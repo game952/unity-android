@@ -1,8 +1,9 @@
-# ① 获取 Unity 许可证 · v2
-# 背景：Unity 官网已关闭个人版的网页手动激活（license.unity3d.com/manual
-# 现在只给企业版/行业版用）。本版改用 Unity Hub 官方安装包里自带的
-# 许可证命令行工具（Unity.Licensing.Client），直接用账号密码领取
-# 个人版免费许可证，全程云端完成，不需要电脑、不需要打开任何网页。
+# ① 获取 Unity 许可证 · v3（三源下载加固版）
+# v2 在 GitHub 服务器上被 Unity CDN 拒绝（wget 退出码 8）。
+# v3 改为：官方 apt 仓库 deb 包（主源）→ 全球 CDN AppImage（备源1）
+#         → 中国镜像 CDN（备源2），依次回退。
+# 领取方式不变：Unity Hub 官方包自带的 Unity.Licensing.Client
+# 用账号密码直接领个人版许可证，全程云端，不需要打开任何网页。
 name: ① 获取 Unity 许可证
 
 on:
@@ -24,17 +25,54 @@ jobs:
           fi
           echo "Secret 已就绪，开始领取个人版许可证"
 
-      - name: 下载 Unity 许可证客户端（Unity Hub 官方包自带）
+      - name: 下载 Unity 许可证客户端（三源回退）
         run: |
-          wget -q https://public-cdn.cloud.unity3d.com/hub/prod/UnityHub.AppImage -O /tmp/hub.AppImage
-          chmod +x /tmp/hub.AppImage
-          cd /tmp && ./hub.AppImage --appimage-extract > /dev/null
-          CLIENT=/tmp/squashfs-root/UnityLicensingClient_V1/Unity.Licensing.Client
-          if [ ! -f "$CLIENT" ]; then
-            echo "::error::没找到许可证客户端，把本步骤日志截图发给助手"
+          CLIENT=""
+          # ---- 源1：Unity 官方 apt 仓库的 deb 包（Artifactory 服务器）----
+          PKG=$(curl -fsSL --retry 3 --max-time 60 \
+            "https://hub.unity3d.com/linux/repos/deb/dists/stable/main/binary-amd64/Packages" \
+            | grep "^Filename:" | tail -1 | awk '{print $2}' || true)
+          echo "apt 仓库最新包：${PKG:-未取到}"
+          if [ -n "$PKG" ] && curl -fsSL --retry 3 --max-time 600 \
+               -o /tmp/hub.deb "https://hub.unity3d.com/linux/repos/deb/$PKG"; then
+            rm -rf /tmp/hubdeb && mkdir -p /tmp/hubdeb
+            if dpkg-deb -x /tmp/hub.deb /tmp/hubdeb 2>/dev/null; then
+              CLIENT=$(find /tmp/hubdeb -name "Unity.Licensing.Client" -type f | head -n 1)
+              [ -n "$CLIENT" ] && echo "源1（apt deb）成功"
+            fi
+          fi
+          # ---- 源2：全球 CDN 的 AppImage ----
+          if [ -z "$CLIENT" ]; then
+            echo "::warning::源1失败，改试源2（全球 CDN AppImage）"
+            if curl -fSL --retry 3 --max-time 600 -A "Mozilla/5.0" \
+                 -o /tmp/hub.AppImage \
+                 "https://public-cdn.cloud.unity3d.com/hub/prod/UnityHub.AppImage"; then
+              chmod +x /tmp/hub.AppImage
+              (cd /tmp && ./hub.AppImage --appimage-extract > /dev/null)
+              [ -f /tmp/squashfs-root/UnityLicensingClient_V1/Unity.Licensing.Client ] \
+                && CLIENT=/tmp/squashfs-root/UnityLicensingClient_V1/Unity.Licensing.Client \
+                && echo "源2（全球 CDN）成功"
+            fi
+          fi
+          # ---- 源3：中国镜像 CDN 的 AppImage ----
+          if [ -z "$CLIENT" ]; then
+            echo "::warning::源2失败，改试源3（中国镜像 CDN）"
+            if curl -fSL --retry 3 --max-time 900 -A "Mozilla/5.0" \
+                 -o /tmp/hub.AppImage \
+                 "https://public-cdn.cloud.unitychina.cn/hub/prod/UnityHub.AppImage"; then
+              chmod +x /tmp/hub.AppImage
+              (cd /tmp && ./hub.AppImage --appimage-extract > /dev/null)
+              [ -f /tmp/squashfs-root/UnityLicensingClient_V1/Unity.Licensing.Client ] \
+                && CLIENT=/tmp/squashfs-root/UnityLicensingClient_V1/Unity.Licensing.Client \
+                && echo "源3（中国镜像）成功"
+            fi
+          fi
+          if [ -z "$CLIENT" ]; then
+            echo "::error::三个下载源全部失败——把本步骤日志截图发给助手"
             exit 1
           fi
           chmod +x "$CLIENT"
+          echo "拿到许可证客户端：$CLIENT"
           echo "CLIENT=$CLIENT" >> "$GITHUB_ENV"
 
       - name: 领取 Unity 个人版免费许可证
@@ -47,9 +85,10 @@ jobs:
 
       - name: 收集许可证文件
         run: |
-          ULF=$(find / -name "Unity_lic.ulf" -not -path "/proc/*" 2>/dev/null | head -n 1)
+          ULF=$(find / \( -name "Unity_lic.ulf" -o -name "*.ulf" \) \
+                -not -path "/proc/*" -not -path "/sys/*" 2>/dev/null | head -n 1)
           if [ -z "$ULF" ]; then
-            echo "::error::没有生成 Unity_lic.ulf——把「领取」一步的日志截图发给助手（重点是有 error 字样的行）"
+            echo "::error::没有生成许可证文件——把「领取」一步的日志展开截图发给助手（重点是有 error 字样的行）"
             exit 1
           fi
           echo "许可证已生成：$ULF"
