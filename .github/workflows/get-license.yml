@@ -1,0 +1,53 @@
+name: ① 获取 Unity 许可证
+
+on:
+  workflow_dispatch:
+
+jobs:
+  get-license:
+    name: 生成许可证文件
+    runs-on: ubuntu-latest
+    container: unityci/editor:ubuntu-2022.3.50f1-android-3
+    env:
+      UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+      UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 方式A - 用账号密码直接激活
+        id: creds
+        continue-on-error: true
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          if [ -z "${UNITY_EMAIL:-}" ] || [ -z "${UNITY_PASSWORD:-}" ]; then
+            echo "::notice::没有设置 UNITY_EMAIL / UNITY_PASSWORD 这两个 Secret，跳过方式A"
+            echo "ulf=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          unity-editor -batchmode -nographics -quit \
+            -username "$UNITY_EMAIL" -password "$UNITY_PASSWORD" || true
+          ULF=$(find / -name "Unity_lic.ulf" -not -path "/proc/*" 2>/dev/null | head -n 1)
+          echo "ulf=$ULF" >> "$GITHUB_OUTPUT"
+          if [ -n "$ULF" ]; then
+            cp "$ULF" "$GITHUB_WORKSPACE/Unity-personal.ulf"
+            echo "::notice::方式A成功！产物里有 Unity-personal.ulf，直接用它"
+          else
+            echo "::warning::方式A没有生成许可证，继续尝试方式B"
+          fi
+
+      - name: 方式B - 生成手动激活请求文件
+        if: ${{ steps.creds.outputs.ulf == '' }}
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          unity-editor -batchmode -nographics -createManualActivationFile || true
+          ls -l || true
+
+      - name: 上传许可证文件
+        uses: actions/upload-artifact@v4
+        with:
+          name: unity-license-files
+          path: |
+            Unity-personal.ulf
+            Unity_v*.alf
+          if-no-files-found: error

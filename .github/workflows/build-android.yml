@@ -1,0 +1,33 @@
+name: ② 打包 Android APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: 云端构建
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Unity 构建
+        uses: game-ci/unity-builder@v4
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        with:
+          targetPlatform: Android
+          buildName: MyGame
+
+      - name: 上传 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: MyGame-Android
+          path: build/Android/**/*.apk
+          if-no-files-found: error
