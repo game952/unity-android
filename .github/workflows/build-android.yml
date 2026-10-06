@@ -1,3 +1,10 @@
+# ② 打包 Android APK · 许可证升级版（unity-builder v6）
+# 为什么升级：v4 打包器只认老式 .ulf 许可证文件（从 <DeveloperData>
+# 里提取序列号），而 Unity 已停止向免费账号发放 .ulf——新版许可证是
+# UnityEntitlementLicense.xml，喂给 v4 会报「License File was corrupted」。
+# v6 改用账号密码直连激活（和「① 获取 Unity 许可证」同一套原理，
+# 运行 #4 已实测成功：ASSIGN_SEAT 200），用的是仓库里已有的
+# UNITY_EMAIL / UNITY_PASSWORD 两个 Secret，不需要 UNITY_LICENSE。
 name: ② 打包 Android APK
 
 on:
@@ -16,9 +23,8 @@ jobs:
           lfs: true
 
       - name: Unity 构建
-        uses: game-ci/unity-builder@v4
+        uses: game-ci/unity-builder@v6
         env:
-          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
           UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
           UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
         with:
