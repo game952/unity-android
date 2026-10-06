@@ -1,3 +1,8 @@
+# ① 获取 Unity 许可证 · v2
+# 背景：Unity 官网已关闭个人版的网页手动激活（license.unity3d.com/manual
+# 现在只给企业版/行业版用）。本版改用 Unity Hub 官方安装包里自带的
+# 许可证命令行工具（Unity.Licensing.Client），直接用账号密码领取
+# 个人版免费许可证，全程云端完成，不需要电脑、不需要打开任何网页。
 name: ① 获取 Unity 许可证
 
 on:
@@ -7,47 +12,53 @@ jobs:
   get-license:
     name: 生成许可证文件
     runs-on: ubuntu-latest
-    container: unityci/editor:ubuntu-2022.3.50f1-android-3
     env:
       UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
       UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
     steps:
-      - name: 检出代码
-        uses: actions/checkout@v4
-
-      - name: 方式A - 用账号密码直接激活
-        id: creds
-        continue-on-error: true
+      - name: 检查账号密码
         run: |
-          cd "$GITHUB_WORKSPACE"
           if [ -z "${UNITY_EMAIL:-}" ] || [ -z "${UNITY_PASSWORD:-}" ]; then
-            echo "::notice::没有设置 UNITY_EMAIL / UNITY_PASSWORD 这两个 Secret，跳过方式A"
-            echo "ulf=" >> "$GITHUB_OUTPUT"
-            exit 0
+            echo "::error::仓库里还没设置 UNITY_EMAIL / UNITY_PASSWORD 这两个 Secret（Settings → Secrets and variables → Actions），设好后重新运行本工作流"
+            exit 1
           fi
-          unity-editor -batchmode -nographics -quit \
-            -username "$UNITY_EMAIL" -password "$UNITY_PASSWORD" || true
-          ULF=$(find / -name "Unity_lic.ulf" -not -path "/proc/*" 2>/dev/null | head -n 1)
-          echo "ulf=$ULF" >> "$GITHUB_OUTPUT"
-          if [ -n "$ULF" ]; then
-            cp "$ULF" "$GITHUB_WORKSPACE/Unity-personal.ulf"
-            echo "::notice::方式A成功！产物里有 Unity-personal.ulf，直接用它"
-          else
-            echo "::warning::方式A没有生成许可证，继续尝试方式B"
-          fi
+          echo "Secret 已就绪，开始领取个人版许可证"
 
-      - name: 方式B - 生成手动激活请求文件
-        if: ${{ steps.creds.outputs.ulf == '' }}
+      - name: 下载 Unity 许可证客户端（Unity Hub 官方包自带）
         run: |
-          cd "$GITHUB_WORKSPACE"
-          unity-editor -batchmode -nographics -createManualActivationFile || true
-          ls -l || true
+          wget -q https://public-cdn.cloud.unity3d.com/hub/prod/UnityHub.AppImage -O /tmp/hub.AppImage
+          chmod +x /tmp/hub.AppImage
+          cd /tmp && ./hub.AppImage --appimage-extract > /dev/null
+          CLIENT=/tmp/squashfs-root/UnityLicensingClient_V1/Unity.Licensing.Client
+          if [ ! -f "$CLIENT" ]; then
+            echo "::error::没找到许可证客户端，把本步骤日志截图发给助手"
+            exit 1
+          fi
+          chmod +x "$CLIENT"
+          echo "CLIENT=$CLIENT" >> "$GITHUB_ENV"
+
+      - name: 领取 Unity 个人版免费许可证
+        run: |
+          mkdir -p "$HOME/.local/share/unity3d/Unity/"
+          "$CLIENT" --activate-all --include-personal \
+            --username "$UNITY_EMAIL" --password "$UNITY_PASSWORD" || true
+          echo "---- 当前账号拿到的许可证 ----"
+          "$CLIENT" --showEntitlements || true
+
+      - name: 收集许可证文件
+        run: |
+          ULF=$(find / -name "Unity_lic.ulf" -not -path "/proc/*" 2>/dev/null | head -n 1)
+          if [ -z "$ULF" ]; then
+            echo "::error::没有生成 Unity_lic.ulf——把「领取」一步的日志截图发给助手（重点是有 error 字样的行）"
+            exit 1
+          fi
+          echo "许可证已生成：$ULF"
+          cp "$ULF" "$GITHUB_WORKSPACE/Unity-personal.ulf"
+          ls -l "$GITHUB_WORKSPACE/Unity-personal.ulf"
 
       - name: 上传许可证文件
         uses: actions/upload-artifact@v4
         with:
           name: unity-license-files
-          path: |
-            Unity-personal.ulf
-            Unity_v*.alf
+          path: Unity-personal.ulf
           if-no-files-found: error
