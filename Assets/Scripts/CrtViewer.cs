@@ -24,11 +24,22 @@ using UnityEngine.Networking;
 //      (A=法线3+UV2 / Rn=骨骼引用33B / C=附加引用30B)，顶点池=R块+C块，
 //      UV 由 A 记录按序配对。算法源自 ski格式破解包 ski_export.py，
 //      297 个 ski 全量对拍 591 顶点黄金标准一致
-//   2) 面索引端序错误 → 子块索引是【大端 u16】(ski 与 act 内嵌网格皆是)，
-//      小端误读导致索引值全错、模型破损。修正为大端读取 + strip 三角条带
-//      装配(跳退化/越界，绕序奇偶交替)
+//   2) .ski 面索引是【大端 u16】(297文件字节级验证)，小端误读全错 → 大端读取
 //   3) 贴图 404 → pak 内贴图文件带 _01/_02 变体后缀而 act 记基础名，
 //      加载失败时自动回退尝试 _01.._04 变体
+//
+// v3.1.1 修复 (2026-10-08，真机反馈)：
+//   1) 剑只剩 3 面 / 杵「无内嵌网格」→ v3.1 把 act 内嵌 VaSkin 索引也改成
+//      大端是错的：VaSkin 索引是【小端 u16】(v3.0 真机证据: 小端读出剑主体)。
+//      与 ski 的大端不同源！改为双端序探测，按界内索引率自动择优
+//   2) 解析失败时旧模型残留画面 → 失败分支隐藏全部已载模型
+//   3) act 顶点流假阳性防护：装配面数须达到索引数一半，否则判定端序/结构错误
+//
+// ★ 遗留已知问题(v3.2 主攻)：.ski 部件几何碎片化 —— 顶点池已验证正确
+//   (hea_05 460/1459、glo_09 350/723 与 Python 黄金标准逐字一致)，
+//   但 CRT_SkelSkin 索引数组的三角形装配语义未破解 (strip/list 均非流形)。
+//   注意: cnt 样本 66/240/660/1050/1980/4074 全部被 6 整除 (概率0.4%)，
+//   强烈暗示索引流单元=6×u16 (如位置三角+法线三角分离索引)，待原始样本验证
 // v4 计划：拿到身体骨骼后，按 bind 矩阵整装拼合 + 动画
 // ============================================================================
 
@@ -172,6 +183,19 @@ public class CrtViewer : MonoBehaviour
         return tris;
     }
 
+    // 界内索引率: 正确端序下索引几乎全部落在顶点池内; 错误端序值膨胀256倍→接近0
+    static float InRate(List<int> idx, int vertCount)
+    {
+        if (idx.Count == 0) return 0f;
+        int inb = 0;
+        for (int i = 0; i < idx.Count; i++) if (idx[i] < vertCount) inb++;
+        return (float)inb / idx.Count;
+    }
+
+    // 双端序索引区读取 (v3.1.1): LE = 低字节在前, BE = 高字节在前
+    static List<int> IdxLE(byte[] b, int o, int fc) { var l = new List<int>(fc); for (int i = 0; i < fc; i++) l.Add(U16(b, o + i * 2)); return l; }
+    static List<int> IdxBE(byte[] b, int o, int fc) { var l = new List<int>(fc); for (int i = 0; i < fc; i++) l.Add((b[o + i * 2] << 8) | b[o + i * 2 + 1]); return l; }
+
     static SkiFile LoadSki(byte[] b)
     {
         var f = new SkiFile();
@@ -179,14 +203,13 @@ public class CrtViewer : MonoBehaviour
         f.name = ReadStr(b, ref o);
         o += 2;                             // 两个布尔
         int subCnt = (int)U32(b, o); o += 4;
-        var allIdx = new List<int>();
+        var idxOffs = new List<int>(); var idxCnts = new List<int>();       // 索引区字节位置(端序延后定)
         for (int s = 0; s < subCnt; s++)
         {
             var ss = new SkiSubset { mtl = ReadStr(b, ref o), tex = ReadStr(b, ref o) };
             int fc = (int)U32(b, o); o += 4 + 1;                    // 索引数 + 尾标 0x01
-            for (int i = 0; i < fc; i++) { ss.faces.Add((b[o] << 8) | b[o + 1]); o += 2; }   // 大端!
+            idxOffs.Add(o); idxCnts.Add(fc); o += fc * 2;
             f.subs.Add(ss);
-            allIdx.AddRange(ss.faces);
         }
         // 定位材质对象 (CRT_MtlStandard=15字符 / CRT_MtlMu=9字符), 顶点流从其后探测
         int mtlOff = o;
@@ -216,7 +239,21 @@ public class CrtViewer : MonoBehaviour
         for (int i = 0; i < f.verts.Count; i++)
             f.uvs.Add(i < aList.Count ? aList[i].uv : Vector2.zero);
 
-        f.tris = StripAssemble(allIdx, f.verts.Count);
+        // 双端序择优 (v3.1.1): ski 297文件字节级验证为BE, LE 探测仅做兜底
+        var idxBE = new List<int>(); var idxLE = new List<int>();
+        for (int s = 0; s < idxOffs.Count; s++)
+        {
+            idxBE.AddRange(IdxBE(b, idxOffs[s], idxCnts[s]));
+            idxLE.AddRange(IdxLE(b, idxOffs[s], idxCnts[s]));
+        }
+        float rBE = InRate(idxBE, f.verts.Count), rLE = InRate(idxLE, f.verts.Count);
+        var bestIdx = rBE >= rLE ? idxBE : idxLE;
+        f.tris = StripAssemble(bestIdx, f.verts.Count);
+        for (int s = 0, acc = 0; s < idxOffs.Count; s++)
+        {
+            for (int i = 0; i < idxCnts[s]; i++) f.subs[s].faces.Add(bestIdx[acc + i]);
+            acc += idxCnts[s];
+        }
         if (f.tris.Count < 3) throw new Exception("面装配为空: " + f.name);
         return f;
     }
@@ -295,19 +332,15 @@ public class CrtViewer : MonoBehaviour
         sk.name = ReadStr(b, ref o);
         o += 2;
         int subCnt = (int)U32(b, o); o += 4;
-        var allIdx = new List<int>();
+        var idxOffs = new List<int>(); var idxCnts = new List<int>(); int fcTotal = 0;
         for (int s = 0; s < subCnt; s++)
         {
             var ss = new SkiSubset { mtl = ReadStr(b, ref o), tex = ReadStr(b, ref o) };
             int fc = (int)U32(b, o); o += 4;
-            for (int i = 0; i < fc; i++) { ss.faces.Add((b[o] << 8) | b[o + 1]); o += 2; }   // 大端!
-            o += 1;
+            idxOffs.Add(o); idxCnts.Add(fc); fcTotal += fc; o += fc * 2 + 1;    // 索引区 + 尾标
             sk.subs.Add(ss);
-            allIdx.AddRange(ss.faces);
         }
-        int idxMax = 0;
-        foreach (var ss in sk.subs) foreach (int idx in ss.faces) if (idx > idxMax) idxMax = idx;
-        if (idxMax < 1) return null;
+        if (fcTotal < 3) return null;
 
         // 顶点区：扫描 [u32 顶点数] + 32B 交错(pos3f+nor3f+uv2f)，浮点全部合理
         // (注意: 索引可能引用到 511 槽而顶点池较小, 越界面由 StripAssemble 剔除)
@@ -326,9 +359,25 @@ public class CrtViewer : MonoBehaviour
                 else { V.Add(pos); N.Add(nor); U.Add(uv); }
             }
             if (!ok || V.Count == 0) continue;
-            var tris = StripAssemble(allIdx, V.Count);
+
+            // 双端序择优 (v3.1.1): VaSkin 索引实测小端(v3.0 真机剑主体可见), ski 才是大端
+            var idxBE = new List<int>(); var idxLE = new List<int>();
+            for (int s = 0; s < idxOffs.Count; s++)
+            {
+                idxBE.AddRange(IdxBE(b, idxOffs[s], idxCnts[s]));
+                idxLE.AddRange(IdxLE(b, idxOffs[s], idxCnts[s]));
+            }
+            float rBE = InRate(idxBE, V.Count), rLE = InRate(idxLE, V.Count);
+            if (rBE < 0.5f && rLE < 0.5f) continue;       // 假阳性防护: 两个端序界内率都不合格=结构错误
+            var bestIdx = rBE >= rLE ? idxBE : idxLE;
+            var tris = StripAssemble(bestIdx, V.Count);
             if (tris.Count < 3) continue;
             sk.verts = V; sk.nors = N; sk.uvs = U; sk.tris = tris;
+            for (int s = 0, acc = 0; s < idxOffs.Count; s++)          // 记录端序择优后的子块索引
+            {
+                for (int i = 0; i < idxCnts[s]; i++) sk.subs[s].faces.Add(bestIdx[acc + i]);
+                acc += idxCnts[s];
+            }
             return sk;
         }
         return null;
@@ -536,6 +585,8 @@ public class CrtViewer : MonoBehaviour
         catch (Exception e)
         {
             _status = "解析失败: " + e.Message;
+            _modelCache.Remove(key);                    // v3.1.1: 失败不留半成品
+            foreach (var kv in _modelCache) kv.Value.SetActive(false);   // 隐藏旧模型, 避免残留画面
         }
         _loading = false;
     }
@@ -641,7 +692,7 @@ public class CrtViewer : MonoBehaviour
         GUI.backgroundColor = new Color(0.1f, 0.1f, 0.14f, 0.85f);
 
         var title = new GUIStyle(GUI.skin.label) { fontSize = Mathf.Max(16, (int)(h * 0.030f)), alignment = TextAnchor.MiddleLeft, normal = { textColor = new Color(0.35f, 1f, 0.45f) } };
-        GUI.Label(new Rect(12, 8, w - 24, h * 0.05f), "v3.1 角色预览台 — CRT 格式直读 (ski/act/dds)", title);
+        GUI.Label(new Rect(12, 8, w - 24, h * 0.05f), "v3.1.1 角色预览台 — CRT 格式直读 (ski/act/dds)", title);
 
         var info = new GUIStyle(GUI.skin.label) { fontSize = Mathf.Max(11, (int)(h * 0.017f)), normal = { textColor = Color.white } };
         GUI.Label(new Rect(12, h * 0.052f, w - 24, h * 0.05f), _status.Length > 0 ? _status : _info, info);
