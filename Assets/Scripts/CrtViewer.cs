@@ -17,7 +17,19 @@ using UnityEngine.Networking;
 //
 // v3 展示：武器(剑/杵，来自 act 内嵌 VaSkin + 原生 dds 贴图) + 身体各部件
 //          (clo/glo/sho/wai/hea，来自 ski) + 触摸旋转 + 部件换装按钮
-// v4 计划：拿到 role_wt_m_01.act 身体骨骼后，按 bind 矩阵整装拼合 + 动画
+//
+// v3.1 修复 (2026-10-08，真机反馈两个 bug)：
+//   1) .ski 服装/头/手/脚全部「顶点区未定位」→ 根因: C# 把 CRT_VaSkin 的
+//      32B 交错格式错套在 CRT_SkelSkin 上。正确格式 = A/R/C 三种顶点记录流
+//      (A=法线3+UV2 / Rn=骨骼引用33B / C=附加引用30B)，顶点池=R块+C块，
+//      UV 由 A 记录按序配对。算法源自 ski格式破解包 ski_export.py，
+//      297 个 ski 全量对拍 591 顶点黄金标准一致
+//   2) 面索引端序错误 → 子块索引是【大端 u16】(ski 与 act 内嵌网格皆是)，
+//      小端误读导致索引值全错、模型破损。修正为大端读取 + strip 三角条带
+//      装配(跳退化/越界，绕序奇偶交替)
+//   3) 贴图 404 → pak 内贴图文件带 _01/_02 变体后缀而 act 记基础名，
+//      加载失败时自动回退尝试 _01.._04 变体
+// v4 计划：拿到身体骨骼后，按 bind 矩阵整装拼合 + 动画
 // ============================================================================
 
 public class CrtViewer : MonoBehaviour
@@ -51,17 +63,16 @@ public class CrtViewer : MonoBehaviour
     }
 
     // ======================= 数据结构 =======================
-    struct BoneRef { public int bone; public float w; public Vector3 pos, nor; }
-
-    class SkiSubset { public string mtl, tex; public ushort[] faces; }
+    class SkiSubset { public string mtl, tex; public List<int> faces = new List<int>(); }   // faces: 大端 u16 还原
 
     class SkiFile
     {
         public string name;
         public List<SkiSubset> subs = new List<SkiSubset>();
-        public List<Vector3> verts = new List<Vector3>();   // 主权重骨骼空间位置(已按权重混合)
+        public List<Vector3> verts = new List<Vector3>();   // R块+C块 骨骼空间坐标 (bind 姿势近似恒等)
         public List<Vector3> nors = new List<Vector3>();
-        public List<Vector2> uvs = new List<Vector2>();
+        public List<Vector2> uvs = new List<Vector2>();     // 来自配对 A 记录
+        public List<int> tris = new List<int>();            // strip 装配后的三角索引
     }
 
     class ActSkin
@@ -71,6 +82,7 @@ public class CrtViewer : MonoBehaviour
         public List<Vector3> verts = new List<Vector3>();   // VaSkin 交错帧0: pos/nor/uv
         public List<Vector3> nors = new List<Vector3>();
         public List<Vector2> uvs = new List<Vector2>();
+        public List<int> tris = new List<int>();
     }
 
     class ActFile
@@ -80,69 +92,133 @@ public class CrtViewer : MonoBehaviour
         public List<ActSkin> skins = new List<ActSkin>();
     }
 
-    // ======================= .ski 解析 =======================
+    // ======================= .ski 解析 (v3.1 权威格式, 经 297 文件对拍验证) =======================
+    //
+    // CRT_SkelSkin 结构:
+    //   对象头(FFFF+类名) + 名字(u32len+str) + 2B + u32 子块数
+    //   子块×N: 名1 + 名2 + u32 索引数 + 1B + 索引×【大端 u16】
+    //   材质库对象(跳过) → 顶点记录流(材质后某处起, 到 EOF-3, 尾标 01 01 01):
+    //     A : 01 01 + f32[5]=法线3+UV2; 首条多 4B 声明数(忽略) → 26B / 后续 22B
+    //     Rn: n(1..8) 00 00 00 + 骨骼ID + f32 权重 + f32 坐标3 + f32 法线3 → 33B
+    //     C : 01 + 骨骼ID + f32 权重 + f32 坐标3 + f32 法线3 → 30B
+    //   顶点池 = R块流序 + C块流序; UV = 第 i 个 A 记录的第4/5个 f32
+    //   面 = 大端索引流 strip 装配 (跳退化三角, 绕序按奇偶交替)
+    class VRec { public string kind; public int bone; public float w; public Vector3 pos, nor; public Vector2 uv; }
+
+    static List<VRec> WalkVertices(byte[] b, int start, int end, out int endPos)
+    {
+        endPos = start;
+        var recs = new List<VRec>();
+        bool firstA = true; int o = start;
+        while (o < end - 26)
+        {
+            int t0 = b[o], t1 = b[o + 1];
+            if (t0 == 1 && t1 == 1)
+            {
+                int q = o + (firstA ? 6 : 2);
+                var r = new VRec { kind = "A" };
+                r.nor = new Vector3(F32(b, q), F32(b, q + 4), F32(b, q + 8));
+                r.uv = new Vector2(F32(b, q + 12), F32(b, q + 16));
+                recs.Add(r); o += firstA ? 26 : 22; firstA = false;
+            }
+            else if (t0 == 1 && t1 != 0)            // C 记录: 附加影响/半侧顶点
+            {
+                var r = new VRec { kind = "C", bone = t1, w = F32(b, o + 2) };
+                r.pos = new Vector3(F32(b, o + 6), F32(b, o + 10), F32(b, o + 14));
+                r.nor = new Vector3(F32(b, o + 18), F32(b, o + 22), F32(b, o + 26));
+                recs.Add(r); o += 30;
+            }
+            else if (t0 >= 1 && t0 <= 8 && t1 == 0 && b[o + 2] == 0 && b[o + 3] == 0)   // R 记录
+            {
+                var r = new VRec { kind = "R" + t0, bone = b[o + 4], w = F32(b, o + 5) };
+                r.pos = new Vector3(F32(b, o + 9), F32(b, o + 13), F32(b, o + 17));
+                r.nor = new Vector3(F32(b, o + 21), F32(b, o + 25), F32(b, o + 29));
+                recs.Add(r); o += 33;
+            }
+            else return null;                       // 未识别 → 起点错误
+            endPos = o;
+        }
+        return recs;
+    }
+
+    static int FindVertStart(byte[] b, int from, out List<VRec> bestRecs, out int endPos)
+    {
+        bestRecs = null; endPos = -1;
+        int best = -1, bestn = 0, bestEnd = -1;
+        int lim = Math.Min(from + 0x400, b.Length - 40);
+        for (int probe = Math.Max(0, from); probe < lim; probe++)
+        {
+            if (b[probe] != 1 || b[probe + 1] != 1) continue;
+            int ep; var recs = WalkVertices(b, probe, b.Length - 3, out ep);
+            if (recs == null) continue;
+            if (recs.Count > bestn) { best = probe; bestRecs = recs; bestn = recs.Count; bestEnd = ep; }
+            if (recs.Count > 10 && (b.Length - 3) - ep < 8) { bestRecs = recs; endPos = ep; return probe; }
+        }
+        endPos = bestEnd;
+        return best;
+    }
+
+    static List<int> StripAssemble(List<int> idx, int vertCount)
+    {
+        var tris = new List<int>(idx.Count);
+        for (int i = 0; i + 2 < idx.Count; i++)
+        {
+            int a = idx[i], c = idx[i + 1], d = idx[i + 2];
+            if (a == c || c == d || a == d) continue;                           // 退化
+            if (a >= vertCount || c >= vertCount || d >= vertCount) continue;   // 越界(Unity 会崩)
+            if ((i & 1) == 0) { tris.Add(a); tris.Add(c); tris.Add(d); }
+            else { tris.Add(a); tris.Add(d); tris.Add(c); }                     // 条带绕序交替
+        }
+        return tris;
+    }
+
     static SkiFile LoadSki(byte[] b)
     {
         var f = new SkiFile();
-        int o = 4 + U16(b, 2);              // 跳过对象头
-        f.name = ReadStr(b, ref o);         // s_a_wt_m_clo_00
+        int o = 4 + U16(b, 2);              // 跳过 CRT_SkelSkin 对象头
+        f.name = ReadStr(b, ref o);
         o += 2;                             // 两个布尔
         int subCnt = (int)U32(b, o); o += 4;
+        var allIdx = new List<int>();
         for (int s = 0; s < subCnt; s++)
         {
             var ss = new SkiSubset { mtl = ReadStr(b, ref o), tex = ReadStr(b, ref o) };
-            int fc = (int)U32(b, o); o += 4;
-            ss.faces = new ushort[fc];
-            for (int i = 0; i < fc; i++) { ss.faces[i] = U16(b, o); o += 2; }
-            o += 1;                         // 子块尾标记 0x01
+            int fc = (int)U32(b, o); o += 4 + 1;                    // 索引数 + 尾标 0x01
+            for (int i = 0; i < fc; i++) { ss.faces.Add((b[o] << 8) | b[o + 1]); o += 2; }   // 大端!
             f.subs.Add(ss);
+            allIdx.AddRange(ss.faces);
         }
-        // 跳过材质库：直接扫顶点区 [u32 顶点数 >= 最大索引+1] 且整段可解析到文件尾
-        int idxMax = 0;
-        foreach (var ss in f.subs) foreach (ushort idx in ss.faces) if (idx > idxMax) idxMax = idx;
-
-        for (int cand = o; cand < b.Length - 40; cand++)
+        // 定位材质对象 (CRT_MtlStandard=15字符 / CRT_MtlMu=9字符), 顶点流从其后探测
+        int mtlOff = o;
+        for (int i = o; i + 6 < b.Length; i++)
         {
-            int cnt = (int)U32(b, cand);
-            if (cnt < idxMax + 1 || cnt > 4000) continue;
-            int p = cand + 4; bool ok = true;
-            var V = new List<Vector3>(cnt); var N = new List<Vector3>(cnt); var U = new List<Vector2>(cnt);
-            for (int v = 0; v < cnt && ok; v++)
-            {
-                Vector3 nor = new Vector3(F32(b, p), F32(b, p + 4), F32(b, p + 8)); p += 12;
-                Vector2 uv = new Vector2(F32(b, p), F32(b, p + 4)); p += 8;
-                int rc = (int)U32(b, p); p += 4;
-                if (rc < 1 || rc > 8) { ok = false; break; }
-                Vector3 bestPos = Vector3.zero, bestNor = Vector3.zero; float bestW = -1;
-                float wSum = 0; Vector3 pAcc = Vector3.zero, nAcc = Vector3.zero;
-                for (int r = 0; r < rc; r++)
-                {
-                    int bone = b[p]; float w = F32(b, p + 1);
-                    var rp = new Vector3(F32(b, p + 5), F32(b, p + 9), F32(b, p + 13));
-                    var rn = new Vector3(F32(b, p + 17), F32(b, p + 21), F32(b, p + 25));
-                    if (b[p + 29] != 1) { ok = false; break; }
-                    p += 30;
-                    if (w > bestW) { bestW = w; bestPos = rp; bestNor = rn; }
-                    wSum += w; pAcc += rp * w; nAcc += rn * w;
-                }
-                if (!ok) break;
-                // 主权重优先：多骨顶点按权重混合，单骨顶点取原值
-                Vector3 P = (rc == 1 || wSum <= 0.001f) ? bestPos : pAcc / wSum;
-                Vector3 Nn = (rc == 1 || wSum <= 0.001f) ? bestNor : nAcc / wSum;
-                if (!Sanity(P) || !Sanity(Nn)) { ok = false; break; }
-                V.Add(P); N.Add(Nn); U.Add(uv);
-            }
-            if (!ok) continue;
-            int tail = b.Length - p;
-            if (tail > 4) continue;
-            bool tailOk = true;
-            for (int t = p; t < b.Length; t++) if (b[t] != 1) { tailOk = false; break; }
-            if (!tailOk) continue;
-
-            f.verts = V; f.nors = N; f.uvs = U;
-            return f;
+            if (b[i] != 0xFF || b[i + 1] != 0xFF) continue;
+            int tl = U16(b, i + 2);
+            if (tl != 15 && tl != 9) continue;
+            string tag = Encoding.GetEncoding(28591).GetString(b, i + 4, tl);
+            if (tag == "CRT_MtlStandard" || tag == "CRT_MtlMu") { mtlOff = i; break; }
         }
-        throw new Exception("顶点区未定位: " + f.name);
+
+        List<VRec> recs; int ep;
+        int vs = FindVertStart(b, mtlOff, out recs, out ep);
+        if (vs < 0 || recs == null) throw new Exception("顶点流未定位: " + f.name);
+
+        // 顶点池 = R块(流序) + C块(流序); UV = 第 i 个 A 记录
+        var aList = new List<VRec>(); var rList = new List<VRec>(); var cList = new List<VRec>();
+        foreach (var r in recs)
+        {
+            if (r.kind == "A") aList.Add(r);
+            else if (r.kind == "C") cList.Add(r);
+            else rList.Add(r);
+        }
+        foreach (var r in rList) { f.verts.Add(r.pos); f.nors.Add(r.nor); }
+        foreach (var r in cList) { f.verts.Add(r.pos); f.nors.Add(r.nor); }
+        for (int i = 0; i < f.verts.Count; i++)
+            f.uvs.Add(i < aList.Count ? aList[i].uv : Vector2.zero);
+
+        f.tris = StripAssemble(allIdx, f.verts.Count);
+        if (f.tris.Count < 3) throw new Exception("面装配为空: " + f.name);
+        return f;
     }
 
     static bool Sanity(Vector3 v) { return Mathf.Abs(v.x) < 1e5f && Mathf.Abs(v.y) < 1e5f && Mathf.Abs(v.z) < 1e5f; }
@@ -219,24 +295,26 @@ public class CrtViewer : MonoBehaviour
         sk.name = ReadStr(b, ref o);
         o += 2;
         int subCnt = (int)U32(b, o); o += 4;
+        var allIdx = new List<int>();
         for (int s = 0; s < subCnt; s++)
         {
             var ss = new SkiSubset { mtl = ReadStr(b, ref o), tex = ReadStr(b, ref o) };
             int fc = (int)U32(b, o); o += 4;
-            ss.faces = new ushort[fc];
-            for (int i = 0; i < fc; i++) { ss.faces[i] = U16(b, o); o += 2; }
+            for (int i = 0; i < fc; i++) { ss.faces.Add((b[o] << 8) | b[o + 1]); o += 2; }   // 大端!
             o += 1;
             sk.subs.Add(ss);
+            allIdx.AddRange(ss.faces);
         }
         int idxMax = 0;
-        foreach (var ss in sk.subs) foreach (ushort idx in ss.faces) if (idx > idxMax) idxMax = idx;
+        foreach (var ss in sk.subs) foreach (int idx in ss.faces) if (idx > idxMax) idxMax = idx;
         if (idxMax < 1) return null;
 
         // 顶点区：扫描 [u32 顶点数] + 32B 交错(pos3f+nor3f+uv2f)，浮点全部合理
+        // (注意: 索引可能引用到 511 槽而顶点池较小, 越界面由 StripAssemble 剔除)
         for (int cand = o; cand < b.Length - 40; cand++)
         {
             int cnt = (int)U32(b, cand);
-            if (cnt < idxMax + 1 || cnt > 5000) continue;
+            if (cnt < 4 || cnt > 5000) continue;
             int p = cand + 4; bool ok = true;
             var V = new List<Vector3>(cnt); var N = new List<Vector3>(cnt); var U = new List<Vector2>(cnt);
             for (int v = 0; v < cnt && ok; v++)
@@ -248,7 +326,9 @@ public class CrtViewer : MonoBehaviour
                 else { V.Add(pos); N.Add(nor); U.Add(uv); }
             }
             if (!ok || V.Count == 0) continue;
-            sk.verts = V; sk.nors = N; sk.uvs = U;
+            var tris = StripAssemble(allIdx, V.Count);
+            if (tris.Count < 3) continue;
+            sk.verts = V; sk.nors = N; sk.uvs = U; sk.tris = tris;
             return sk;
         }
         return null;
@@ -436,17 +516,17 @@ public class CrtViewer : MonoBehaviour
                 if (act.skins.Count == 0) throw new Exception("无内嵌网格");
                 var sk = act.skins[0];
                 texName = sk.subs[0].tex;
-                model = BuildMeshObject(sk.verts, sk.nors, sk.uvs, sk.subs[0].faces, texName);
+                model = BuildMeshObject(sk.verts, sk.nors, sk.uvs, sk.tris, texName);
                 _info = string.Format("{0}  骨骼{1}根  网格{2}顶点/{3}面  贴图={4}",
-                    act.ver, act.bones.Count, sk.verts.Count, sk.subs[0].faces.Length / 3, texName);
+                    act.ver, act.bones.Count, sk.verts.Count, sk.tris.Count / 3, texName);
             }
             else
             {
                 var ski = LoadSki(d);
                 texName = ski.subs[0].tex;
-                model = BuildMeshObject(ski.verts, ski.nors, ski.uvs, ski.subs[0].faces, texName);
+                model = BuildMeshObject(ski.verts, ski.nors, ski.uvs, ski.tris, texName);
                 _info = string.Format("{0}  {1}顶点/{2}面  贴图={3}",
-                    ski.name, ski.verts.Count, ski.subs[0].faces.Length / 3, texName);
+                    ski.name, ski.verts.Count, ski.tris.Count / 3, texName);
             }
             model.transform.SetParent(_pivot, false);
             _modelCache[key] = model;
@@ -460,7 +540,7 @@ public class CrtViewer : MonoBehaviour
         _loading = false;
     }
 
-    GameObject BuildMeshObject(List<Vector3> V, List<Vector3> N, List<Vector2> U, ushort[] faces, string texName)
+    GameObject BuildMeshObject(List<Vector3> V, List<Vector3> N, List<Vector2> U, List<int> tris, string texName)
     {
         // 归一化：让模型稳定占屏（各部件尺寸差异大）
         var bmin = V[0]; var bmax = V[0];
@@ -471,13 +551,12 @@ public class CrtViewer : MonoBehaviour
 
         var verts = new Vector3[V.Count];
         for (int i = 0; i < V.Count; i++) verts[i] = (V[i] - center) * scale;
-        var tris = new int[faces.Length];
-        for (int i = 0; i < faces.Length; i++) tris[i] = faces[i];
+        var idx = tris.ToArray();
 
         var mesh = new Mesh();
         mesh.indexFormat = UnityEngine.Rendering.IndexFormat.UInt32;
         mesh.vertices = verts; mesh.normals = N.ToArray(); mesh.uv = U.ToArray();
-        mesh.triangles = tris;
+        mesh.triangles = idx;
         mesh.RecalculateBounds();
 
         var go = new GameObject("CRT_" + texName);
@@ -503,12 +582,27 @@ public class CrtViewer : MonoBehaviour
     {
         var tex = GetTexture(name);
         if (tex != null) yield break;
-        var req = UnityWebRequest.Get(SA("creature/texture/" + name + ".dds"));
-        req.timeout = 20;
-        yield return req.SendWebRequest();
-        if (req.result != UnityWebRequest.Result.Success) yield break;
-        var t = LoadDds(req.downloadHandler.data);
-        if (t != null) { _texCache[name] = t; if (mat != null) { mat.mainTexture = t; mat.color = Color.white; } }
+        // 变体回退：pak 内贴图文件常带 _01/_02 变体后缀，而 act/ski 记录的是基础名
+        var cands = new List<string>();
+        cands.Add(name);
+        int us = name.LastIndexOf('_');
+        bool hasVar = us > 0 && us + 2 < name.Length && name[us + 1] == '0' && name[us + 2] >= '1' && name[us + 2] <= '9';
+        if (hasVar) cands.Insert(0, name.Substring(0, us));          // 已带后缀 → 先试基础名
+        for (int k = 1; k <= 4; k++) cands.Add(name + "_0" + k);      // 再试 _01.._04
+        foreach (var cand in cands)
+        {
+            var req = UnityWebRequest.Get(SA("creature/texture/" + cand + ".dds"));
+            req.timeout = 20;
+            yield return req.SendWebRequest();
+            if (req.result != UnityWebRequest.Result.Success) continue;
+            var t = LoadDds(req.downloadHandler.data);
+            if (t != null)
+            {
+                _texCache[name] = t;
+                if (mat != null) { mat.mainTexture = t; mat.color = Color.white; }
+                yield break;
+            }
+        }
     }
 
     void Show(string key)
@@ -547,7 +641,7 @@ public class CrtViewer : MonoBehaviour
         GUI.backgroundColor = new Color(0.1f, 0.1f, 0.14f, 0.85f);
 
         var title = new GUIStyle(GUI.skin.label) { fontSize = Mathf.Max(16, (int)(h * 0.030f)), alignment = TextAnchor.MiddleLeft, normal = { textColor = new Color(0.35f, 1f, 0.45f) } };
-        GUI.Label(new Rect(12, 8, w - 24, h * 0.05f), "v3 角色预览台 — CRT 格式直读 (ski/act/dds)", title);
+        GUI.Label(new Rect(12, 8, w - 24, h * 0.05f), "v3.1 角色预览台 — CRT 格式直读 (ski/act/dds)", title);
 
         var info = new GUIStyle(GUI.skin.label) { fontSize = Mathf.Max(11, (int)(h * 0.017f)), normal = { textColor = Color.white } };
         GUI.Label(new Rect(12, h * 0.052f, w - 24, h * 0.05f), _status.Length > 0 ? _status : _info, info);
