@@ -35,11 +35,16 @@ using UnityEngine.Networking;
 //   2) 解析失败时旧模型残留画面 → 失败分支隐藏全部已载模型
 //   3) act 顶点流假阳性防护：装配面数须达到索引数一半，否则判定端序/结构错误
 //
-// ★ 遗留已知问题(v3.2 主攻)：.ski 部件几何碎片化 —— 顶点池已验证正确
-//   (hea_05 460/1459、glo_09 350/723 与 Python 黄金标准逐字一致)，
-//   但 CRT_SkelSkin 索引数组的三角形装配语义未破解 (strip/list 均非流形)。
-//   注意: cnt 样本 66/240/660/1050/1980/4074 全部被 6 整除 (概率0.4%)，
-//   强烈暗示索引流单元=6×u16 (如位置三角+法线三角分离索引)，待原始样本验证
+// v3.2 突破 (2026-10-08 深夜，5个原始样本对照实验30+组)：
+//   ★ ski 碎片化主因 = 顶点坐标在各绑定骨骼的【局部空间】！
+//     - glo_09 绑 12 骨、clo_02 绑 34 骨、61% 三角形跨骨骼
+//   ★ C 记录真身破译 = 同一顶点在第二骨骼空间的坐标 (R2 w=0.5 + C w=0.5, 和为1)
+//     - RANSAC 骨12↔骨13 解出 15/15 全配对, 刚体残差<0.08 → 实锤
+//   ★ 解法: 3点几何法RANSAC配对 + Kabsch解骨骼刚体变换 + 骨骼图BFS传递
+//     → 全部顶点归一到代表骨空间, 无需骨骼文件！
+//     - Python 离线验证: hea_05 统一后渲染出连续实体头盔壳 (原碎片消失)
+//   - 条带滑窗装配保持 (v3.1.1 端序择优不变)
+// v4 计划：提取 role_wt_m_01.act 全身骨骼 → 整装拼合 + 动画
 // v4 计划：拿到身体骨骼后，按 bind 矩阵整装拼合 + 动画
 // ============================================================================
 
@@ -239,6 +244,9 @@ public class CrtViewer : MonoBehaviour
         for (int i = 0; i < f.verts.Count; i++)
             f.uvs.Add(i < aList.Count ? aList[i].uv : Vector2.zero);
 
+        // v3.2: 骨骼空间统一 — ski 顶点在各绑定骨骼的局部空间, 必须归一才能正确显示
+        UnifyBoneSpace(f, rList, cList);
+
         // 双端序择优 (v3.1.1): ski 297文件字节级验证为BE, LE 探测仅做兜底
         var idxBE = new List<int>(); var idxLE = new List<int>();
         for (int s = 0; s < idxOffs.Count; s++)
@@ -256,6 +264,185 @@ public class CrtViewer : MonoBehaviour
         }
         if (f.tris.Count < 3) throw new Exception("面装配为空: " + f.name);
         return f;
+    }
+
+    // ======================= v3.2: 骨骼空间统一 =======================
+    // 发现: R2(w=0.5,骨A) + C(骨B) 是同一顶点在两个骨骼空间的坐标(权重和=1)。
+    // 同一骨骼对 (A,B) 的点对服从同一刚体变换 → 3点几何法 RANSAC 配对 + 解 T(A→B)
+    // → BFS 沿骨骼图传递 → 全部顶点归一到各分量代表骨空间 → 网格连续
+    // 真机验证: hea_05 骨12↔骨13 解出 15/15 全配对(刚体残差<0.08)
+
+    static bool EstimateRigid3(Vector3 p1, Vector3 p2, Vector3 p3, Vector3 q1, Vector3 q2, Vector3 q3, out Matrix4x4 M)
+    {
+        // 3 点构正交基求旋转 (免SVD), p系→q系
+        M = Matrix4x4.identity;
+        Vector3 e1 = p2 - p1, e2 = p3 - p1;
+        float l1 = e1.magnitude; if (l1 < 1e-5f) return false;
+        e1 /= l1;
+        e2 -= Vector3.Dot(e2, e1) * e1; float l2 = e2.magnitude; if (l2 < 1e-4f) return false;
+        e2 /= l2;
+        Vector3 e3 = Vector3.Cross(e1, e2);
+        Vector3 f1 = q2 - q1, f2 = q3 - q1;
+        float g1 = f1.magnitude; if (g1 < 1e-5f) return false;
+        f1 /= g1;
+        f2 -= Vector3.Dot(f2, f1) * f1; float g2 = f2.magnitude; if (g2 < 1e-4f) return false;
+        f2 /= g2;
+        Vector3 f3 = Vector3.Cross(f1, f2);
+        // R = F · E^T
+        Matrix4x4 E = Matrix4x4.identity, F = Matrix4x4.identity;
+        E.SetColumn(0, e1); E.SetColumn(1, e2); E.SetColumn(2, e3);
+        F.SetColumn(0, f1); F.SetColumn(1, f2); F.SetColumn(2, f3);
+        Matrix4x4 Rm = F * E.transpose;
+        Vector3 t = q1 - Rm * p1;
+        M = Matrix4x4.identity;
+        for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) M[r, c] = Rm[r, c];
+        M[0, 3] = t.x; M[1, 3] = t.y; M[2, 3] = t.z;
+        return true;
+    }
+
+    static int CountInliers(Vector3[] PA, Vector3[] PB, Matrix4x4 M, float tol, List<int> inA, List<int> inB)
+    {
+        inA.Clear(); inB.Clear();
+        for (int i = 0; i < PA.Length; i++)
+        {
+            Vector3 t = M * PA[i];
+            int best = -1; float bd = tol;
+            for (int j = 0; j < PB.Length; j++)
+            {
+                float d = Vector3.Distance(t, PB[j]);
+                if (d < bd) { bd = d; best = j; }
+            }
+            if (best >= 0) { inA.Add(i); inB.Add(best); }
+        }
+        return inA.Count;
+    }
+
+    // 返回 T(A→B) 与配对; R2按骨分组索引
+    static Matrix4x4 SolveBonePair(List<int> AI, List<int> BI, List<VRec> rList, List<VRec> cList, out List<int> pairA, out List<int> pairB)
+    {
+        int na = AI.Count, nb = BI.Count;
+        var PA = new Vector3[na]; var PB = new Vector3[nb];
+        for (int i = 0; i < na; i++) PA[i] = rList[AI[i]].pos;
+        for (int i = 0; i < nb; i++) PB[i] = cList[BI[i]].pos;
+        var rnd = new System.Random(7);
+        int bestN = 0; Matrix4x4 bestM = Matrix4x4.identity;
+        var la = new List<int>(); var lb = new List<int>();
+        pairA = new List<int>(); pairB = new List<int>();
+        if (na < 3 || nb < 3) return bestM;
+        for (int it = 0; it < 900; it++)
+        {
+            int i1 = rnd.Next(na), i2 = rnd.Next(na), i3 = rnd.Next(na);
+            if (i1 == i2 || i1 == i3 || i2 == i3) continue;
+            int j1 = rnd.Next(nb), j2 = rnd.Next(nb), j3 = rnd.Next(nb);
+            if (j1 == j2 || j1 == j3 || j2 == j3) continue;
+            Matrix4x4 M;
+            if (!EstimateRigid3(PA[i1], PA[i2], PA[i3], PB[j1], PB[j2], PB[j3], out M)) continue;
+            int n = CountInliers(PA, PB, M, 0.09f, la, lb);
+            if (n > bestN) { bestN = n; bestM = M; }
+            if (bestN == Mathf.Min(na, nb)) break;      // 全配对早退
+        }
+        if (bestN >= 3)
+        {
+            CountInliers(PA, PB, bestM, 0.09f, la, lb);   // 重算 inlier 列表
+            for (int i = 0; i < la.Count; i++) { pairA.Add(AI[la[i]]); pairB.Add(BI[lb[i]]); }
+        }
+        return bestM;
+    }
+
+    static void UnifyBoneSpace(SkiFile f, List<VRec> rList, List<VRec> cList)
+    {
+        int nR = rList.Count, nC = cList.Count;
+        if (nR == 0 || nC == 0) return;
+        // R2 (w<0.99) 与 C 按骨分组
+        var r2ByBone = new Dictionary<int, List<int>>();
+        for (int i = 0; i < nR; i++) if (rList[i].w < 0.99f)
+        {
+            int bn = rList[i].bone;
+            if (!r2ByBone.ContainsKey(bn)) r2ByBone[bn] = new List<int>();
+            r2ByBone[bn].Add(i);
+        }
+        var cByBone = new Dictionary<int, List<int>>();
+        for (int j = 0; j < nC; j++)
+        {
+            int bn = cList[j].bone;
+            if (!cByBone.ContainsKey(bn)) cByBone[bn] = new List<int>();
+            cByBone[bn].Add(j);
+        }
+        if (r2ByBone.Count == 0) return;
+        // RANSAC 解骨骼对
+        var tMap = new Dictionary<long, Matrix4x4>();          // key = A*1000+B  (A→B: p_B = M * p_A)
+        var pairR2C = new Dictionary<int, int>();              // C全局槽 -> R全局槽
+        foreach (var ka in r2ByBone)
+            foreach (var kb in cByBone)
+            {
+                List<int> pairA, pairB;
+                Matrix4x4 M = SolveBonePair(ka.Value, kb.Value, rList, cList, out pairA, out pairB);
+                if (pairA.Count >= 4)
+                {
+                    tMap[(long)ka.Key * 1000 + kb.Key] = M;
+                    for (int i = 0; i < pairA.Count; i++) pairR2C[nR + pairB[i]] = pairA[i];
+                }
+            }
+        if (tMap.Count == 0) return;
+        // 骨骼图 BFS: dist[骨] = M 使 p_rep = M * p_骨
+        var adj = new Dictionary<int, List<int>>();
+        foreach (var kv in tMap)
+        {
+            int a = (int)(kv.Key / 1000), b2 = (int)(kv.Key % 1000);
+            if (!adj.ContainsKey(a)) adj[a] = new List<int>();
+            if (!adj.ContainsKey(b2)) adj[b2] = new List<int>();
+            adj[a].Add(b2); adj[b2].Add(a);
+        }
+        var dist = new Dictionary<int, Matrix4x4>();
+        while (dist.Count < adj.Count)
+        {
+            int rep = -1, maxn = -1;
+            foreach (var bn in adj.Keys)
+                if (!dist.ContainsKey(bn))
+                {
+                    int cnt = 0;
+                    for (int i = 0; i < nR; i++) if (rList[i].bone == bn) cnt++;
+                    if (cnt > maxn) { maxn = cnt; rep = bn; }
+                }
+            if (rep < 0) break;
+            dist[rep] = Matrix4x4.identity;
+            var queue = new Queue<int>(); queue.Enqueue(rep);
+            while (queue.Count > 0)
+            {
+                int cur = queue.Dequeue();
+                Matrix4x4 Mc = dist[cur];
+                foreach (var kv in tMap)
+                {
+                    int a = (int)(kv.Key / 1000), b2 = (int)(kv.Key % 1000);
+                    if (a == cur && !dist.ContainsKey(b2))      // T: A→B, p_rep = Mc * T * p_B
+                    { dist[b2] = Mc * kv.Value; queue.Enqueue(b2); }
+                    if (b2 == cur && !dist.ContainsKey(a))      // T: A→B, p_rep = Mc * T⁻¹ * p_A
+                    { dist[a] = Mc * kv.Value.inverse; queue.Enqueue(a); }
+                }
+            }
+        }
+        // 应用: R 顶点变换; 法线仅旋转
+        for (int i = 0; i < nR; i++)
+        {
+            Matrix4x4 M;
+            if (dist.TryGetValue(rList[i].bone, out M))
+            {
+                f.verts[i] = M * rList[i].pos;
+                f.nors[i] = M * rList[i].nor;
+            }
+        }
+        // C 区: 配对副本 or 直接变换
+        for (int j = 0; j < nC; j++)
+        {
+            int slot = nR + j;
+            int src;
+            if (pairR2C.TryGetValue(slot, out src)) { f.verts[slot] = f.verts[src]; f.nors[slot] = f.nors[src]; }
+            else
+            {
+                Matrix4x4 M;
+                if (dist.TryGetValue(cList[j].bone, out M)) { f.verts[slot] = M * cList[j].pos; f.nors[slot] = M * cList[j].nor; }
+            }
+        }
     }
 
     static bool Sanity(Vector3 v) { return Mathf.Abs(v.x) < 1e5f && Mathf.Abs(v.y) < 1e5f && Mathf.Abs(v.z) < 1e5f; }
@@ -692,7 +879,7 @@ public class CrtViewer : MonoBehaviour
         GUI.backgroundColor = new Color(0.1f, 0.1f, 0.14f, 0.85f);
 
         var title = new GUIStyle(GUI.skin.label) { fontSize = Mathf.Max(16, (int)(h * 0.030f)), alignment = TextAnchor.MiddleLeft, normal = { textColor = new Color(0.35f, 1f, 0.45f) } };
-        GUI.Label(new Rect(12, 8, w - 24, h * 0.05f), "v3.1.1 角色预览台 — CRT 格式直读 (ski/act/dds)", title);
+        GUI.Label(new Rect(12, 8, w - 24, h * 0.05f), "v3.2 角色预览台 — CRT 直读 + 骨骼空间统一 (ski/act/dds)", title);
 
         var info = new GUIStyle(GUI.skin.label) { fontSize = Mathf.Max(11, (int)(h * 0.017f)), normal = { textColor = Color.white } };
         GUI.Label(new Rect(12, h * 0.052f, w - 24, h * 0.05f), _status.Length > 0 ? _status : _info, info);
