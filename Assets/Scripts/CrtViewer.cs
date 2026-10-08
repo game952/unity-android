@@ -293,7 +293,8 @@ public class CrtViewer : MonoBehaviour
         E.SetColumn(0, e1); E.SetColumn(1, e2); E.SetColumn(2, e3);
         F.SetColumn(0, f1); F.SetColumn(1, f2); F.SetColumn(2, f3);
         Matrix4x4 Rm = F * E.transpose;
-        Vector3 t = q1 - Rm * p1;
+        Vector3 rp = Rm * p1;          // Matrix4x4*Vector3 结果为 Vector4, 先赋值转回 Vector3 (CS0034 修复)
+        Vector3 t = q1 - rp;
         M = Matrix4x4.identity;
         for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) M[r, c] = Rm[r, c];
         M[0, 3] = t.x; M[1, 3] = t.y; M[2, 3] = t.z;
@@ -329,6 +330,7 @@ public class CrtViewer : MonoBehaviour
         var la = new List<int>(); var lb = new List<int>();
         pairA = new List<int>(); pairB = new List<int>();
         if (na < 3 || nb < 3) return bestM;
+        if (Math.Abs(na - nb) > 2) return bestM;   // R2/C 同一点集双记录, 点数应相等 — 预筛砍掉绝大部分无效组合
         for (int it = 0; it < 900; it++)
         {
             int i1 = rnd.Next(na), i2 = rnd.Next(na), i3 = rnd.Next(na);
@@ -347,6 +349,13 @@ public class CrtViewer : MonoBehaviour
             for (int i = 0; i < la.Count; i++) { pairA.Add(AI[la[i]]); pairB.Add(BI[lb[i]]); }
         }
         return bestM;
+    }
+
+    static Matrix4x4 RotOnly(Matrix4x4 M)
+    {
+        var R = Matrix4x4.identity;
+        for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) R[r, c] = M[r, c];
+        return R;
     }
 
     static void UnifyBoneSpace(SkiFile f, List<VRec> rList, List<VRec> cList)
@@ -428,7 +437,7 @@ public class CrtViewer : MonoBehaviour
             if (dist.TryGetValue(rList[i].bone, out M))
             {
                 f.verts[i] = M * rList[i].pos;
-                f.nors[i] = M * rList[i].nor;
+                f.nors[i] = RotOnly(M) * rList[i].nor;
             }
         }
         // C 区: 配对副本 or 直接变换
@@ -440,7 +449,7 @@ public class CrtViewer : MonoBehaviour
             else
             {
                 Matrix4x4 M;
-                if (dist.TryGetValue(cList[j].bone, out M)) { f.verts[slot] = M * cList[j].pos; f.nors[slot] = M * cList[j].nor; }
+                if (dist.TryGetValue(cList[j].bone, out M)) { f.verts[slot] = M * cList[j].pos; f.nors[slot] = RotOnly(M) * cList[j].nor; }
             }
         }
     }
@@ -879,7 +888,7 @@ public class CrtViewer : MonoBehaviour
         GUI.backgroundColor = new Color(0.1f, 0.1f, 0.14f, 0.85f);
 
         var title = new GUIStyle(GUI.skin.label) { fontSize = Mathf.Max(16, (int)(h * 0.030f)), alignment = TextAnchor.MiddleLeft, normal = { textColor = new Color(0.35f, 1f, 0.45f) } };
-        GUI.Label(new Rect(12, 8, w - 24, h * 0.05f), "v3.2 角色预览台 — CRT 直读 + 骨骼空间统一 (ski/act/dds)", title);
+        GUI.Label(new Rect(12, 8, w - 24, h * 0.05f), "v3.2.1 角色预览台 — CRT 直读 + 骨骼空间统一 (ski/act/dds)", title);
 
         var info = new GUIStyle(GUI.skin.label) { fontSize = Mathf.Max(11, (int)(h * 0.017f)), normal = { textColor = Color.white } };
         GUI.Label(new Rect(12, h * 0.052f, w - 24, h * 0.05f), _status.Length > 0 ? _status : _info, info);
