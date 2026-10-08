@@ -111,6 +111,8 @@ public class HelloWorld : MonoBehaviour
         {
             _verdict = "SELF-CHECK PASS  " + ok + "/" + picked.Count;
             _verdictColor = new Color(0.30f, 1f, 0.35f);
+            // v3: 自检全绿 → 启动 CRT 资源查看器（接管屏幕）
+            StartCoroutine(SpawnViewer());
         }
         else if (ok == picked.Count)
         {
@@ -124,6 +126,13 @@ public class HelloWorld : MonoBehaviour
             _lines.Add("首个失败: " + firstErr);
         }
         _finished = true;
+    }
+
+    // v3: 延迟 2 秒让用户看清自检结果，然后挂上查看器（本文件 GUID 不变，场景零改动）
+    IEnumerator SpawnViewer()
+    {
+        yield return new WaitForSeconds(2.0f);
+        gameObject.AddComponent<CrtViewer>();
     }
 
     void Fail(string msg)
@@ -159,6 +168,7 @@ public class HelloWorld : MonoBehaviour
 
     private void OnGUI()
     {
+        if (CrtViewer.ViewerActive) return;   // v3: 查看器已接管屏幕
         float h = Screen.height;
         float w = Screen.width;
 
