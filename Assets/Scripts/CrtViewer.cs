@@ -356,6 +356,13 @@ public class CrtViewer : MonoBehaviour
     // v3.5: Kabsch 6D + 退化防护
     //   n<3 或位置点云扁平 → 旋转欠定(绕轴自由) → 强制 R=I 只保留质心平移 (v3.4 手机碎片的根因:
     //   单点对走法线拟合, 绕轴随机旋转被 norRes≈0 骗过检验, 污染全图)
+    // v3.6.3: 垃圾法线过滤 — 实机截图法线残差=6.6亿(天文数字) → 垃圾法线(0/越界/NaN)以权重20
+    //   混入协方差劫持旋转解 → norRes 爆炸 → trust=false → 强边全灭 → 图空 → 部件堆积(v3.5.1 实机 BFS覆盖=0/0)
+    static bool NorBad(Vector3 v)
+    {
+        float m2 = v.x * v.x + v.y * v.y + v.z * v.z;
+        return !(m2 > 1e-6f && m2 < 1e6f);     // 单位法线≈1; NaN 比较恒 false → !false=true 正确判垃圾
+    }
     static Matrix4x4 KabschFit(List<Vector3> P, List<Vector3> Q, List<Vector3> PN, List<Vector3> QN, out float avgRes, out float norRes, out bool rotTrust, float minSigma = 0.5f)
     {
         var I = Matrix4x4.identity;
@@ -405,6 +412,7 @@ public class CrtViewer : MonoBehaviour
             if (PN != null && i < PN.Count)   // 法线协方差: 同一旋转 R 作用于法线对, 不中心化
             {
                 Vector3 nv = PN[i], mv = QN[i];
+                if (NorBad(nv) || NorBad(mv)) continue;   // v3.6.3: 垃圾法线不参与求解
                 Sxx += WN * nv.x * mv.x; Sxy += WN * nv.x * mv.y; Sxz += WN * nv.x * mv.z;
                 Syx += WN * nv.y * mv.x; Syy += WN * nv.y * mv.y; Syz += WN * nv.y * mv.z;
                 Szx += WN * nv.z * mv.x; Szy += WN * nv.z * mv.y; Szz += WN * nv.z * mv.z;
@@ -436,6 +444,7 @@ public class CrtViewer : MonoBehaviour
             {
                 for (int i = 0; i < n && i < PN.Count; i++)
                 {
+                    if (NorBad(PN[i]) || NorBad(QN[i])) continue;   // v3.6.3: 过滤垃圾法线再检验
                     Vector3 rn = M.MultiplyVector(PN[i]);
                     nsum += (rn - QN[i]).magnitude; nc++;
                 }
@@ -457,8 +466,8 @@ public class CrtViewer : MonoBehaviour
     static Dictionary<int, Matrix4x4> UnifyBoneSpace(SkiFile f, List<VRec> rList, List<VRec> cList)
     {
         int nR = rList.Count, nC = cList.Count;
-        _kabschRes = 0f; _kabschNor = 0f; _kabschCnt = 0; _flatCnt = 0;   // v3.4: 每文件重置统计
-        if (nR == 0 || nC == 0) return null;
+        _kabschRes = 0f; _kabschNor = 0f; _kabschCnt = 0;   // v3.4: 每文件重置统计
+        if (nR == 0 || nC == 0) { _skiStat = "统一跳过: R=" + nR + " C=" + nC; return null; }   // v3.6.3: 写统计防残留误导
         // v3.3: 顺序 FIFO 配对 — Rn 的 n = 影响骨骼数 (R1 不消耗 C, R2/R3 依次消耗)
         // 流序即对应关系: 每条 C 与最近的未满 R 主记录是同一顶点
         var paList = new List<Vector3>(); var pbList = new List<Vector3>();
@@ -489,7 +498,7 @@ public class CrtViewer : MonoBehaviour
                 fj++;
             }
         }
-        if (paList.Count == 0) return null;
+        if (paList.Count == 0) { _skiStat = "统一跳过: 配对=0 (R/C 流无交叉)"; return null; }   // v3.6.3
         // 骨对分组 → Kabsch 确定性求解 (297文件/4068骨对 实测全零残差)
         var tMap = new Dictionary<long, Matrix4x4>();          // 强边: key = A*1000+B (A→B), 旋转可信
         var tMapFlat = new Dictionary<long, Matrix4x4>();      // v3.5 弱边: R=I 纯平移兜底
@@ -510,22 +519,21 @@ public class CrtViewer : MonoBehaviour
             float res, nres; bool rotT;
             Matrix4x4 M = KabschFit(P, Q, PN, QN, out res, out nres, out rotT);
             if (rotT && res < 0.05f) tMap[kv.Key] = M;                 // 强边: 旋转可信且精确
-            else if (!rotT && res < 20f) tMapFlat[kv.Key] = M;         // 弱边: R=I 平移兜底 (错配 res 巨大, 拒)
+            else if (res < 50f)                                        // v3.6.3: 兜底带扩到全部 res<50 (原仅 !rotT&&res<20)
+            {                                                          //   v3.5.1 实机堆积根因: 强边被 res<0.05 全拒 + 弱边拒绝 → 图空(BFS=0/0) → 完全不统一
+                Matrix4x4 MF = Matrix4x4.identity;                     // R=I, 只取 Kabsch 质心平移 (位置统一保底, 朝向由强边链修正)
+                MF[0, 3] = M[0, 3]; MF[1, 3] = M[1, 3]; MF[2, 3] = M[2, 3];
+                tMapFlat[kv.Key] = MF;
+            }
             _kabschRes += res; _kabschNor += nres; _kabschCnt++;
-            if (!rotT) _flatCnt++;
             for (int k = 0; k < kv.Value.Count; k++)           // C 顶点无条件抄配对 R (同一点)
                 pairR2C[nR + bSrc[kv.Value[k]]] = aSrc[kv.Value[k]];
         }
-        if (tMap.Count == 0 && tMapFlat.Count == 0) return null;
+        if (tMap.Count == 0 && tMapFlat.Count == 0) { _skiStat = "统一失败: 全部骨对 res≥50 拒绝"; return null; }
         // 骨骼图 BFS: dist[骨] = M 使 p_rep = M * p_骨
         var adj = new Dictionary<int, List<int>>();
-        foreach (var kv in tMap)
-        {
-            int a = (int)(kv.Key / 1000), b2 = (int)(kv.Key % 1000);
-            if (!adj.ContainsKey(a)) adj[a] = new List<int>();
-            if (!adj.ContainsKey(b2)) adj[b2] = new List<int>();
-            adj[a].Add(b2); adj[b2].Add(a);
-        }
+        foreach (var kv in tMap) AddEdge(adj, (int)(kv.Key / 1000), (int)(kv.Key % 1000));
+        foreach (var kv in tMapFlat) AddEdge(adj, (int)(kv.Key / 1000), (int)(kv.Key % 1000));   // v3.6.3: 弱边也建图(保证连通)
         var dist = new Dictionary<int, Matrix4x4>();
         while (dist.Count < adj.Count)
         {
@@ -544,16 +552,21 @@ public class CrtViewer : MonoBehaviour
             {
                 int cur = queue.Dequeue();
                 Matrix4x4 Mc = dist[cur];
+                // v3.4 修 BFS 方向 bug: p_rep = dist[cur]*p_cur
+                //   cur=A: p_rep = Mc*p_A, p_A = T⁻¹*p_B  ⇒  dist[B] = Mc * T⁻¹
+                //   cur=B: p_rep = Mc*p_B, p_B = T*p_A    ⇒  dist[A] = Mc * T
+                // v3.6.3: 强边+弱边同语义传播 (p_B = T·p_A); 弱边 T 无旋转 → 弱连通部件继承种子朝向, 位置统一
                 foreach (var kv in tMap)
                 {
                     int a = (int)(kv.Key / 1000), b2 = (int)(kv.Key % 1000);
-                    // v3.4 修 BFS 方向 bug: p_rep = dist[cur]*p_cur
-                    //   cur=A: p_rep = Mc*p_A, p_A = T⁻¹*p_B  ⇒  dist[B] = Mc * T⁻¹
-                    //   cur=B: p_rep = Mc*p_B, p_B = T*p_A    ⇒  dist[A] = Mc * T
-                    if (a == cur && !dist.ContainsKey(b2))
-                    { dist[b2] = Mc * kv.Value.inverse; queue.Enqueue(b2); }
-                    if (b2 == cur && !dist.ContainsKey(a))
-                    { dist[a] = Mc * kv.Value; queue.Enqueue(a); }
+                    if (a == cur && !dist.ContainsKey(b2)) { dist[b2] = Mc * kv.Value.inverse; queue.Enqueue(b2); }
+                    if (b2 == cur && !dist.ContainsKey(a)) { dist[a] = Mc * kv.Value; queue.Enqueue(a); }
+                }
+                foreach (var kv in tMapFlat)
+                {
+                    int a = (int)(kv.Key / 1000), b2 = (int)(kv.Key % 1000);
+                    if (a == cur && !dist.ContainsKey(b2)) { dist[b2] = Mc * kv.Value.inverse; queue.Enqueue(b2); }
+                    if (b2 == cur && !dist.ContainsKey(a)) { dist[a] = Mc * kv.Value; queue.Enqueue(a); }
                 }
             }
         }
@@ -608,7 +621,7 @@ public class CrtViewer : MonoBehaviour
         float avgN = _kabschCnt > 0 ? _kabschNor / _kabschCnt : 0f;
         int paired = pairR2C.Count;
         _skiStat = string.Format("R1={0} R2={1} R3={2} C={3} 对={4} 骨对={5} 强={6} 平移={7} 位置残差={8:F4} 法线残差={9:F3} BFS覆盖={10}/{11}",
-            cR1, cR2, cR3, nC, paList.Count, grp.Count, grp.Count - _flatCnt, _flatCnt, avgK, avgN, dist.Count, adj.Count);
+            cR1, cR2, cR3, nC, paList.Count, grp.Count, tMap.Count, tMapFlat.Count, avgK, avgN, dist.Count, adj.Count);   // v3.6.3: 强/平移=真实图边数
         return dist;
     }
 
@@ -718,7 +731,17 @@ public class CrtViewer : MonoBehaviour
     }
 
     static string _skiStat = "";           // v3.4: 最近一次 ski 骨骼统一诊断
-    static float _kabschRes, _kabschNor; static int _kabschCnt, _flatCnt;
+    static float _kabschRes, _kabschNor; static int _kabschCnt;
+
+    // v3.6.3: 骨骼图无向边 (强边+弱边共用)
+    static void AddEdge(Dictionary<int, List<int>> adj, int a, int b)
+    {
+        List<int> l;
+        if (!adj.TryGetValue(a, out l)) { l = new List<int>(); adj[a] = l; }
+        l.Add(b);
+        if (!adj.TryGetValue(b, out l)) { l = new List<int>(); adj[b] = l; }
+        l.Add(a);
+    }
 
     static bool Sanity(Vector3 v) { return Mathf.Abs(v.x) < 1e5f && Mathf.Abs(v.y) < 1e5f && Mathf.Abs(v.z) < 1e5f; }
 
@@ -1229,7 +1252,7 @@ public class CrtViewer : MonoBehaviour
         GUI.backgroundColor = new Color(0.1f, 0.1f, 0.14f, 0.85f);
 
         var title = new GUIStyle(GUI.skin.label) { fontSize = Mathf.Max(16, (int)(h * 0.030f)), alignment = TextAnchor.MiddleLeft, normal = { textColor = new Color(0.35f, 1f, 0.45f) } };
-        GUI.Label(new Rect(12, 8, w - 24, h * 0.05f), "v3.6.2 角色预览台 — CRT 直读 + 骨骼空间统一+孤骨吸附 (ski/act/dds)", title);
+        GUI.Label(new Rect(12, 8, w - 24, h * 0.05f), "v3.6.3 角色预览台 — CRT 直读 + 骨骼空间统一+孤骨吸附 (ski/act/dds)", title);
 
         var info = new GUIStyle(GUI.skin.label) { fontSize = Mathf.Max(11, (int)(h * 0.017f)), normal = { textColor = Color.white } };
         GUI.Label(new Rect(12, h * 0.052f, w - 24, h * 0.05f), _status.Length > 0 ? _status : _info, info);
