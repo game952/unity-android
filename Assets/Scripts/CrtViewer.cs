@@ -269,6 +269,16 @@ public class CrtViewer : MonoBehaviour
 
         List<VRec> recs; int ep;
         int vs = FindVertStart(b, mtlOff, out recs, out ep);
+        // v3.8: 顶点流头 `01 01 01 00` (4B) — firstA A 记录从 +4 起。
+        //   v3.7 把流头当 firstA 读 26B → 多吞 4B → gap 爬行丢首条 A 的 UV。
+        //   297文件字节级验证: wai_07/glo_07/hea_00 等全部以此 4B 头开始。
+        if (vs >= 0 && vs + 4 <= b.Length && b[vs] == 1 && b[vs + 1] == 1 && b[vs + 2] == 1 && b[vs + 3] == 0)
+        {
+            List<VRec> recs2; int ep2;
+            int vs2 = FindVertStart(b, vs + 4, out recs2, out ep2);
+            if (vs2 == vs + 4 && recs2 != null && recs2.Count >= recs.Count)
+            { recs = recs2; ep = ep2; vs = vs2; }
+        }
         if (vs < 0 || recs == null) throw new Exception("顶点流未定位: " + f.name);
 
         // 顶点池 = R块(流序) + C块(流序); UV = 第 i 个 A 记录
@@ -281,7 +291,9 @@ public class CrtViewer : MonoBehaviour
             else rList.Add(r);
         }
         foreach (var r in rList) { f.verts.Add(r.pos); f.nors.Add(r.nor); }
-        foreach (var r in cList) { f.verts.Add(r.pos); f.nors.Add(r.nor); }
+        // v3.8: C 记录 = 副骨坐标副本(同一顶点第二骨骼空间), 不占顶点池!
+        //   297文件验证: 剔除索引怪值后 max索引 = R数-1 严格成立(hea_00 155/155, sho_00 128/128, wai_07 31/31)
+        //   v3.7 把 C 加入池 → 池虚高(glo_07 389 vs 真实284), 索引择优/需数全歪
         for (int i = 0; i < f.verts.Count; i++)
             f.uvs.Add(i < aList.Count ? aList[i].uv : Vector2.zero);
 
@@ -297,19 +309,27 @@ public class CrtViewer : MonoBehaviour
         }
         float rBE = InRate(idxBE, f.verts.Count), rLE = InRate(idxLE, f.verts.Count);
         var bestIdx = rBE >= rLE ? idxBE : idxLE;
-        f.tris = StripAssemble(bestIdx, f.verts.Count);
+        // v3.8: 索引怪值剔除 — 索引流中嵌入的非索引数据(值≥顶点数, 高字节 01/03/04 特征)
+        //   297文件验证: glo_07 怪值15(398~504), clo_03 怪值24(961~1023), hea_03 怪值50, clo_07 怪值14
+        //   剔除后 max索引 = 顶点数-1 严格闭合 → "池<需缺N" 全部消失
+        int nvReal = f.verts.Count;
+        var cleanIdx = new List<int>(bestIdx.Count);
+        for (int i = 0; i < bestIdx.Count; i++) if (bestIdx[i] < nvReal) cleanIdx.Add(bestIdx[i]);
+        int junkCnt = bestIdx.Count - cleanIdx.Count;
+        f.tris = StripAssemble(cleanIdx, nvReal);
         for (int s = 0, acc = 0; s < idxOffs.Count; s++)
         {
-            for (int i = 0; i < idxCnts[s]; i++) f.subs[s].faces.Add(bestIdx[acc + i]);
+            for (int i = 0; i < idxCnts[s]; i++) { int v = bestIdx[acc + i]; if (v < nvReal) f.subs[s].faces.Add(v); }
             acc += idxCnts[s];
         }
         if (f.tris.Count < 3) throw new Exception("面装配为空: " + f.name);
         // v3.6: 孤骨吸附 — 面拓扑就绪后执行
         LoneBoneAttach(f, rList, cList, distMap != null ? new HashSet<int>(distMap.Keys) : null);
-        // v3.7: 解析指纹 — maxIndex+1 = 顶点池硬下限(三角网格规律); 池<需 = 顶点流残缺(碎片根因数据佐证)
+        // v3.8: 解析指纹 — 需数用剔除怪值后的真实 max; 怪剔数入状态行
         int maxIdx = 0;
-        for (int i = 0; i < bestIdx.Count; i++) if (bestIdx[i] > maxIdx) maxIdx = bestIdx[i];
+        for (int i = 0; i < cleanIdx.Count; i++) if (cleanIdx[i] > maxIdx) maxIdx = cleanIdx[i];
         _skiStat += " 池=" + f.verts.Count + "/需=" + (maxIdx + 1)
+            + (junkCnt > 0 ? " 怪剔=" + junkCnt : "")
             + (f.verts.Count < maxIdx + 1 ? "⚠缺" + (maxIdx + 1 - f.verts.Count) : "")
             + (_walkDiag.Length > 0 ? " " + _walkDiag : "");
         return f;
@@ -613,18 +633,8 @@ public class CrtViewer : MonoBehaviour
                 f.nors[i] = RotOnly(M) * rList[i].nor;
             }
         }
-        // C 区: 配对副本 or 直接变换
-        for (int j = 0; j < nC; j++)
-        {
-            int slot = nR + j;
-            int src;
-            if (pairR2C.TryGetValue(slot, out src)) { f.verts[slot] = f.verts[src]; f.nors[slot] = f.nors[src]; }
-            else
-            {
-                Matrix4x4 M;
-                if (dist.TryGetValue(cList[j].bone, out M)) { f.verts[slot] = M * cList[j].pos; f.nors[slot] = RotOnly(M) * cList[j].nor; }
-            }
-        }
+        // v3.8: C 区不再写顶点池 — C 是配对 R 顶点的副骨坐标副本(索引从不引用), 顶点池 = R 数
+        //   (v3.7 写 verts[nR+j] 会把池撑大到 nR+nC, 与索引 max 严重脱节)
         // v3.4 诊断统计 (HUD 显示, 用户截图回报用)
         int cR1 = 0, cR2 = 0, cR3 = 0;
         foreach (var r in rList)
@@ -1046,9 +1056,12 @@ public class CrtViewer : MonoBehaviour
         new PartGroup{ label="甲袍·防具(3)", dir="creature/actor/", isAct=false,
             files=new []{"a_wt_m_clo_00.ski","a_wt_m_clo_01.ski","a_wt_m_clo_02.ski","a_wt_m_clo_03.ski","a_wt_m_clo_04.ski","a_wt_m_clo_05.ski","a_wt_m_clo_06.ski","a_wt_m_clo_07.ski","a_wt_m_clo_08.ski","a_wt_m_clo_09.ski","a_wt_m_clo_fashion01.ski","a_wt_m_clo_fashion02.ski","a_wt_m_clo_suit02.ski","a_wt_m_clo_suit03.ski"},
             names=new []{"狂战·甲袍 Lv10","狂战·甲袍 Lv17","狂战·甲袍 Lv27","狂战·甲袍 Lv37","狂战·甲袍 Lv47","狂战·甲袍 Lv57","狂战·甲袍 Lv67","狂战·甲袍 Lv77","狂战·甲袍 Lv87","狂战·甲袍 Lv97","时装·1","时装·2","稀有时装·2","稀有时装·3"}},
+        new PartGroup{ label="头部(脸)", dir="creature/actor/", isAct=false,
+            files=new []{"a_wt_m_hea_00.ski"},
+            names=new []{"狂战·头部/裸脸 (155顶点·690面·单骨)"}},
         new PartGroup{ label="头饰", dir="creature/actor/", isAct=false,
-            files=new []{"a_wt_m_hea_00.ski","a_wt_m_hea_01.ski","a_wt_m_hea_02.ski","a_wt_m_hea_03.ski","a_wt_m_hea_04.ski","a_wt_m_hea_05.ski"},
-            names=new []{"狂战·头饰 Lv10","狂战·头饰 Lv17","狂战·头饰 Lv27","狂战·头饰 Lv37","狂战·头饰 Lv47","狂战·头饰 Lv57"}},
+            files=new []{"a_wt_m_hea_01.ski","a_wt_m_hea_02.ski","a_wt_m_hea_03.ski","a_wt_m_hea_04.ski","a_wt_m_hea_05.ski"},
+            names=new []{"头饰·1","头饰·2","头饰·3","头饰·4","头饰·5"}},
         // 防具(1) 手套
         new PartGroup{ label="手套·防具(1)", dir="creature/actor/", isAct=false,
             files=new []{"a_wt_m_glo_00.ski","a_wt_m_glo_01.ski","a_wt_m_glo_02.ski","a_wt_m_glo_03.ski","a_wt_m_glo_04.ski","a_wt_m_glo_05.ski","a_wt_m_glo_06.ski","a_wt_m_glo_07.ski","a_wt_m_glo_08.ski","a_wt_m_glo_09.ski"},
@@ -1338,10 +1351,56 @@ public class CrtViewer : MonoBehaviour
         GUI.Label(new Rect(w * 0.18f, h * 0.70f, w * 0.64f, h * 0.06f),
             string.Format("{0}  [{1}/{2}]\n{3}", grp.label, _idx + 1, grp.files.Length, grp.files[_idx]), mid);
 
+        // v3.8: 职业扫描按钮 — 探测其他职业(术士/道士/风舞者)的部件文件前缀
+        var scb = new GUIStyle(GUI.skin.button) { fontSize = Mathf.Max(12, (int)(h * 0.018f)) };
+        GUI.backgroundColor = _scanning ? new Color(0.9f, 0.6f, 0.2f) : new Color(0.55f, 0.25f, 0.75f);
+        if (GUI.Button(new Rect(12, h * 0.765f, w * 0.30f, h * 0.045f), _scanning ? "扫描中…" : "扫描其他职业", scb) && !_scanning && !_loading)
+            StartCoroutine(ScanJobs());
+
         var tip = new GUIStyle(GUI.skin.label) { fontSize = Mathf.Max(10, (int)(h * 0.015f)), alignment = TextAnchor.UpperLeft, normal = { textColor = new Color(0.75f, 0.78f, 0.85f) }, wordWrap = true };
-        GUI.Label(new Rect(12, h * 0.80f, w - 24, h * 0.19f),
-            "触摸滑动=旋转展台(滑动暂停自转·松手1秒恢复)  ·  v3.6 骨骼空间统一(顶点内配对+Kabsch 6D+强弱边BFS+孤骨吸附)\n" +
-            "整装狂战士(身体拼合+骨骼动画)待 v4：需从游戏包提取 role_wt_m_01.act\n" +
-            "Swap test: 服装/手套/鞋/外装/头/武器 已可实时切换", tip);
+        GUI.Label(new Rect(12, h * 0.815f, w - 24, h * 0.10f),
+            (_scanResult.Length > 0 ? _scanResult + "\n" : "") +
+            "v3.8: 流头4B修正 · C副本不入池 · 索引怪值剔除 · 头部/头饰拆分", tip);
+        var tip2 = new GUIStyle(GUI.skin.label) { fontSize = Mathf.Max(9, (int)(h * 0.013f)), alignment = TextAnchor.UpperLeft, normal = { textColor = new Color(0.55f, 0.58f, 0.66f) }, wordWrap = true };
+        GUI.Label(new Rect(12, h * 0.925f, w - 24, h * 0.07f),
+            "触摸滑动=旋转展台 · 骨骼统一Kabsch/BFS · 整装拼合待v4(role_wt_m_01.act)", tip2);
+    }
+
+    // ======================= v3.8: 职业前缀扫描 =======================
+    // 目标: 术士(邪灵术士·宝珠武器(6)) / 道士 / 风舞者 的部件文件前缀。
+    // 方法: 对候选职业缩写探测 a_XX_m_clo_00.ski (防具基础档必存在);
+    //       命中后探测武器段字母 w_XX{L}_m_01.act (j=剑 c=杵 z=珠 f=飞剑)。
+    static readonly string[] ScanPrefixes = {
+        "ss","xl","fs","ds","fd","fw","zs","sc","ws","ms","ck","jx","yx","zw","tl","em","gy","qx","sl","wm","wf","xs","fl","lz","jg","wx","fm","xw","dx","ms"
+    };
+    string _scanResult = "";
+    bool _scanning;
+    System.Collections.IEnumerator ScanJobs()
+    {
+        _scanning = true;
+        var found = new List<string>();
+        foreach (var p in ScanPrefixes)
+        {
+            string f1 = "creature/actor/a_" + p + "_m_clo_00.ski";
+            var req = UnityWebRequest.Get(SA(f1));
+            yield return req.SendWebRequest();
+            if (req.result == UnityWebRequest.Result.Success && req.downloadHandler.data != null && req.downloadHandler.data.Length > 100)
+            {
+                found.Add("★职业[" + p + "] a_" + p + "_m_clo_00.ski (" + req.downloadHandler.data.Length + "B)");
+                foreach (var L in new[] { "j", "c", "z", "f", "l", "g" })
+                {
+                    string f2 = "creature/actor/w_" + p + L + "_m_01.act";
+                    var r2 = UnityWebRequest.Get(SA(f2));
+                    yield return r2.SendWebRequest();
+                    if (r2.result == UnityWebRequest.Result.Success && r2.downloadHandler.data != null && r2.downloadHandler.data.Length > 100)
+                        found.Add("  武器 w_" + p + L + "_m_01.act (" + r2.downloadHandler.data.Length + "B)");
+                }
+            }
+            _scanResult = "扫描中… 已命中 " + found.Count + " 项\n" + string.Join("\n", found.ToArray());
+        }
+        _scanResult = found.Count > 0
+            ? "扫描完成, 命中 " + found.Count + " 项:\n" + string.Join("\n", found.ToArray())
+            : "扫描完成: 候选前缀均未命中 — 术士文件可能用别的命名, 请截此屏给我";
+        _scanning = false;
     }
 }
