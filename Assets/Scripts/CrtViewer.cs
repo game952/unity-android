@@ -46,8 +46,16 @@ using UnityEngine.Networking;
 //     → 全部顶点归一到代表骨空间, 无需骨骼文件！
 //     - Python 离线验证: hea_05 统一后渲染出连续实体头盔壳 (原碎片消失)
 //   - 条带滑窗装配保持 (v3.1.1 端序择优不变)
-// v4 计划：提取 role_wt_m_01.act 全身骨骼 → 整装拼合 + 动画
-// v4 计划：拿到身体骨骼后，按 bind 矩阵整装拼合 + 动画
+// v3.4 修复 (2026-10-09，真机回归：服装/脚碎片堆叠 + 剑[2/10]贴图404 + 头部纯白)：
+//   1) ★BFS方向bug实锤修复: v3.3 骨骼图传递的两个方向全反 (dist[B]应为 Mc·T⁻¹ 写成 Mc·T,
+//      dist[A]应为 Mc·T 写成 Mc·T⁻¹) → 离线复现: 手套/脚环残差100%超阈, 修正后全部归零
+//   2) Kabsch 6D 升级: 位置协方差 + 法线协方差(wn=20, 不中心化) — 共线缝点/单点对的
+//      旋转欠定用法线分布破简并; 拟合后法线残差>0.2 判旋转不可信 → R=I 只保留平移(防碎裂)
+//   3) 贴图404诊断: 全候选失败 → 模型品红 + 状态栏显示贴图名 (不再静默白模)
+//   4) HUD 增加解析统计行 (R1/R2/R3/C计数·骨对数·位置/法线残差·BFS覆盖), 供真机回报定位
+//   注: 武器(w_wtj/w_wtc)来自 act 内嵌 VaSkin, 其 slot→武器语义与原游戏的对应关系
+//       待 role_wt_m_01.act (整装骨骼) 到位后在 v4 校准
+// v4 计划：提取 role_wt_m_01.act 全身骨骼 → 整装拼合 + 动画 + 武器槽位校准
 // ============================================================================
 
 public class CrtViewer : MonoBehaviour
@@ -323,21 +331,18 @@ public class CrtViewer : MonoBehaviour
         ev = new float[] { A[0, 0], A[1, 1], A[2, 2], A[3, 3] };
     }
 
-    // v3.3: Kabsch 刚体拟合 (Horn四元数+Jacobi) — 求 M 使 Q≈M·P, avgRes=平均残差
-    static Matrix4x4 KabschFit(List<Vector3> P, List<Vector3> Q, out float avgRes)
+    // v3.4: Kabsch 刚体拟合 6D 升级 — 位置协方差 + 法线协方差(不中心化, wn=20)
+    //   共线/单点对的旋转欠定 → 法线分布破简并; 拟合后法线残差>0.2 判定旋转不可信 → R=I 只保留平移
+    static Matrix4x4 KabschFit(List<Vector3> P, List<Vector3> Q, List<Vector3> PN, List<Vector3> QN, out float avgRes, out float norRes)
     {
         var I = Matrix4x4.identity;
         int n = P.Count;
-        if (n == 0) { avgRes = 1e9f; return I; }
+        avgRes = 1e9f; norRes = 1e9f;
+        if (n == 0) return I;
         Vector3 pc = Vector3.zero, qc = Vector3.zero;
         for (int i = 0; i < n; i++) { pc += P[i]; qc += Q[i]; }
         pc /= n; qc /= n;
-        if (n == 1)
-        {
-            Vector3 t1 = qc - pc;
-            I[0, 3] = t1.x; I[1, 3] = t1.y; I[2, 3] = t1.z;
-            avgRes = 0f; return I;
-        }
+        const float WN = 20f;
         float Sxx = 0f, Sxy = 0f, Sxz = 0f, Syx = 0f, Syy = 0f, Syz = 0f, Szx = 0f, Szy = 0f, Szz = 0f;
         for (int i = 0; i < n; i++)
         {
@@ -345,6 +350,13 @@ public class CrtViewer : MonoBehaviour
             Sxx += p.x * q.x; Sxy += p.x * q.y; Sxz += p.x * q.z;
             Syx += p.y * q.x; Syy += p.y * q.y; Syz += p.y * q.z;
             Szx += p.z * q.x; Szy += p.z * q.y; Szz += p.z * q.z;
+            if (PN != null && i < PN.Count)   // 法线协方差: 同一旋转 R 作用于法线对, 不中心化
+            {
+                Vector3 nv = PN[i], mv = QN[i];
+                Sxx += WN * nv.x * mv.x; Sxy += WN * nv.x * mv.y; Sxz += WN * nv.x * mv.z;
+                Syx += WN * nv.y * mv.x; Syy += WN * nv.y * mv.y; Syz += WN * nv.y * mv.z;
+                Szx += WN * nv.z * mv.x; Szy += WN * nv.z * mv.y; Szz += WN * nv.z * mv.z;
+            }
         }
         // Horn 4x4 对称矩阵: 最大特征值的特征向量 = 最优旋转四元数 (w,x,y,z)
         float[] a = {
@@ -362,6 +374,23 @@ public class CrtViewer : MonoBehaviour
         M[0, 0] = qw2 + qx2 - qy2 - qz2; M[0, 1] = 2f * (qx * qy - qw * qz); M[0, 2] = 2f * (qx * qz + qw * qy);
         M[1, 0] = 2f * (qx * qy + qw * qz); M[1, 1] = qw2 - qx2 + qy2 - qz2; M[1, 2] = 2f * (qy * qz - qw * qx);
         M[2, 0] = 2f * (qx * qz - qw * qy); M[2, 1] = 2f * (qy * qz + qw * qx); M[2, 2] = qw2 - qx2 - qy2 + qz2;
+        // v3.4 法线检验: 旋转对不对? 不可信 → 单位旋转+质心平移 (平移总可信, 防碎裂)
+        float nsum = 0f; int nc = 0;
+        if (PN != null)
+        {
+            for (int i = 0; i < n && i < PN.Count; i++)
+            {
+                Vector3 rn = M.MultiplyVector(PN[i]);
+                nsum += (rn - QN[i]).magnitude; nc++;
+            }
+            if (nc > 0) norRes = nsum / nc;
+            if (norRes > 0.2f)
+            {
+                M = Matrix4x4.identity;
+                Vector3 t0 = qc - pc;
+                M[0, 3] = t0.x; M[1, 3] = t0.y; M[2, 3] = t0.z;
+            }
+        }
         Vector3 rp = M * pc;                    // Matrix4x4*Vector3 结果为 Vector4, 先赋值转回 Vector3
         Vector3 t = qc - rp;
         M[0, 3] = t.x; M[1, 3] = t.y; M[2, 3] = t.z;
@@ -374,12 +403,14 @@ public class CrtViewer : MonoBehaviour
     static void UnifyBoneSpace(SkiFile f, List<VRec> rList, List<VRec> cList)
     {
         int nR = rList.Count, nC = cList.Count;
+        _kabschRes = 0f; _kabschNor = 0f; _kabschCnt = 0;   // v3.4: 每文件重置统计
         if (nR == 0 || nC == 0) return;
         // v3.3: 顺序 FIFO 配对 — Rn 的 n = 影响骨骼数 (R1 不消耗 C, R2/R3 依次消耗)
         // 流序即对应关系: 每条 C 与最近的未满 R 主记录是同一顶点
         var paList = new List<Vector3>(); var pbList = new List<Vector3>();
+        var paNor = new List<Vector3>(); var pbNor = new List<Vector3>();   // v3.4: 法线参与 6D Kabsch
         var aSrc = new List<int>(); var bSrc = new List<int>();   // 配对 → rList/cList 全局下标
-        int fi = 0, fj = 0, head = -1, headLeft = 0, headBone = 0; Vector3 headPos = Vector3.zero;
+        int fi = 0, fj = 0, head = -1, headLeft = 0, headBone = 0; Vector3 headPos = Vector3.zero; Vector3 headNor = Vector3.zero;
         while (fi < nR || fj < nC)
         {
             bool takeR = fj >= nC || (fi < nR && rList[fi].si < cList[fj].si);
@@ -388,7 +419,7 @@ public class CrtViewer : MonoBehaviour
                 var r = rList[fi];
                 int nImp; int.TryParse(r.kind.Length > 1 ? r.kind.Substring(1) : "1", out nImp);
                 if (nImp < 1) nImp = 1;
-                if (nImp >= 2) { head = fi; headBone = r.bone; headPos = r.pos; headLeft = nImp - 1; }
+                if (nImp >= 2) { head = fi; headBone = r.bone; headPos = r.pos; headNor = r.nor; headLeft = nImp - 1; }
                 fi++;
             }
             else
@@ -397,6 +428,7 @@ public class CrtViewer : MonoBehaviour
                 if (headLeft > 0)
                 {
                     paList.Add(headPos); pbList.Add(c.pos);
+                    paNor.Add(headNor); pbNor.Add(c.nor);
                     aSrc.Add(head); bSrc.Add(fj);
                     headLeft--;
                 }
@@ -418,10 +450,12 @@ public class CrtViewer : MonoBehaviour
         foreach (var kv in grp)
         {
             var P = new List<Vector3>(); var Q = new List<Vector3>();
-            foreach (int k in kv.Value) { P.Add(paList[k]); Q.Add(pbList[k]); }
-            float res;
-            Matrix4x4 M = KabschFit(P, Q, out res);
+            var PN = new List<Vector3>(); var QN = new List<Vector3>();
+            foreach (int k in kv.Value) { P.Add(paList[k]); Q.Add(pbList[k]); PN.Add(paNor[k]); QN.Add(pbNor[k]); }
+            float res, nres;
+            Matrix4x4 M = KabschFit(P, Q, PN, QN, out res, out nres);
             if (res < 0.05f) tMap[kv.Key] = M;                 // 残差兜底
+            _kabschRes += res; _kabschNor += nres; _kabschCnt++;
             for (int k = 0; k < kv.Value.Count; k++)           // C 顶点无条件抄配对 R (同一点)
                 pairR2C[nR + bSrc[kv.Value[k]]] = aSrc[kv.Value[k]];
         }
@@ -456,10 +490,13 @@ public class CrtViewer : MonoBehaviour
                 foreach (var kv in tMap)
                 {
                     int a = (int)(kv.Key / 1000), b2 = (int)(kv.Key % 1000);
-                    if (a == cur && !dist.ContainsKey(b2))      // T: A→B, p_rep = Mc * T * p_B
-                    { dist[b2] = Mc * kv.Value; queue.Enqueue(b2); }
-                    if (b2 == cur && !dist.ContainsKey(a))      // T: A→B, p_rep = Mc * T⁻¹ * p_A
-                    { dist[a] = Mc * kv.Value.inverse; queue.Enqueue(a); }
+                    // v3.4 修 BFS 方向 bug: p_rep = dist[cur]*p_cur
+                    //   cur=A: p_rep = Mc*p_A, p_A = T⁻¹*p_B  ⇒  dist[B] = Mc * T⁻¹
+                    //   cur=B: p_rep = Mc*p_B, p_B = T*p_A    ⇒  dist[A] = Mc * T
+                    if (a == cur && !dist.ContainsKey(b2))
+                    { dist[b2] = Mc * kv.Value.inverse; queue.Enqueue(b2); }
+                    if (b2 == cur && !dist.ContainsKey(a))
+                    { dist[a] = Mc * kv.Value; queue.Enqueue(a); }
                 }
             }
         }
@@ -485,7 +522,23 @@ public class CrtViewer : MonoBehaviour
                 if (dist.TryGetValue(cList[j].bone, out M)) { f.verts[slot] = M * cList[j].pos; f.nors[slot] = RotOnly(M) * cList[j].nor; }
             }
         }
+        // v3.4 诊断统计 (HUD 显示, 用户截图回报用)
+        int cR1 = 0, cR2 = 0, cR3 = 0;
+        foreach (var r in rList)
+        {
+            if (r.kind == "R1" || r.kind == "R") cR1++;
+            else if (r.kind == "R2") cR2++;
+            else cR3++;
+        }
+        float avgK = _kabschCnt > 0 ? _kabschRes / _kabschCnt : 0f;
+        float avgN = _kabschCnt > 0 ? _kabschNor / _kabschCnt : 0f;
+        int paired = pairR2C.Count;
+        _skiStat = string.Format("R1={0} R2={1} R3={2} C={3} 对={4} 骨对={5} 位置残差={6:F4} 法线残差={7:F3} BFS覆盖={8}/{9} 抄C={10}",
+            cR1, cR2, cR3, nC, paList.Count, grp.Count, avgK, avgN, dist.Count, adj.Count, paired);
     }
+
+    static string _skiStat = "";           // v3.4: 最近一次 ski 骨骼统一诊断
+    static float _kabschRes, _kabschNor; static int _kabschCnt;
 
     static bool Sanity(Vector3 v) { return Mathf.Abs(v.x) < 1e5f && Mathf.Abs(v.y) < 1e5f && Mathf.Abs(v.z) < 1e5f; }
 
@@ -803,8 +856,8 @@ public class CrtViewer : MonoBehaviour
                 var ski = LoadSki(d);
                 texName = ski.subs[0].tex;
                 model = BuildMeshObject(ski.verts, ski.nors, ski.uvs, ski.tris, texName);
-                _info = string.Format("{0}  {1}顶点/{2}面  贴图={3}",
-                    ski.name, ski.verts.Count, ski.tris.Count / 3, texName);
+                _info = string.Format("{0}  {1}顶点/{2}面  贴图={3}  |  {4}",
+                    ski.name, ski.verts.Count, ski.tris.Count / 3, texName, _skiStat);
             }
             model.transform.SetParent(_pivot, false);
             _modelCache[key] = model;
@@ -880,9 +933,13 @@ public class CrtViewer : MonoBehaviour
             {
                 _texCache[name] = t;
                 if (mat != null) { mat.mainTexture = t; mat.color = Color.white; }
+                _status = "";
                 yield break;
             }
         }
+        // v3.4: 全部候选 404 → 品红警示 + 状态栏报贴图名 (不再静默白模)
+        if (mat != null) mat.color = new Color(0.85f, 0.1f, 0.85f);
+        _status = "贴图未找到: " + name;
     }
 
     void Show(string key)
