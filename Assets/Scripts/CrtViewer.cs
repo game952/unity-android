@@ -943,7 +943,8 @@ public class CrtViewer : MonoBehaviour
     // ======================= 展台 =======================
     public static bool ViewerActive;        // HelloWorld 看到 true 就让出屏幕
 
-    // v3.5: PartGroup 增加官方名称对照 (来源: 真封神国际版官网物品数据库 zfsonline.com/game/items.o)
+    // v3.5: PartGroup 增加名称对照; v3.6.2 职业更正: wt 前缀 = 狂战士(不是术士)!
+    //   旧官网名称(青云剑/渡法法袍…均为术士系命名)全部作废 → 显示改为"狂战·部位 档位", 待游戏内官方名回填
     //   编号规则(实测自洽): 武器 wtj/wtc_NN ↔ 槽位(1)(2)等级档; 防具 a_wt_m_*_NN ↔ 套装档 00..09
     class PartGroup
     {
@@ -952,34 +953,31 @@ public class CrtViewer : MonoBehaviour
         public string Name(int i) { return names != null && i < names.Length && !string.IsNullOrEmpty(names[i]) ? names[i] : files[i]; }
     }
 
-    // 术士/全职业防具 10 档 (ski 尾号 00..09 → 套装名, 与官网逐档核对)
-    static readonly string[] SuitNames = { "渡法", "渡痕", "渡骨", "无神", "钰阙", "龙神", "护法天君", "地煞恶神", "碧游通天", "魔枭天冥" };
-
     static readonly PartGroup[] Groups = new PartGroup[]
     {
-        // 槽位(1) 剑刀系 15件官方数据 → wtj 10档: Lv1/5/15/25/35/45/55/65/75/85
-        new PartGroup{ label="武器·剑刀(槽1)", dir="creature/actor/", isAct=true,
+        // 槽位(1) 刀剑系 → wtj 10档: Lv1/5/15/25/35/45/55/65/75/85
+        new PartGroup{ label="武器·刀剑(槽1)", dir="creature/actor/", isAct=true,
             files=new []{"w_wtj_m_01.act","w_wtj_m_02.act","w_wtj_m_03.act","w_wtj_m_04.act","w_wtj_m_05.act","w_wtj_m_06.act","w_wtj_m_07.act","w_wtj_m_08.act","w_wtj_m_09.act","w_wtj_m_10.act"},
-            names=new []{"青云剑·狂战Lv1","吴钩剑·狂战Lv5","飞烟剑·狂战Lv15","斩将刀·狂战Lv25","化血神刀·金甲Lv35","斩仙飞刀·金甲Lv45","三尖两刃刀·金甲Lv55","正法天王刀·武斗Lv65","九曜星君刃·武斗Lv75","轩辕圣皇刀·武斗Lv85"}},
-        // 槽位(2) 杵斧系: Lv1/5/15/25/35/45/55/65/75 (撞心杵→15级杵→25级后斧)
-        new PartGroup{ label="武器·杵斧(槽2)", dir="creature/actor/", isAct=true,
+            names=new []{"狂战·刀剑 Lv1","狂战·刀剑 Lv5","狂战·刀剑 Lv15","狂战·刀剑 Lv25","狂战·刀剑 Lv35","狂战·刀剑 Lv45","狂战·刀剑 Lv55","狂战·刀剑 Lv65","狂战·刀剑 Lv75","狂战·刀剑 Lv85"}},
+        // 槽位(2) 斧杵系: Lv1/5/15/25/35/45/55/65/75
+        new PartGroup{ label="武器·斧杵(槽2)", dir="creature/actor/", isAct=true,
             files=new []{"w_wtc_m_01.act","w_wtc_m_02.act","w_wtc_m_03.act","w_wtc_m_04.act","w_wtc_m_05.act","w_wtc_m_06.act","w_wtc_m_07.act","w_wtc_m_08.act","w_wtc_m_09.act"},
-            names=new []{"撞心杵·狂战Lv1","荡魔杵·狂战Lv5","降魔杵·狂战Lv15","宣花斧·狂战Lv25","开山斧·金甲Lv35","湛金斧·金甲Lv45","斗神斧·金甲Lv55","荧惑炎君斧·武斗Lv65","天齐岳神斧·武斗Lv75"}},
-        // 防具(3) 甲袍: 10档术士套装 + fashion/suit 时尚装(官方名待考)
+            names=new []{"狂战·斧杵 Lv1","狂战·斧杵 Lv5","狂战·斧杵 Lv15","狂战·斧杵 Lv25","狂战·斧杵 Lv35","狂战·斧杵 Lv45","狂战·斧杵 Lv55","狂战·斧杵 Lv65","狂战·斧杵 Lv75"}},
+        // 防具(3) 甲袍: 10档 + fashion/suit 时尚装
         new PartGroup{ label="甲袍·防具(3)", dir="creature/actor/", isAct=false,
             files=new []{"a_wt_m_clo_00.ski","a_wt_m_clo_01.ski","a_wt_m_clo_02.ski","a_wt_m_clo_03.ski","a_wt_m_clo_04.ski","a_wt_m_clo_05.ski","a_wt_m_clo_06.ski","a_wt_m_clo_07.ski","a_wt_m_clo_08.ski","a_wt_m_clo_09.ski","a_wt_m_clo_fashion01.ski","a_wt_m_clo_fashion02.ski","a_wt_m_clo_suit02.ski","a_wt_m_clo_suit03.ski"},
-            names=new []{"渡法法袍·Lv10","渡痕法袍·Lv17","渡骨法袍·Lv27","无神战甲·Lv37","钰阙战甲·Lv47","龙神战甲·Lv57","护法天君战甲·Lv67","地煞恶神战甲·Lv77","碧游通天战甲·Lv87","魔枭天冥战甲·Lv97","时装·1","时装·2","稀有时装·2","稀有时装·3"}},
+            names=new []{"狂战·甲袍 Lv10","狂战·甲袍 Lv17","狂战·甲袍 Lv27","狂战·甲袍 Lv37","狂战·甲袍 Lv47","狂战·甲袍 Lv57","狂战·甲袍 Lv67","狂战·甲袍 Lv77","狂战·甲袍 Lv87","狂战·甲袍 Lv97","时装·1","时装·2","稀有时装·2","稀有时装·3"}},
         new PartGroup{ label="头饰", dir="creature/actor/", isAct=false,
             files=new []{"a_wt_m_hea_00.ski","a_wt_m_hea_01.ski","a_wt_m_hea_02.ski","a_wt_m_hea_03.ski","a_wt_m_hea_04.ski","a_wt_m_hea_05.ski"},
-            names=new []{"渡法头冠·Lv10","渡痕头冠·Lv17","渡骨头冠·Lv27","无神头冠·Lv37","钰阙头冠·Lv47","龙神头冠·Lv57"}},
+            names=new []{"狂战·头饰 Lv10","狂战·头饰 Lv17","狂战·头饰 Lv27","狂战·头饰 Lv37","狂战·头饰 Lv47","狂战·头饰 Lv57"}},
         // 防具(1) 手套
         new PartGroup{ label="手套·防具(1)", dir="creature/actor/", isAct=false,
             files=new []{"a_wt_m_glo_00.ski","a_wt_m_glo_01.ski","a_wt_m_glo_02.ski","a_wt_m_glo_03.ski","a_wt_m_glo_04.ski","a_wt_m_glo_05.ski","a_wt_m_glo_06.ski","a_wt_m_glo_07.ski","a_wt_m_glo_08.ski","a_wt_m_glo_09.ski"},
-            names=new []{"渡法手套·Lv8","渡痕手套·Lv13","渡骨手套·Lv23","无神手套·Lv33","钰阙手套·Lv43","龙神手套·Lv53","护法天君手套·Lv63","地煞恶神手套·Lv73","碧游通天手套·Lv83","魔枭天冥手套·Lv93"}},
+            names=new []{"狂战·手套 Lv8","狂战·手套 Lv13","狂战·手套 Lv23","狂战·手套 Lv33","狂战·手套 Lv43","狂战·手套 Lv53","狂战·手套 Lv63","狂战·手套 Lv73","狂战·手套 Lv83","狂战·手套 Lv93"}},
         // 防具(2) 长靴
         new PartGroup{ label="长靴·防具(2)", dir="creature/actor/", isAct=false,
             files=new []{"a_wt_m_sho_00.ski","a_wt_m_sho_01.ski","a_wt_m_sho_02.ski","a_wt_m_sho_03.ski","a_wt_m_sho_04.ski","a_wt_m_sho_05.ski","a_wt_m_sho_06.ski","a_wt_m_sho_07.ski","a_wt_m_sho_08.ski","a_wt_m_sho_09.ski"},
-            names=new []{"渡法长靴·Lv9","渡痕长靴·Lv15","渡骨长靴·Lv25","无神长靴·Lv35","钰阙长靴·Lv45","龙神长靴·Lv55","护法天君长靴·Lv65","地煞恶神长靴·Lv75","碧游通天长靴·Lv85","魔枭天冥长靴·Lv95"}},
+            names=new []{"狂战·长靴 Lv9","狂战·长靴 Lv15","狂战·长靴 Lv25","狂战·长靴 Lv35","狂战·长靴 Lv45","狂战·长靴 Lv55","狂战·长靴 Lv65","狂战·长靴 Lv75","狂战·长靴 Lv85","狂战·长靴 Lv95"}},
         new PartGroup{ label="外装", dir="creature/actor/", isAct=false,
             files=new []{"a_wt_m_wai_01.ski","a_wt_m_wai_02.ski","a_wt_m_wai_03.ski","a_wt_m_wai_04.ski","a_wt_m_wai_05.ski","a_wt_m_wai_06.ski","a_wt_m_wai_07.ski","a_wt_m_wai_08.ski","a_wt_m_wai_09.ski"},
             names=new []{"外装·1","外装·2","外装·3","外装·4","外装·5","外装·6","外装·7","外装·8","外装·9"}},
@@ -991,7 +989,11 @@ public class CrtViewer : MonoBehaviour
     string _info = "";
     bool _loading;
     float _yaw = 30f, _pitch = 10f;
-    Vector2 _lastTouchPos; Vector3 _lastMousePos;      // v3.6.1: 位置帧差(部分机型 deltaPosition 不更新)
+    Vector2 _lastTouchPos;                              // v3.6.1: 位置帧差(部分机型 deltaPosition 不更新)
+    float _lastTouchTime = -10f;                        // v3.6.2: 最近触摸时间戳(时间窗暂停自转, 防永久静止)
+#if UNITY_EDITOR || UNITY_STANDALONE
+    Vector3 _lastMousePos;                              // v3.6.2: 鼠标回退专用(仅编辑器/桌面编译)
+#endif
     int _skip;                                          // v3.6.1: 404 连续跳过计数(一轮上限)
     readonly Dictionary<string, Texture2D> _texCache = new Dictionary<string, Texture2D>();
     readonly Dictionary<string, GameObject> _modelCache = new Dictionary<string, GameObject>();
@@ -1190,21 +1192,22 @@ public class CrtViewer : MonoBehaviour
     void Update()
     {
         if (_pivot == null) return;
-        bool holding = false;
-        if (Input.touchCount == 1)                 // v3.6.1: 位置帧差(替代 deltaPosition, 兼容部分机型)
+        float now = Time.realtimeSinceStartup;
+        if (Input.touchCount == 1)                 // v3.6.2: 位置帧差触摸旋转
         {
             var t = Input.GetTouch(0);
-            if (t.phase == TouchPhase.Began) { _lastTouchPos = t.position; holding = true; }
+            if (t.phase == TouchPhase.Began) { _lastTouchPos = t.position; _lastTouchTime = now; }
             else if (t.phase == TouchPhase.Moved)
             {
                 _yaw   += (t.position.x - _lastTouchPos.x) * 0.4f;
                 _pitch  = Mathf.Clamp(_pitch - (t.position.y - _lastTouchPos.y) * 0.3f, -80f, 80f);
                 _lastTouchPos = t.position;
-                holding = true;
+                _lastTouchTime = now;              // 滑动期间暂停自转 → 跟手
             }
-            else if (t.phase == TouchPhase.Stationary) holding = true;
+            // 按住不动(Stationary)不刷新时间戳 → 1秒后自转自动恢复, 任何输入异常都不会永久静止
         }
-        else if (Input.GetMouseButton(0))          // v3.6.1: 鼠标回退(touchCount==0 才生效, 防触摸模拟双份)
+#if UNITY_EDITOR || UNITY_STANDALONE           // v3.6.2: 鼠标回退仅编辑器/桌面 — 排除个别安卓机型 GetMouseButton 误报导致的"完全静止"
+        else if (Input.GetMouseButton(0))
         {
             var m = Input.mousePosition;
             if (!Input.GetMouseButtonDown(0))
@@ -1213,9 +1216,10 @@ public class CrtViewer : MonoBehaviour
                 _pitch  = Mathf.Clamp(_pitch - (m.y - _lastMousePos.y) * 0.3f, -80f, 80f);
             }
             _lastMousePos = m;
-            holding = true;
+            _lastTouchTime = now;
         }
-        if (!holding) _yaw += Time.unscaledDeltaTime * 12f;   // 手指按住暂停自转 → 滑动即跟手
+#endif
+        if (now - _lastTouchTime > 1.0f) _yaw += Time.unscaledDeltaTime * 12f;   // 松手1秒后恢复自转(保底: 最多停1秒)
         _pivot.rotation = Quaternion.Euler(_pitch, _yaw, 0);
     }
 
@@ -1225,7 +1229,7 @@ public class CrtViewer : MonoBehaviour
         GUI.backgroundColor = new Color(0.1f, 0.1f, 0.14f, 0.85f);
 
         var title = new GUIStyle(GUI.skin.label) { fontSize = Mathf.Max(16, (int)(h * 0.030f)), alignment = TextAnchor.MiddleLeft, normal = { textColor = new Color(0.35f, 1f, 0.45f) } };
-        GUI.Label(new Rect(12, 8, w - 24, h * 0.05f), "v3.6.1 角色预览台 — CRT 直读 + 骨骼空间统一+孤骨吸附 (ski/act/dds)", title);
+        GUI.Label(new Rect(12, 8, w - 24, h * 0.05f), "v3.6.2 角色预览台 — CRT 直读 + 骨骼空间统一+孤骨吸附 (ski/act/dds)", title);
 
         var info = new GUIStyle(GUI.skin.label) { fontSize = Mathf.Max(11, (int)(h * 0.017f)), normal = { textColor = Color.white } };
         GUI.Label(new Rect(12, h * 0.052f, w - 24, h * 0.05f), _status.Length > 0 ? _status : _info, info);
@@ -1257,8 +1261,8 @@ public class CrtViewer : MonoBehaviour
 
         var tip = new GUIStyle(GUI.skin.label) { fontSize = Mathf.Max(10, (int)(h * 0.015f)), alignment = TextAnchor.UpperLeft, normal = { textColor = new Color(0.75f, 0.78f, 0.85f) }, wordWrap = true };
         GUI.Label(new Rect(12, h * 0.80f, w - 24, h * 0.19f),
-            "触摸滑动=旋转展台(按住暂停自转)  ·  v3.6 骨骼空间统一(顶点内配对+Kabsch 6D+强弱边BFS+孤骨吸附)\n" +
-            "整装术士(身体拼合+骨骼动画)待 v4：需从游戏包提取 role_wt_m_01.act\n" +
+            "触摸滑动=旋转展台(滑动暂停自转·松手1秒恢复)  ·  v3.6 骨骼空间统一(顶点内配对+Kabsch 6D+强弱边BFS+孤骨吸附)\n" +
+            "整装狂战士(身体拼合+骨骼动画)待 v4：需从游戏包提取 role_wt_m_01.act\n" +
             "Swap test: 服装/手套/鞋/外装/头/武器 已可实时切换", tip);
     }
 }
