@@ -408,7 +408,7 @@ public class CrtViewer : MonoBehaviour
         Vector3 pc = Vector3.zero, qc = Vector3.zero;
         for (int i = 0; i < n; i++) { pc += P[i]; qc += Q[i]; }
         pc /= n; qc /= n;
-        // 退化检测: 位置散布的最小方向伸展 σmin (协方差最小特征值开方)
+        // v3.9: σmin 仅作记录不再参与判定 (碎片根因已移除其先验降级)
         float sigmin = 0f;
         {
             float cxx = 0f, cyy = 0f, czz = 0f, cxy = 0f, cxz = 0f, cyz = 0f;
@@ -466,35 +466,42 @@ public class CrtViewer : MonoBehaviour
         for (int k = 1; k < 4; k++) if (ev[k] > ev[im]) im = k;
         float qw = V[im], qx = V[4 + im], qy = V[8 + im], qz = V[12 + im];   // 行主序: 列 im = 特征向量
         float qw2 = qw * qw, qx2 = qx * qx, qy2 = qy * qy, qz2 = qz * qz;
-        // v3.5 旋转可信度: 点数≥3 且位置散布非扁平 (σmin>0.5) 才允许旋转进图
-        bool trust = n >= 3 && sigmin > minSigma;
+        // v3.9: 信任判据重构 — 数据驱动(求解后残差), 替代 v3.5 的 σmin 几何先验!
+        //   实锤(glo_07 numpy 复算): 指骨点集 σmin=0.088(扁平) 但 Horn 残差=0.0000(精确)
+        //   → 扁平≠旋转不可信! v3.5 的 σmin<0.5 降级把全部骨对打成 R=I 只平移,
+        //     旋转分量全丢 = 模型散架碎片根因 (App 报位置残差 8.6 = R=I 降级残差的平均)
+        //   新判据: 先无条件求旋转, 残差小 → 接受; 残差大 → 数据真坏 → R=I 兜底
         var M = I;
-        if (trust)
+        M[0, 0] = qw2 + qx2 - qy2 - qz2; M[0, 1] = 2f * (qx * qy - qw * qz); M[0, 2] = 2f * (qx * qz + qw * qy);
+        M[1, 0] = 2f * (qx * qy + qw * qz); M[1, 1] = qw2 - qx2 + qy2 - qz2; M[1, 2] = 2f * (qy * qz - qw * qx);
+        M[2, 0] = 2f * (qx * qz - qw * qy); M[2, 1] = 2f * (qy * qz + qw * qx); M[2, 2] = qw2 - qx2 - qy2 + qz2;
+        // 法线一致性检验 (旋转 vs 法线对应)
+        float nsum = 0f; int nc = 0;
+        if (PN != null)
         {
-            M[0, 0] = qw2 + qx2 - qy2 - qz2; M[0, 1] = 2f * (qx * qy - qw * qz); M[0, 2] = 2f * (qx * qz + qw * qy);
-            M[1, 0] = 2f * (qx * qy + qw * qz); M[1, 1] = qw2 - qx2 + qy2 - qz2; M[1, 2] = 2f * (qy * qz - qw * qx);
-            M[2, 0] = 2f * (qx * qz - qw * qy); M[2, 1] = 2f * (qy * qz + qw * qx); M[2, 2] = qw2 - qx2 - qy2 + qz2;
-            // 法线检验: 旋转与法线对应关系矛盾 → 不可信
-            float nsum = 0f; int nc = 0;
-            if (PN != null)
+            for (int i = 0; i < n && i < PN.Count; i++)
             {
-                for (int i = 0; i < n && i < PN.Count; i++)
-                {
-                    if (NorBad(PN[i]) || NorBad(QN[i])) continue;   // v3.6.3: 过滤垃圾法线再检验
-                    Vector3 rn = M.MultiplyVector(PN[i]);
-                    nsum += (rn - QN[i]).magnitude; nc++;
-                }
-                if (nc > 0) norRes = nsum / nc; else norRes = 0f;   // v3.7: 全过滤时记0(不再显示1e9残留误导)
-                if (norRes > 0.2f) trust = false;
+                if (NorBad(PN[i]) || NorBad(QN[i])) continue;   // 垃圾法线不参与检验
+                Vector3 rn = M.MultiplyVector(PN[i]);
+                nsum += (rn - QN[i]).magnitude; nc++;
             }
+            norRes = nc > 0 ? nsum / nc : 0f;
         }
-        if (!trust) M = Matrix4x4.identity;    // R=I: 只保留质心平移 (平移总可信)
+        // 旋转方案的位置残差 — 判定依据
+        float sum = 0f;
+        for (int i = 0; i < n; i++) { Vector3 tp = M * P[i]; sum += (tp - Q[i]).magnitude; }
+        float rotRes = sum / n;
+        bool trust = n >= 3 && rotRes < 0.5f && norRes <= 0.2f;
+        if (!trust)
+        {
+            M = Matrix4x4.identity;    // R=I 兜底: 只保留质心平移 (残差大=数据真坏)
+            sum = 0f;
+            for (int i = 0; i < n; i++) { Vector3 tp = M * P[i]; sum += (tp - Q[i]).magnitude; }
+        }
         rotTrust = trust;
         Vector3 rp = M * pc;                    // Matrix4x4*Vector3 结果为 Vector4, 先赋值转回 Vector3
         Vector3 t = qc - rp;
         M[0, 3] = t.x; M[1, 3] = t.y; M[2, 3] = t.z;
-        float sum = 0f;
-        for (int i = 0; i < n; i++) { Vector3 tp = M * P[i]; sum += (tp - Q[i]).magnitude; }
         avgRes = sum / n;
         return M;
     }
@@ -1321,7 +1328,7 @@ public class CrtViewer : MonoBehaviour
         GUI.backgroundColor = new Color(0.1f, 0.1f, 0.14f, 0.85f);
 
         var title = new GUIStyle(GUI.skin.label) { fontSize = Mathf.Max(16, (int)(h * 0.030f)), alignment = TextAnchor.MiddleLeft, normal = { textColor = new Color(0.35f, 1f, 0.45f) } };
-        GUI.Label(new Rect(12, 8, w - 24, h * 0.05f), "v3.7 角色预览台 — CRT 直读 + 解析指纹佐证 + 骨骼空间统一+孤骨吸附 (ski/act/dds)", title);
+        GUI.Label(new Rect(12, 8, w - 24, h * 0.05f), "v3.9 角色预览台 — 残差驱动Kabsch重构+流头修正+副本不入池+职业扫描 (ski/act/dds)", title);
 
         var info = new GUIStyle(GUI.skin.label) { fontSize = Mathf.Max(11, (int)(h * 0.017f)), normal = { textColor = Color.white } };
         GUI.Label(new Rect(12, h * 0.052f, w - 24, h * 0.05f), _status.Length > 0 ? _status : _info, info);
