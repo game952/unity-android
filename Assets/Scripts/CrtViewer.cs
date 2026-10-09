@@ -46,6 +46,17 @@ using UnityEngine.Networking;
 //     → 全部顶点归一到代表骨空间, 无需骨骼文件！
 //     - Python 离线验证: hea_05 统一后渲染出连续实体头盔壳 (原碎片消失)
 //   - 条带滑窗装配保持 (v3.1.1 端序择优不变)
+// v3.5.1 (2026-10-09 下午)：仅更新界面提示文字为 v3.5.1 描述(上一版漏改)；代码逻辑与 v3.5 完全一致
+// v3.5 修复 (2026-10-09，真机回归 v3.4 仍碎片 + 统计行异常)：
+//   ★根因: v3.4 改 KabschFit 时删掉了 n==1 安全分支(纯平移) — 单点/共线骨对改走"法线拟合",
+//     绕轴旋转自由度未定死, 且 norRes≈0 骗过检验 → 随机旋转混入骨骼图污染 BFS (Python 验证
+//     版带安全分支所以测不出)。
+//   1) KabschFit 加 rotTrust 判定: n≥3 且位置散布 σmin>0.5 才允许旋转; 否则强制 R=I 只保留
+//      质心平移 (平移总可信)
+//   2) 骨骼图分强弱边: 强边(旋转可信)先建树; 弱边(R=I 平移)多轮迭代桥接强图之外的孤岛骨
+//   3) 统计行竞态修复: _loadSeq 守卫快速翻页时旧协程覆盖状态 + _infoCache per-model 恢复
+//      (v3.4 真机三张截图同一份统计 = 竞态覆盖)
+//   4) 统计行增加 强/平移 边计数, 标题升 v3.5
 // v3.4 修复 (2026-10-09，真机回归：服装/脚碎片堆叠 + 剑[2/10]贴图404 + 头部纯白)：
 //   1) ★BFS方向bug实锤修复: v3.3 骨骼图传递的两个方向全反 (dist[B]应为 Mc·T⁻¹ 写成 Mc·T,
 //      dist[A]应为 Mc·T 写成 Mc·T⁻¹) → 离线复现: 手套/脚环残差100%超阈, 修正后全部归零
@@ -55,6 +66,13 @@ using UnityEngine.Networking;
 //   4) HUD 增加解析统计行 (R1/R2/R3/C计数·骨对数·位置/法线残差·BFS覆盖), 供真机回报定位
 //   注: 武器(w_wtj/w_wtc)来自 act 内嵌 VaSkin, 其 slot→武器语义与原游戏的对应关系
 //       待 role_wt_m_01.act (整装骨骼) 到位后在 v4 校准
+// v3.5 官方命名对照 (2026-10-09，接官网物品数据库 zfsonline.com/game/items.o 全量 120 武器+147 防具)：
+//   1) 预览台全面接入官方名称: 武器槽位(1)剑刀系=青云剑Lv1→…→轩辕圣皇刀Lv85 (wtj 10档全对应)
+//      槽位(2)杵斧系=撞心杵Lv1→降魔杵Lv15→宣花斧Lv25→…→天齐岳神斧Lv75 (wtc 9档全对应)
+//      防具 10 档 = 渡法00/渡痕01/渡骨02/无神03/钰阙04/龙神05/护法天君06/地煞恶神07/碧游通天08/魔枭天冥09
+//   2) 部件组标签语义化: 甲袍·防具(3)/手套·防具(1)/长靴·防具(2)/头饰/外装 (槽位号=官网括号ID)
+//   3) 信息行显示【官方名·职业·等级】, 用户可直接对照原游戏验证编号映射
+//   注: 术士武器"珠"系(槽6, 戳目珠→地煞亡神珠 10 档)不在本资源包, 推断内嵌于 role_wt_m_01.act (v4)
 // v4 计划：提取 role_wt_m_01.act 全身骨骼 → 整装拼合 + 动画 + 武器槽位校准
 // ============================================================================
 
@@ -256,7 +274,7 @@ public class CrtViewer : MonoBehaviour
             f.uvs.Add(i < aList.Count ? aList[i].uv : Vector2.zero);
 
         // v3.2: 骨骼空间统一 — ski 顶点在各绑定骨骼的局部空间, 必须归一才能正确显示
-        UnifyBoneSpace(f, rList, cList);
+        var distMap = UnifyBoneSpace(f, rList, cList);
 
         // 双端序择优 (v3.1.1): ski 297文件字节级验证为BE, LE 探测仅做兜底
         var idxBE = new List<int>(); var idxLE = new List<int>();
@@ -274,6 +292,8 @@ public class CrtViewer : MonoBehaviour
             acc += idxCnts[s];
         }
         if (f.tris.Count < 3) throw new Exception("面装配为空: " + f.name);
+        // v3.6: 孤骨吸附 — 面拓扑就绪后执行
+        LoneBoneAttach(f, rList, cList, distMap != null ? new HashSet<int>(distMap.Keys) : null);
         return f;
     }
 
@@ -331,17 +351,47 @@ public class CrtViewer : MonoBehaviour
         ev = new float[] { A[0, 0], A[1, 1], A[2, 2], A[3, 3] };
     }
 
-    // v3.4: Kabsch 刚体拟合 6D 升级 — 位置协方差 + 法线协方差(不中心化, wn=20)
-    //   共线/单点对的旋转欠定 → 法线分布破简并; 拟合后法线残差>0.2 判定旋转不可信 → R=I 只保留平移
-    static Matrix4x4 KabschFit(List<Vector3> P, List<Vector3> Q, List<Vector3> PN, List<Vector3> QN, out float avgRes, out float norRes)
+    // v3.5: Kabsch 6D + 退化防护
+    //   n<3 或位置点云扁平 → 旋转欠定(绕轴自由) → 强制 R=I 只保留质心平移 (v3.4 手机碎片的根因:
+    //   单点对走法线拟合, 绕轴随机旋转被 norRes≈0 骗过检验, 污染全图)
+    static Matrix4x4 KabschFit(List<Vector3> P, List<Vector3> Q, List<Vector3> PN, List<Vector3> QN, out float avgRes, out float norRes, out bool rotTrust, float minSigma = 0.5f)
     {
         var I = Matrix4x4.identity;
         int n = P.Count;
-        avgRes = 1e9f; norRes = 1e9f;
+        avgRes = 1e9f; norRes = 1e9f; rotTrust = false;
         if (n == 0) return I;
         Vector3 pc = Vector3.zero, qc = Vector3.zero;
         for (int i = 0; i < n; i++) { pc += P[i]; qc += Q[i]; }
         pc /= n; qc /= n;
+        // 退化检测: 位置散布的最小方向伸展 σmin (协方差最小特征值开方)
+        float sigmin = 0f;
+        {
+            float cxx = 0f, cyy = 0f, czz = 0f, cxy = 0f, cxz = 0f, cyz = 0f;
+            for (int i = 0; i < n; i++)
+            {
+                Vector3 p = P[i] - pc;
+                cxx += p.x * p.x; cyy += p.y * p.y; czz += p.z * p.z;
+                cxy += p.x * p.y; cxz += p.x * p.z; cyz += p.y * p.z;
+            }
+            // 3x3 对称幂迭代求最大特征值, 再 deflation 求次小 — 简化: 用迹与最大值的粗略关系
+            float tr = cxx + cyy + czz;
+            // 幂迭代最大
+            float[] v = { 1f, 0.33f, 0.71f };
+            for (int it = 0; it < 24; it++)
+            {
+                float w0 = cxx * v[0] + cxy * v[1] + cxz * v[2];
+                float w1 = cxy * v[0] + cyy * v[1] + cyz * v[2];
+                float w2 = cxz * v[0] + cyz * v[1] + czz * v[2];
+                float nm = Mathf.Sqrt(w0 * w0 + w1 * w1 + w2 * w2);
+                if (nm < 1e-9f) break;
+                v[0] = w0 / nm; v[1] = w1 / nm; v[2] = w2 / nm;
+            }
+            float lmax = v[0] * (cxx * v[0] + cxy * v[1] + cxz * v[2])
+                       + v[1] * (cxy * v[0] + cyy * v[1] + cyz * v[2])
+                       + v[2] * (cxz * v[0] + cyz * v[1] + czz * v[2]);
+            float lmid = Mathf.Max(0f, tr - lmax) * 0.5f;   // 粗略下界估计: 剩余均分
+            sigmin = Mathf.Sqrt(Mathf.Max(0f, Mathf.Min(lmid, lmax)) * 0.25f);
+        }
         const float WN = 20f;
         float Sxx = 0f, Sxy = 0f, Sxz = 0f, Syx = 0f, Syy = 0f, Syz = 0f, Szx = 0f, Szy = 0f, Szz = 0f;
         for (int i = 0; i < n; i++)
@@ -370,27 +420,29 @@ public class CrtViewer : MonoBehaviour
         for (int k = 1; k < 4; k++) if (ev[k] > ev[im]) im = k;
         float qw = V[im], qx = V[4 + im], qy = V[8 + im], qz = V[12 + im];   // 行主序: 列 im = 特征向量
         float qw2 = qw * qw, qx2 = qx * qx, qy2 = qy * qy, qz2 = qz * qz;
+        // v3.5 旋转可信度: 点数≥3 且位置散布非扁平 (σmin>0.5) 才允许旋转进图
+        bool trust = n >= 3 && sigmin > minSigma;
         var M = I;
-        M[0, 0] = qw2 + qx2 - qy2 - qz2; M[0, 1] = 2f * (qx * qy - qw * qz); M[0, 2] = 2f * (qx * qz + qw * qy);
-        M[1, 0] = 2f * (qx * qy + qw * qz); M[1, 1] = qw2 - qx2 + qy2 - qz2; M[1, 2] = 2f * (qy * qz - qw * qx);
-        M[2, 0] = 2f * (qx * qz - qw * qy); M[2, 1] = 2f * (qy * qz + qw * qx); M[2, 2] = qw2 - qx2 - qy2 + qz2;
-        // v3.4 法线检验: 旋转对不对? 不可信 → 单位旋转+质心平移 (平移总可信, 防碎裂)
-        float nsum = 0f; int nc = 0;
-        if (PN != null)
+        if (trust)
         {
-            for (int i = 0; i < n && i < PN.Count; i++)
+            M[0, 0] = qw2 + qx2 - qy2 - qz2; M[0, 1] = 2f * (qx * qy - qw * qz); M[0, 2] = 2f * (qx * qz + qw * qy);
+            M[1, 0] = 2f * (qx * qy + qw * qz); M[1, 1] = qw2 - qx2 + qy2 - qz2; M[1, 2] = 2f * (qy * qz - qw * qx);
+            M[2, 0] = 2f * (qx * qz - qw * qy); M[2, 1] = 2f * (qy * qz + qw * qx); M[2, 2] = qw2 - qx2 - qy2 + qz2;
+            // 法线检验: 旋转与法线对应关系矛盾 → 不可信
+            float nsum = 0f; int nc = 0;
+            if (PN != null)
             {
-                Vector3 rn = M.MultiplyVector(PN[i]);
-                nsum += (rn - QN[i]).magnitude; nc++;
-            }
-            if (nc > 0) norRes = nsum / nc;
-            if (norRes > 0.2f)
-            {
-                M = Matrix4x4.identity;
-                Vector3 t0 = qc - pc;
-                M[0, 3] = t0.x; M[1, 3] = t0.y; M[2, 3] = t0.z;
+                for (int i = 0; i < n && i < PN.Count; i++)
+                {
+                    Vector3 rn = M.MultiplyVector(PN[i]);
+                    nsum += (rn - QN[i]).magnitude; nc++;
+                }
+                if (nc > 0) norRes = nsum / nc;
+                if (norRes > 0.2f) trust = false;
             }
         }
+        if (!trust) M = Matrix4x4.identity;    // R=I: 只保留质心平移 (平移总可信)
+        rotTrust = trust;
         Vector3 rp = M * pc;                    // Matrix4x4*Vector3 结果为 Vector4, 先赋值转回 Vector3
         Vector3 t = qc - rp;
         M[0, 3] = t.x; M[1, 3] = t.y; M[2, 3] = t.z;
@@ -400,11 +452,11 @@ public class CrtViewer : MonoBehaviour
         return M;
     }
 
-    static void UnifyBoneSpace(SkiFile f, List<VRec> rList, List<VRec> cList)
+    static Dictionary<int, Matrix4x4> UnifyBoneSpace(SkiFile f, List<VRec> rList, List<VRec> cList)
     {
         int nR = rList.Count, nC = cList.Count;
-        _kabschRes = 0f; _kabschNor = 0f; _kabschCnt = 0;   // v3.4: 每文件重置统计
-        if (nR == 0 || nC == 0) return;
+        _kabschRes = 0f; _kabschNor = 0f; _kabschCnt = 0; _flatCnt = 0;   // v3.4: 每文件重置统计
+        if (nR == 0 || nC == 0) return null;
         // v3.3: 顺序 FIFO 配对 — Rn 的 n = 影响骨骼数 (R1 不消耗 C, R2/R3 依次消耗)
         // 流序即对应关系: 每条 C 与最近的未满 R 主记录是同一顶点
         var paList = new List<Vector3>(); var pbList = new List<Vector3>();
@@ -435,9 +487,10 @@ public class CrtViewer : MonoBehaviour
                 fj++;
             }
         }
-        if (paList.Count == 0) return;
+        if (paList.Count == 0) return null;
         // 骨对分组 → Kabsch 确定性求解 (297文件/4068骨对 实测全零残差)
-        var tMap = new Dictionary<long, Matrix4x4>();          // key = A*1000+B  (A→B: p_B = M * p_A)
+        var tMap = new Dictionary<long, Matrix4x4>();          // 强边: key = A*1000+B (A→B), 旋转可信
+        var tMapFlat = new Dictionary<long, Matrix4x4>();      // v3.5 弱边: R=I 纯平移兜底
         var pairR2C = new Dictionary<int, int>();              // C全局槽 -> R全局槽
         var grp = new Dictionary<long, List<int>>();
         for (int fk = 0; fk < paList.Count; fk++)
@@ -452,14 +505,16 @@ public class CrtViewer : MonoBehaviour
             var P = new List<Vector3>(); var Q = new List<Vector3>();
             var PN = new List<Vector3>(); var QN = new List<Vector3>();
             foreach (int k in kv.Value) { P.Add(paList[k]); Q.Add(pbList[k]); PN.Add(paNor[k]); QN.Add(pbNor[k]); }
-            float res, nres;
-            Matrix4x4 M = KabschFit(P, Q, PN, QN, out res, out nres);
-            if (res < 0.05f) tMap[kv.Key] = M;                 // 残差兜底
+            float res, nres; bool rotT;
+            Matrix4x4 M = KabschFit(P, Q, PN, QN, out res, out nres, out rotT);
+            if (rotT && res < 0.05f) tMap[kv.Key] = M;                 // 强边: 旋转可信且精确
+            else if (!rotT && res < 20f) tMapFlat[kv.Key] = M;         // 弱边: R=I 平移兜底 (错配 res 巨大, 拒)
             _kabschRes += res; _kabschNor += nres; _kabschCnt++;
+            if (!rotT) _flatCnt++;
             for (int k = 0; k < kv.Value.Count; k++)           // C 顶点无条件抄配对 R (同一点)
                 pairR2C[nR + bSrc[kv.Value[k]]] = aSrc[kv.Value[k]];
         }
-        if (tMap.Count == 0) return;
+        if (tMap.Count == 0 && tMapFlat.Count == 0) return null;
         // 骨骼图 BFS: dist[骨] = M 使 p_rep = M * p_骨
         var adj = new Dictionary<int, List<int>>();
         foreach (var kv in tMap)
@@ -500,6 +555,23 @@ public class CrtViewer : MonoBehaviour
                 }
             }
         }
+        // v3.5 阶段2: 弱边 (R=I 平移) 桥接强图之外的孤岛骨 — 多轮迭代到不动点
+        if (tMapFlat.Count > 0)
+        {
+            bool changed = true;
+            while (changed)
+            {
+                changed = false;
+                foreach (var kv in tMapFlat)
+                {
+                    int a = (int)(kv.Key / 1000), b2 = (int)(kv.Key % 1000);
+                    bool ha = dist.ContainsKey(a), hb = dist.ContainsKey(b2);
+                    // 方向与强边一致: T: p_B = M·p_A → cur=A: dist[B]=Mc·T⁻¹ ; cur=B: dist[A]=Mc·T
+                    if (ha && !hb) { dist[b2] = dist[a] * kv.Value.inverse; changed = true; }
+                    else if (hb && !ha) { dist[a] = dist[b2] * kv.Value; changed = true; }
+                }
+            }
+        }
         // 应用: R 顶点变换; 法线仅旋转
         for (int i = 0; i < nR; i++)
         {
@@ -533,12 +605,118 @@ public class CrtViewer : MonoBehaviour
         float avgK = _kabschCnt > 0 ? _kabschRes / _kabschCnt : 0f;
         float avgN = _kabschCnt > 0 ? _kabschNor / _kabschCnt : 0f;
         int paired = pairR2C.Count;
-        _skiStat = string.Format("R1={0} R2={1} R3={2} C={3} 对={4} 骨对={5} 位置残差={6:F4} 法线残差={7:F3} BFS覆盖={8}/{9} 抄C={10}",
-            cR1, cR2, cR3, nC, paList.Count, grp.Count, avgK, avgN, dist.Count, adj.Count, paired);
+        _skiStat = string.Format("R1={0} R2={1} R3={2} C={3} 对={4} 骨对={5} 强={6} 平移={7} 位置残差={8:F4} 法线残差={9:F3} BFS覆盖={10}/{11}",
+            cR1, cR2, cR3, nC, paList.Count, grp.Count, grp.Count - _flatCnt, _flatCnt, avgK, avgN, dist.Count, adj.Count);
+        return dist;
+    }
+
+    // ======================= v3.6: 孤骨吸附 =======================
+    // 孤骨 = 无任何双引用记录(图边)的骨骼 → BFS 不可达, 顶点 identity 兜底留在自身空间。
+    // 拓扑约束: 同一三角形内顶点空间连续 → 跨骨共面边给出"贴回"点对, Kabsch 完整刚体。
+    // Python 镜像实测(GL边长中位数): glo_09 8.25→1.38, hea_05 5.61→0.86, hea_03(反向) 9.41→1.19。
+    // 方向: 孤骨顶点数 ≤ 图骨顶点数 → 孤骨吸向图骨; 单大孤骨(>总数一半) → 图骨吸向孤骨。
+    // 稳妥性: det(R)<0 反射 → 回退纯平移; 无共面边 → 保持 identity(全孤骨单骨文件本就连续)。
+    static int _attachCnt = 0;
+    static void LoneBoneAttach(SkiFile f, List<VRec> rList, List<VRec> cList, HashSet<int> unifiedBones)
+    {
+        int nR = rList.Count;
+        if (f.tris == null || f.tris.Count < 3 || unifiedBones == null || unifiedBones.Count == 0) { _attachCnt = 0; return; }
+        var byBone = new Dictionary<int, List<int>>();
+        for (int i = 0; i < nR; i++)
+        {
+            int b = rList[i].bone;
+            List<int> l;
+            if (!byBone.TryGetValue(b, out l)) { l = new List<int>(); byBone[b] = l; }
+            l.Add(i);
+        }
+        var loneBones = new List<int>();
+        foreach (var kv in byBone) if (!unifiedBones.Contains(kv.Key)) loneBones.Add(kv.Key);
+        if (loneBones.Count == 0) { _attachCnt = 0; return; }
+
+        var isLoneVert = new bool[f.verts.Count];
+        for (int i = 0; i < nR; i++)
+            if (loneBones.Contains(rList[i].bone)) isLoneVert[i] = true;
+        int loneVertTotal = 0;
+        for (int i = 0; i < isLoneVert.Length; i++) if (isLoneVert[i]) loneVertTotal++;
+        int uniVertTotal = f.verts.Count - loneVertTotal;
+
+        loneBones.Sort((x, y) => byBone[y].Count - byBone[x].Count);   // 大块优先(反向目标)
+        bool reversed = false;
+        int attached = 0;
+        foreach (int bone in loneBones)
+        {
+            var vl = byBone[bone];
+            if (vl.Count > uniVertTotal && reversed) continue;           // 只允许一次反向(实测数据单大孤骨)
+            bool reverse = vl.Count > uniVertTotal;
+            // 每骨重建邻点表(用当前 f.verts 快照, 反向移位后坐标最新)
+            var nbrMap = new Dictionary<int, List<Vector3>>();
+            for (int t = 0; t + 2 < f.tris.Count; t += 3)
+            {
+                int a = f.tris[t], b = f.tris[t + 1], c = f.tris[t + 2];
+                int[] tri = { a, b, c };
+                for (int e = 0; e < 3; e++)
+                {
+                    int u = tri[e], v = tri[(e + 1) % 3];
+                    if (u == v || u >= f.verts.Count || v >= f.verts.Count) continue;
+                    bool ul = isLoneVert[u], wv = isLoneVert[v];
+                    if (ul == wv) continue;
+                    if (reverse && !wv) continue;                        // 反向只收孤骨端为邻点源
+                    int li = ul ? u : v, gi = ul ? v : u;
+                    List<Vector3> l;
+                    if (!nbrMap.TryGetValue(li, out l)) { l = new List<Vector3>(); nbrMap[li] = l; }
+                    l.Add(f.verts[gi]);
+                }
+            }
+            if (nbrMap.Count == 0) continue;
+            var P = new List<Vector3>(); var Q = new List<Vector3>();
+            foreach (var kv in nbrMap)
+            {
+                Vector3 near = kv.Value[0]; float bd = float.MaxValue;
+                for (int i = 0; i < kv.Value.Count; i++)
+                {
+                    float d = (kv.Value[i] - f.verts[kv.Key]).sqrMagnitude;
+                    if (d < bd) { bd = d; near = kv.Value[i]; }
+                }
+                P.Add(f.verts[kv.Key]); Q.Add(near);
+            }
+            if (P.Count < 1) continue;
+            float res, norRes; bool rt;
+            Matrix4x4 M;
+            if (reverse)
+            {
+                var P2 = new List<Vector3>(Q); var Q2 = new List<Vector3>(P);
+                M = KabschFit(P2, Q2, null, null, out res, out norRes, out rt, 0.1f);
+            }
+            else M = KabschFit(P, Q, null, null, out res, out norRes, out rt, 0.1f);
+            float det = M[0, 0] * (M[1, 1] * M[2, 2] - M[1, 2] * M[2, 1])
+                      - M[0, 1] * (M[1, 0] * M[2, 2] - M[1, 2] * M[2, 0])
+                      + M[0, 2] * (M[1, 0] * M[2, 1] - M[1, 1] * M[2, 0]);
+            if (det < 0f)                                                 // 反射 → 回退纯平移
+            {
+                Vector3 pc = Vector3.zero, qc = Vector3.zero;
+                for (int i = 0; i < P.Count; i++) { pc += P[i]; qc += Q[i]; }
+                pc /= P.Count; qc /= P.Count;
+                M = Matrix4x4.identity;
+                M[0, 3] = qc.x - pc.x; M[1, 3] = qc.y - pc.y; M[2, 3] = qc.z - pc.z;
+            }
+            if (reverse)
+            {
+                for (int i = 0; i < f.verts.Count; i++)
+                    if (!isLoneVert[i]) { Vector3 rp = M * f.verts[i]; f.verts[i] = rp; }
+                reversed = true;
+            }
+            else
+            {
+                foreach (int vi in vl) { Vector3 rp = M * f.verts[vi]; f.verts[vi] = rp; }
+            }
+            attached++;
+        }
+        _attachCnt = attached;
+        if (loneBones.Count > 0) _skiStat += " 吸附=" + attached + "/" + loneBones.Count;
     }
 
     static string _skiStat = "";           // v3.4: 最近一次 ski 骨骼统一诊断
-    static float _kabschRes, _kabschNor; static int _kabschCnt;
+    static float _kabschRes, _kabschNor; static int _kabschCnt, _flatCnt;
 
     static bool Sanity(Vector3 v) { return Mathf.Abs(v.x) < 1e5f && Mathf.Abs(v.y) < 1e5f && Mathf.Abs(v.z) < 1e5f; }
 
@@ -763,24 +941,46 @@ public class CrtViewer : MonoBehaviour
     // ======================= 展台 =======================
     public static bool ViewerActive;        // HelloWorld 看到 true 就让出屏幕
 
-    class PartGroup { public string label; public string[] files; public bool isAct; public string dir; }
+    // v3.5: PartGroup 增加官方名称对照 (来源: 真封神国际版官网物品数据库 zfsonline.com/game/items.o)
+    //   编号规则(实测自洽): 武器 wtj/wtc_NN ↔ 槽位(1)(2)等级档; 防具 a_wt_m_*_NN ↔ 套装档 00..09
+    class PartGroup
+    {
+        public string label; public string[] files; public bool isAct; public string dir;
+        public string[] names;                 // 与 files 一一对应的官方名称(名称·等级), 空则回退文件名
+        public string Name(int i) { return names != null && i < names.Length && !string.IsNullOrEmpty(names[i]) ? names[i] : files[i]; }
+    }
+
+    // 术士/全职业防具 10 档 (ski 尾号 00..09 → 套装名, 与官网逐档核对)
+    static readonly string[] SuitNames = { "渡法", "渡痕", "渡骨", "无神", "钰阙", "龙神", "护法天君", "地煞恶神", "碧游通天", "魔枭天冥" };
 
     static readonly PartGroup[] Groups = new PartGroup[]
     {
-        new PartGroup{ label="武器·剑", dir="creature/actor/", isAct=true,
-            files=new []{"w_wtj_m_01.act","w_wtj_m_02.act","w_wtj_m_03.act","w_wtj_m_04.act","w_wtj_m_05.act","w_wtj_m_06.act","w_wtj_m_07.act","w_wtj_m_08.act","w_wtj_m_09.act","w_wtj_m_10.act"}},
-        new PartGroup{ label="武器·杵", dir="creature/actor/", isAct=true,
-            files=new []{"w_wtc_m_01.act","w_wtc_m_02.act","w_wtc_m_03.act","w_wtc_m_04.act","w_wtc_m_05.act","w_wtc_m_06.act","w_wtc_m_07.act","w_wtc_m_08.act","w_wtc_m_09.act"}},
-        new PartGroup{ label="服装", dir="creature/actor/", isAct=false,
-            files=new []{"a_wt_m_clo_00.ski","a_wt_m_clo_01.ski","a_wt_m_clo_02.ski","a_wt_m_clo_03.ski","a_wt_m_clo_04.ski","a_wt_m_clo_05.ski","a_wt_m_clo_06.ski","a_wt_m_clo_07.ski","a_wt_m_clo_08.ski","a_wt_m_clo_09.ski","a_wt_m_clo_fashion01.ski","a_wt_m_clo_fashion02.ski","a_wt_m_clo_suit02.ski","a_wt_m_clo_suit03.ski"}},
-        new PartGroup{ label="头", dir="creature/actor/", isAct=false,
-            files=new []{"a_wt_m_hea_00.ski","a_wt_m_hea_01.ski","a_wt_m_hea_02.ski","a_wt_m_hea_03.ski","a_wt_m_hea_04.ski","a_wt_m_hea_05.ski"}},
-        new PartGroup{ label="手", dir="creature/actor/", isAct=false,
-            files=new []{"a_wt_m_glo_00.ski","a_wt_m_glo_01.ski","a_wt_m_glo_02.ski","a_wt_m_glo_03.ski","a_wt_m_glo_04.ski","a_wt_m_glo_05.ski","a_wt_m_glo_06.ski","a_wt_m_glo_07.ski","a_wt_m_glo_08.ski","a_wt_m_glo_09.ski"}},
-        new PartGroup{ label="脚", dir="creature/actor/", isAct=false,
-            files=new []{"a_wt_m_sho_00.ski","a_wt_m_sho_01.ski","a_wt_m_sho_02.ski","a_wt_m_sho_03.ski","a_wt_m_sho_04.ski","a_wt_m_sho_05.ski","a_wt_m_sho_06.ski","a_wt_m_sho_07.ski","a_wt_m_sho_08.ski","a_wt_m_sho_09.ski"}},
+        // 槽位(1) 剑刀系 15件官方数据 → wtj 10档: Lv1/5/15/25/35/45/55/65/75/85
+        new PartGroup{ label="武器·剑刀(槽1)", dir="creature/actor/", isAct=true,
+            files=new []{"w_wtj_m_01.act","w_wtj_m_02.act","w_wtj_m_03.act","w_wtj_m_04.act","w_wtj_m_05.act","w_wtj_m_06.act","w_wtj_m_07.act","w_wtj_m_08.act","w_wtj_m_09.act","w_wtj_m_10.act"},
+            names=new []{"青云剑·狂战Lv1","吴钩剑·狂战Lv5","飞烟剑·狂战Lv15","斩将刀·狂战Lv25","化血神刀·金甲Lv35","斩仙飞刀·金甲Lv45","三尖两刃刀·金甲Lv55","正法天王刀·武斗Lv65","九曜星君刃·武斗Lv75","轩辕圣皇刀·武斗Lv85"}},
+        // 槽位(2) 杵斧系: Lv1/5/15/25/35/45/55/65/75 (撞心杵→15级杵→25级后斧)
+        new PartGroup{ label="武器·杵斧(槽2)", dir="creature/actor/", isAct=true,
+            files=new []{"w_wtc_m_01.act","w_wtc_m_02.act","w_wtc_m_03.act","w_wtc_m_04.act","w_wtc_m_05.act","w_wtc_m_06.act","w_wtc_m_07.act","w_wtc_m_08.act","w_wtc_m_09.act"},
+            names=new []{"撞心杵·狂战Lv1","荡魔杵·狂战Lv5","降魔杵·狂战Lv15","宣花斧·狂战Lv25","开山斧·金甲Lv35","湛金斧·金甲Lv45","斗神斧·金甲Lv55","荧惑炎君斧·武斗Lv65","天齐岳神斧·武斗Lv75"}},
+        // 防具(3) 甲袍: 10档术士套装 + fashion/suit 时尚装(官方名待考)
+        new PartGroup{ label="甲袍·防具(3)", dir="creature/actor/", isAct=false,
+            files=new []{"a_wt_m_clo_00.ski","a_wt_m_clo_01.ski","a_wt_m_clo_02.ski","a_wt_m_clo_03.ski","a_wt_m_clo_04.ski","a_wt_m_clo_05.ski","a_wt_m_clo_06.ski","a_wt_m_clo_07.ski","a_wt_m_clo_08.ski","a_wt_m_clo_09.ski","a_wt_m_clo_fashion01.ski","a_wt_m_clo_fashion02.ski","a_wt_m_clo_suit02.ski","a_wt_m_clo_suit03.ski"},
+            names=new []{"渡法法袍·Lv10","渡痕法袍·Lv17","渡骨法袍·Lv27","无神战甲·Lv37","钰阙战甲·Lv47","龙神战甲·Lv57","护法天君战甲·Lv67","地煞恶神战甲·Lv77","碧游通天战甲·Lv87","魔枭天冥战甲·Lv97","时装·1","时装·2","稀有时装·2","稀有时装·3"}},
+        new PartGroup{ label="头饰", dir="creature/actor/", isAct=false,
+            files=new []{"a_wt_m_hea_00.ski","a_wt_m_hea_01.ski","a_wt_m_hea_02.ski","a_wt_m_hea_03.ski","a_wt_m_hea_04.ski","a_wt_m_hea_05.ski"},
+            names=new []{"渡法头冠·Lv10","渡痕头冠·Lv17","渡骨头冠·Lv27","无神头冠·Lv37","钰阙头冠·Lv47","龙神头冠·Lv57"}},
+        // 防具(1) 手套
+        new PartGroup{ label="手套·防具(1)", dir="creature/actor/", isAct=false,
+            files=new []{"a_wt_m_glo_00.ski","a_wt_m_glo_01.ski","a_wt_m_glo_02.ski","a_wt_m_glo_03.ski","a_wt_m_glo_04.ski","a_wt_m_glo_05.ski","a_wt_m_glo_06.ski","a_wt_m_glo_07.ski","a_wt_m_glo_08.ski","a_wt_m_glo_09.ski"},
+            names=new []{"渡法手套·Lv8","渡痕手套·Lv13","渡骨手套·Lv23","无神手套·Lv33","钰阙手套·Lv43","龙神手套·Lv53","护法天君手套·Lv63","地煞恶神手套·Lv73","碧游通天手套·Lv83","魔枭天冥手套·Lv93"}},
+        // 防具(2) 长靴
+        new PartGroup{ label="长靴·防具(2)", dir="creature/actor/", isAct=false,
+            files=new []{"a_wt_m_sho_00.ski","a_wt_m_sho_01.ski","a_wt_m_sho_02.ski","a_wt_m_sho_03.ski","a_wt_m_sho_04.ski","a_wt_m_sho_05.ski","a_wt_m_sho_06.ski","a_wt_m_sho_07.ski","a_wt_m_sho_08.ski","a_wt_m_sho_09.ski"},
+            names=new []{"渡法长靴·Lv9","渡痕长靴·Lv15","渡骨长靴·Lv25","无神长靴·Lv35","钰阙长靴·Lv45","龙神长靴·Lv55","护法天君长靴·Lv65","地煞恶神长靴·Lv75","碧游通天长靴·Lv85","魔枭天冥长靴·Lv95"}},
         new PartGroup{ label="外装", dir="creature/actor/", isAct=false,
-            files=new []{"a_wt_m_wai_01.ski","a_wt_m_wai_02.ski","a_wt_m_wai_03.ski","a_wt_m_wai_04.ski","a_wt_m_wai_05.ski","a_wt_m_wai_06.ski","a_wt_m_wai_07.ski","a_wt_m_wai_08.ski","a_wt_m_wai_09.ski"}},
+            files=new []{"a_wt_m_wai_01.ski","a_wt_m_wai_02.ski","a_wt_m_wai_03.ski","a_wt_m_wai_04.ski","a_wt_m_wai_05.ski","a_wt_m_wai_06.ski","a_wt_m_wai_07.ski","a_wt_m_wai_08.ski","a_wt_m_wai_09.ski"},
+            names=new []{"外装·1","外装·2","外装·3","外装·4","外装·5","外装·6","外装·7","外装·8","外装·9"}},
     };
 
     Transform _pivot;                       // 当前模型挂点(自动旋转)
@@ -792,6 +992,8 @@ public class CrtViewer : MonoBehaviour
     Vector2 _touchLast;
     readonly Dictionary<string, Texture2D> _texCache = new Dictionary<string, Texture2D>();
     readonly Dictionary<string, GameObject> _modelCache = new Dictionary<string, GameObject>();
+    readonly Dictionary<string, string> _infoCache = new Dictionary<string, string>();   // v3.5: per-model 信息
+    int _loadSeq;                                                                          // v3.5: 加载序号(竞态守卫)
 
     void Awake()
     {
@@ -818,15 +1020,18 @@ public class CrtViewer : MonoBehaviour
         string file = grp.files[i];
         string path = grp.dir + file;
         string key = grp.label + "/" + file;
-        StartCoroutine(LoadModel(key, path, grp.isAct));
+        StartCoroutine(LoadModel(key, path, grp.isAct, grp.Name(i)));
     }
 
-    IEnumerator LoadModel(string key, string path, bool isAct)
+    IEnumerator LoadModel(string key, string path, bool isAct, string dispName)
     {
+        int seq = ++_loadSeq;                  // v3.5: 竞态守卫 — 快速翻页时旧协程不再覆盖状态
         _loading = true;
         if (_modelCache.ContainsKey(key))
         {
-            Show(key); _loading = false; yield break;
+            Show(key);
+            if (_infoCache.ContainsKey(key)) _info = _infoCache[key];   // v3.5: 恢复本模型的统计
+            _loading = false; yield break;
         }
         _status = "加载 " + path + " …";
         var req = UnityWebRequest.Get(SA(path));
@@ -841,6 +1046,7 @@ public class CrtViewer : MonoBehaviour
         {
             GameObject model;
             string texName;
+            string info;
             if (isAct)
             {
                 var act = LoadAct(d);
@@ -848,24 +1054,28 @@ public class CrtViewer : MonoBehaviour
                 var sk = act.skins[0];
                 texName = sk.subs[0].tex;
                 model = BuildMeshObject(sk.verts, sk.nors, sk.uvs, sk.tris, texName);
-                _info = string.Format("{0}  骨骼{1}根  网格{2}顶点/{3}面  贴图={4}",
-                    act.ver, act.bones.Count, sk.verts.Count, sk.tris.Count / 3, texName);
+                info = string.Format("【{0}】 {1}  骨骼{2}根  网格{3}顶点/{4}面  贴图={5}",
+                    dispName, act.ver, act.bones.Count, sk.verts.Count, sk.tris.Count / 3, texName);
             }
             else
             {
                 var ski = LoadSki(d);
                 texName = ski.subs[0].tex;
                 model = BuildMeshObject(ski.verts, ski.nors, ski.uvs, ski.tris, texName);
-                _info = string.Format("{0}  {1}顶点/{2}面  贴图={3}  |  {4}",
-                    ski.name, ski.verts.Count, ski.tris.Count / 3, texName, _skiStat);
+                info = string.Format("【{0}】 {1}  {2}顶点/{3}面  贴图={4}  |  {5}",
+                    dispName, ski.name, ski.verts.Count, ski.tris.Count / 3, texName, _skiStat);
             }
+            if (seq != _loadSeq) yield break;      // v3.5: 已被更新的翻页取代, 放弃本协程
             model.transform.SetParent(_pivot, false);
             _modelCache[key] = model;
+            _infoCache[key] = info;                // v3.5: per-model 信息 (缓存命中时恢复)
             Show(key);
+            _info = info;
             _status = "";
         }
         catch (Exception e)
         {
+            if (seq != _loadSeq) yield break;
             _status = "解析失败: " + e.Message;
             _modelCache.Remove(key);                    // v3.1.1: 失败不留半成品
             foreach (var kv in _modelCache) kv.Value.SetActive(false);   // 隐藏旧模型, 避免残留画面
@@ -978,7 +1188,7 @@ public class CrtViewer : MonoBehaviour
         GUI.backgroundColor = new Color(0.1f, 0.1f, 0.14f, 0.85f);
 
         var title = new GUIStyle(GUI.skin.label) { fontSize = Mathf.Max(16, (int)(h * 0.030f)), alignment = TextAnchor.MiddleLeft, normal = { textColor = new Color(0.35f, 1f, 0.45f) } };
-        GUI.Label(new Rect(12, 8, w - 24, h * 0.05f), "v3.3 角色预览台 — CRT 直读 + 骨骼空间统一 (ski/act/dds)", title);
+        GUI.Label(new Rect(12, 8, w - 24, h * 0.05f), "v3.5 角色预览台 — CRT 直读 + 骨骼空间统一 (ski/act/dds)", title);
 
         var info = new GUIStyle(GUI.skin.label) { fontSize = Mathf.Max(11, (int)(h * 0.017f)), normal = { textColor = Color.white } };
         GUI.Label(new Rect(12, h * 0.052f, w - 24, h * 0.05f), _status.Length > 0 ? _status : _info, info);
@@ -1010,7 +1220,7 @@ public class CrtViewer : MonoBehaviour
 
         var tip = new GUIStyle(GUI.skin.label) { fontSize = Mathf.Max(10, (int)(h * 0.015f)), alignment = TextAnchor.UpperLeft, normal = { textColor = new Color(0.75f, 0.78f, 0.85f) }, wordWrap = true };
         GUI.Label(new Rect(12, h * 0.80f, w - 24, h * 0.19f),
-            "触摸滑动=旋转展台  ·  v3 只展示单件部件(骨骼局部坐标)\n" +
+            "触摸滑动=旋转展台  ·  v3.5.1 骨骼空间统一(顶点内配对+Kabsch 6D+强弱边BFS)\n" +
             "整装术士(身体拼合+骨骼动画)待 v4：需从游戏包提取 role_wt_m_01.act\n" +
             "Swap test: 服装/手套/鞋/外装/头/武器 已可实时切换", tip);
     }
