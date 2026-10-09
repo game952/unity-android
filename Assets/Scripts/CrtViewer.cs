@@ -375,34 +375,32 @@ public class CrtViewer : MonoBehaviour
     {
         int nR = rList.Count, nC = cList.Count;
         if (nR == 0 || nC == 0) return;
-        int nR = rList.Count, nC = cList.Count;
-        if (nR == 0 || nC == 0) return;
         // v3.3: 顺序 FIFO 配对 — Rn 的 n = 影响骨骼数 (R1 不消耗 C, R2/R3 依次消耗)
         // 流序即对应关系: 每条 C 与最近的未满 R 主记录是同一顶点
         var paList = new List<Vector3>(); var pbList = new List<Vector3>();
         var aSrc = new List<int>(); var bSrc = new List<int>();   // 配对 → rList/cList 全局下标
-        int i = 0, j = 0, head = -1, headLeft = 0, headBone = 0; Vector3 headPos = Vector3.zero;
-        while (i < nR || j < nC)
+        int fi = 0, fj = 0, head = -1, headLeft = 0, headBone = 0; Vector3 headPos = Vector3.zero;
+        while (fi < nR || fj < nC)
         {
-            bool takeR = j >= nC || (i < nR && rList[i].si < cList[j].si);
+            bool takeR = fj >= nC || (fi < nR && rList[fi].si < cList[fj].si);
             if (takeR)
             {
-                var r = rList[i];
+                var r = rList[fi];
                 int nImp; int.TryParse(r.kind.Length > 1 ? r.kind.Substring(1) : "1", out nImp);
                 if (nImp < 1) nImp = 1;
-                if (nImp >= 2) { head = i; headBone = r.bone; headPos = r.pos; headLeft = nImp - 1; }
-                i++;
+                if (nImp >= 2) { head = fi; headBone = r.bone; headPos = r.pos; headLeft = nImp - 1; }
+                fi++;
             }
             else
             {
-                var c = cList[j];
+                var c = cList[fj];
                 if (headLeft > 0)
                 {
                     paList.Add(headPos); pbList.Add(c.pos);
-                    aSrc.Add(head); bSrc.Add(j);
+                    aSrc.Add(head); bSrc.Add(fj);
                     headLeft--;
                 }
-                j++;
+                fj++;
             }
         }
         if (paList.Count == 0) return;
@@ -410,12 +408,12 @@ public class CrtViewer : MonoBehaviour
         var tMap = new Dictionary<long, Matrix4x4>();          // key = A*1000+B  (A→B: p_B = M * p_A)
         var pairR2C = new Dictionary<int, int>();              // C全局槽 -> R全局槽
         var grp = new Dictionary<long, List<int>>();
-        for (int k = 0; k < paList.Count; k++)
+        for (int fk = 0; fk < paList.Count; fk++)
         {
-            long key = (long)rList[aSrc[k]].bone * 1000 + cList[bSrc[k]].bone;
+            long key = (long)rList[aSrc[fk]].bone * 1000 + cList[bSrc[fk]].bone;
             List<int> L;
             if (!grp.TryGetValue(key, out L)) { L = new List<int>(); grp[key] = L; }
-            L.Add(k);
+            L.Add(fk);
         }
         foreach (var kv in grp)
         {
