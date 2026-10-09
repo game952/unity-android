@@ -151,38 +151,48 @@ public class CrtViewer : MonoBehaviour
     //   面 = 大端索引流 strip 装配 (跳退化三角, 绕序按奇偶交替)
     class VRec { public string kind; public int si; public int bone; public float w; public Vector3 pos, nor; public Vector2 uv; }
 
+    static string _walkDiag = "";           // v3.7: 首个断点的原始字节佐证(确诊未识别记录的真实布局)
+
     static List<VRec> WalkVertices(byte[] b, int start, int end, out int endPos)
     {
         endPos = start;
         var recs = new List<VRec>();
-        bool firstA = true; int o = start;
+        bool firstA = true; int o = start; int gaps = 0;
         while (o < end - 26)
         {
+            if (recs.Count > 5000) break;                 // v3.7: 顶点数上限(性能+防垃圾灌入)
             int t0 = b[o], t1 = b[o + 1];
             if (t0 == 1 && t1 == 1)
             {
                 int q = o + (firstA ? 6 : 2);
-                var r = new VRec { kind = "A" };
-                r.nor = new Vector3(F32(b, q), F32(b, q + 4), F32(b, q + 8));
-                r.uv = new Vector2(F32(b, q + 12), F32(b, q + 16));
-                recs.Add(r); o += firstA ? 26 : 22; firstA = false;
+                var nor = new Vector3(F32(b, q), F32(b, q + 4), F32(b, q + 8));
+                var uv = new Vector2(F32(b, q + 12), F32(b, q + 16));
+                if (Sanity(nor) && Sanity(uv))
+                { var r = new VRec { kind = "A" }; r.nor = nor; r.uv = uv; recs.Add(r); o += firstA ? 26 : 22; firstA = false; endPos = o; continue; }
             }
             else if (t0 == 1 && t1 != 0)            // C 记录: 附加影响/半侧顶点
             {
-                var r = new VRec { kind = "C", bone = t1, w = F32(b, o + 2) };
-                r.pos = new Vector3(F32(b, o + 6), F32(b, o + 10), F32(b, o + 14));
-                r.nor = new Vector3(F32(b, o + 18), F32(b, o + 22), F32(b, o + 26));
-                recs.Add(r); o += 30;
+                float w = F32(b, o + 2);
+                var pos = new Vector3(F32(b, o + 6), F32(b, o + 10), F32(b, o + 14));
+                var nor = new Vector3(F32(b, o + 18), F32(b, o + 22), F32(b, o + 26));
+                if (w >= 0f && w <= 1.02f && Sanity(pos) && Sanity(nor))
+                { var r = new VRec { kind = "C", bone = t1, w = w, pos = pos, nor = nor }; recs.Add(r); o += 30; endPos = o; continue; }
             }
             else if (t0 >= 1 && t0 <= 8 && t1 == 0 && b[o + 2] == 0 && b[o + 3] == 0)   // R 记录
             {
-                var r = new VRec { kind = "R" + t0, bone = b[o + 4], w = F32(b, o + 5) };
-                r.pos = new Vector3(F32(b, o + 9), F32(b, o + 13), F32(b, o + 17));
-                r.nor = new Vector3(F32(b, o + 21), F32(b, o + 25), F32(b, o + 29));
-                recs.Add(r); o += 33;
+                float w = F32(b, o + 5);
+                var pos = new Vector3(F32(b, o + 9), F32(b, o + 13), F32(b, o + 17));
+                var nor = new Vector3(F32(b, o + 21), F32(b, o + 25), F32(b, o + 29));
+                if (w >= 0f && w <= 1.02f && Sanity(pos) && Sanity(nor))
+                { var r = new VRec { kind = "R" + t0, bone = b[o + 4], w = w, pos = pos, nor = nor }; recs.Add(r); o += 33; endPos = o; continue; }
             }
-            else return null;                       // 未识别 → 起点错误
-            endPos = o;
+            // v3.7: 未识别 → 不再整条流作废(旧逻辑断流=顶点池残缺=碎片根因)!
+            //   记录首个断点的 8 字节原始 hex (HUD 显示, 供远程确诊真实记录布局), 单步跳过续走
+            if (gaps == 0) _walkDiag = "断@" + o.ToString("X") + "[" + b[o].ToString("X2") + " " + b[o + 1].ToString("X2") + " "
+                + b[o + 2].ToString("X2") + " " + b[o + 3].ToString("X2") + " " + b[o + 4].ToString("X2") + " "
+                + b[o + 5].ToString("X2") + " " + b[o + 6].ToString("X2") + " " + b[o + 7].ToString("X2") + "]";
+            gaps++; o++; endPos = o;
+            if (gaps > 65536) break;                      // 安全阀
         }
         return recs;
     }
@@ -296,6 +306,12 @@ public class CrtViewer : MonoBehaviour
         if (f.tris.Count < 3) throw new Exception("面装配为空: " + f.name);
         // v3.6: 孤骨吸附 — 面拓扑就绪后执行
         LoneBoneAttach(f, rList, cList, distMap != null ? new HashSet<int>(distMap.Keys) : null);
+        // v3.7: 解析指纹 — maxIndex+1 = 顶点池硬下限(三角网格规律); 池<需 = 顶点流残缺(碎片根因数据佐证)
+        int maxIdx = 0;
+        for (int i = 0; i < bestIdx.Count; i++) if (bestIdx[i] > maxIdx) maxIdx = bestIdx[i];
+        _skiStat += " 池=" + f.verts.Count + "/需=" + (maxIdx + 1)
+            + (f.verts.Count < maxIdx + 1 ? "⚠缺" + (maxIdx + 1 - f.verts.Count) : "")
+            + (_walkDiag.Length > 0 ? " " + _walkDiag : "");
         return f;
     }
 
@@ -448,7 +464,7 @@ public class CrtViewer : MonoBehaviour
                     Vector3 rn = M.MultiplyVector(PN[i]);
                     nsum += (rn - QN[i]).magnitude; nc++;
                 }
-                if (nc > 0) norRes = nsum / nc;
+                if (nc > 0) norRes = nsum / nc; else norRes = 0f;   // v3.7: 全过滤时记0(不再显示1e9残留误导)
                 if (norRes > 0.2f) trust = false;
             }
         }
@@ -827,45 +843,85 @@ public class CrtViewer : MonoBehaviour
         }
         if (fcTotal < 3) return null;
 
-        // 顶点区：扫描 [u32 顶点数] + 32B 交错(pos3f+nor3f+uv2f)，浮点全部合理
-        // (注意: 索引可能引用到 511 槽而顶点池较小, 越界面由 StripAssemble 剔除)
-        for (int cand = o; cand < b.Length - 40; cand++)
+        // v3.7: 索引前置 — maxIndex+1 是顶点池大小的硬下限(三角网格规律), 用数据佐证替代盲扫。
+        //  实机证据: 三个武器 act 顶点数全是 257 而面数各异(827/503/724) → 旧扫描命中了假顶点区!
+        var idxBE = new List<int>(); var idxLE = new List<int>();
+        for (int s = 0; s < idxOffs.Count; s++)
         {
-            int cnt = (int)U32(b, cand);
-            if (cnt < 4 || cnt > 5000) continue;
+            idxBE.AddRange(IdxBE(b, idxOffs[s], idxCnts[s]));
+            idxLE.AddRange(IdxLE(b, idxOffs[s], idxCnts[s]));
+        }
+        int maxBE = 0, maxLE = 0;
+        for (int i = 0; i < idxBE.Count; i++) if (idxBE[i] > maxBE) maxBE = idxBE[i];
+        for (int i = 0; i < idxLE.Count; i++) if (idxLE[i] > maxLE) maxLE = idxLE[i];
+        int needMin = Math.Min(maxBE, maxLE) + 1;   // 正确端序的 maxIdx 必 < 真实池大小
+
+        int[] strides = { 32, 36, 40, 44, 28, 48 };
+        string note;
+        // 三轮: 0) o处直读cnt+stride试探(格式直读优先) 1) 全扫描 cnt≥needMin 2) 全扫描 cnt≥4 旧兜底(法线弱验证)
+        for (int pass = 0; pass < 3; pass++)
+        {
+            if (pass == 0)
+            {
+                if (TryReadVertBlock(b, o, strides, true, idxBE, idxLE, idxOffs, idxCnts, sk, out note)) { _actFp = "池=" + sk.verts.Count + "/需≥" + needMin + " " + note; return sk; }
+                continue;
+            }
+            int lo = pass == 1 ? needMin : 4;
+            for (int cand = o; cand < b.Length - 40; cand++)
+            {
+                int cnt = (int)U32(b, cand);
+                if (cnt < lo || cnt > 5000) continue;
+                if (TryReadVertBlock(b, cand, strides, pass == 1, idxBE, idxLE, idxOffs, idxCnts, sk, out note)) { _actFp = "池=" + sk.verts.Count + "/需≥" + needMin + " cand=" + cand.ToString("X") + " " + note; return sk; }
+            }
+        }
+        _actFp = "解析失败(需≥" + needMin + ")";
+        return null;
+    }
+
+    static string _actFp = "";              // v3.7: act 解析指纹(HUD 显示, 供对比佐证)
+
+    // v3.7: 从 cand 读 [u32 cnt] + cnt×stride 交错块; stride 试探(32/36/40/44/28/48), 法线单位化作 stride 判据
+    static bool TryReadVertBlock(byte[] b, int cand, int[] strides, bool norStrict, List<int> idxBE, List<int> idxLE, List<int> idxOffs, List<int> idxCnts, ActSkin sk, out string note)
+    {
+        note = "";
+        int cnt = (int)U32(b, cand);
+        if (cnt < 4 || cnt > 5000 || cand + 4 > b.Length) return false;
+        foreach (int st in strides)
+        {
+            if (cand + 4 + (long)cnt * st > b.Length) continue;
             int p = cand + 4; bool ok = true;
             var V = new List<Vector3>(cnt); var N = new List<Vector3>(cnt); var U = new List<Vector2>(cnt);
             for (int v = 0; v < cnt && ok; v++)
             {
                 var pos = new Vector3(F32(b, p), F32(b, p + 4), F32(b, p + 8));
                 var nor = new Vector3(F32(b, p + 12), F32(b, p + 16), F32(b, p + 20));
-                var uv = new Vector2(F32(b, p + 24), F32(b, p + 28)); p += 32;
-                if (!Sanity(pos) || !Sanity(nor) || !Sanity(uv)) ok = false;
-                else { V.Add(pos); N.Add(nor); U.Add(uv); }
+                var uv = new Vector2(F32(b, p + 24), F32(b, p + 28)); p += st;
+                if (!Sanity(pos) || !Sanity(uv)) { ok = false; break; }
+                if (norStrict)
+                {
+                    float nm = nor.x * nor.x + nor.y * nor.y + nor.z * nor.z;
+                    if (nm < 0.5f || nm > 2f) { ok = false; break; }   // 单位法线判别: stride 错误立即失配
+                }
+                else if (!Sanity(nor)) { ok = false; break; }
+                V.Add(pos); N.Add(nor); U.Add(uv);
             }
-            if (!ok || V.Count == 0) continue;
+            if (!ok || V.Count < cnt) continue;
 
-            // 双端序择优 (v3.1.1): VaSkin 索引实测小端(v3.0 真机剑主体可见), ski 才是大端
-            var idxBE = new List<int>(); var idxLE = new List<int>();
-            for (int s = 0; s < idxOffs.Count; s++)
-            {
-                idxBE.AddRange(IdxBE(b, idxOffs[s], idxCnts[s]));
-                idxLE.AddRange(IdxLE(b, idxOffs[s], idxCnts[s]));
-            }
             float rBE = InRate(idxBE, V.Count), rLE = InRate(idxLE, V.Count);
-            if (rBE < 0.5f && rLE < 0.5f) continue;       // 假阳性防护: 两个端序界内率都不合格=结构错误
+            if (rBE < 0.5f && rLE < 0.5f) continue;    // 假阳性防护
             var bestIdx = rBE >= rLE ? idxBE : idxLE;
             var tris = StripAssemble(bestIdx, V.Count);
             if (tris.Count < 3) continue;
             sk.verts = V; sk.nors = N; sk.uvs = U; sk.tris = tris;
-            for (int s = 0, acc = 0; s < idxOffs.Count; s++)          // 记录端序择优后的子块索引
+            for (int s = 0, acc = 0; s < idxOffs.Count; s++)
             {
                 for (int i = 0; i < idxCnts[s]; i++) sk.subs[s].faces.Add(bestIdx[acc + i]);
                 acc += idxCnts[s];
             }
-            return sk;
+            note = "stride=" + st;
+            return true;
         }
-        return null;
+        return false;
     }
 
     // ======================= .dds 解码 (DXT1/3/5) =======================
@@ -1095,8 +1151,8 @@ public class CrtViewer : MonoBehaviour
                 var sk = act.skins[0];
                 texName = sk.subs[0].tex;
                 model = BuildMeshObject(sk.verts, sk.nors, sk.uvs, sk.tris, texName);
-                info = string.Format("【{0}】 {1}  骨骼{2}根  网格{3}顶点/{4}面  贴图={5}",
-                    dispName, act.ver, act.bones.Count, sk.verts.Count, sk.tris.Count / 3, texName);
+                info = string.Format("【{0}】 {1}  骨骼{2}根  网格{3}顶点/{4}面  贴图={5}  |  {6}",
+                    dispName, act.ver, act.bones.Count, sk.verts.Count, sk.tris.Count / 3, texName, _actFp);
             }
             else
             {
@@ -1252,7 +1308,7 @@ public class CrtViewer : MonoBehaviour
         GUI.backgroundColor = new Color(0.1f, 0.1f, 0.14f, 0.85f);
 
         var title = new GUIStyle(GUI.skin.label) { fontSize = Mathf.Max(16, (int)(h * 0.030f)), alignment = TextAnchor.MiddleLeft, normal = { textColor = new Color(0.35f, 1f, 0.45f) } };
-        GUI.Label(new Rect(12, 8, w - 24, h * 0.05f), "v3.6.3 角色预览台 — CRT 直读 + 骨骼空间统一+孤骨吸附 (ski/act/dds)", title);
+        GUI.Label(new Rect(12, 8, w - 24, h * 0.05f), "v3.7 角色预览台 — CRT 直读 + 解析指纹佐证 + 骨骼空间统一+孤骨吸附 (ski/act/dds)", title);
 
         var info = new GUIStyle(GUI.skin.label) { fontSize = Mathf.Max(11, (int)(h * 0.017f)), normal = { textColor = Color.white } };
         GUI.Label(new Rect(12, h * 0.052f, w - 24, h * 0.05f), _status.Length > 0 ? _status : _info, info);
