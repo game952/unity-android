@@ -47,6 +47,8 @@ using UnityEngine.Networking;
 //     - Python 离线验证: hea_05 统一后渲染出连续实体头盔壳 (原碎片消失)
 //   - 条带滑窗装配保持 (v3.1.1 端序择优不变)
 // v3.5.1 (2026-10-09 下午)：仅更新界面提示文字为 v3.5.1 描述(上一版漏改)；代码逻辑与 v3.5 完全一致
+// v3.6 (2026-10-09 下午)：孤骨吸附 — 无图边骨经面索引拓扑贴回统一分量(Kabsch完整刚体,
+//   按顶点数自适应正/反向, det<0回退平移)。297全量: 28文件GL边长显著改善/0恶化。
 // v3.5 修复 (2026-10-09，真机回归 v3.4 仍碎片 + 统计行异常)：
 //   ★根因: v3.4 改 KabschFit 时删掉了 n==1 安全分支(纯平移) — 单点/共线骨对改走"法线拟合",
 //     绕轴旋转自由度未定死, 且 norRes≈0 骗过检验 → 随机旋转混入骨骼图污染 BFS (Python 验证
@@ -989,7 +991,8 @@ public class CrtViewer : MonoBehaviour
     string _info = "";
     bool _loading;
     float _yaw = 30f, _pitch = 10f;
-    Vector2 _touchLast;
+    Vector2 _lastTouchPos; Vector3 _lastMousePos;      // v3.6.1: 位置帧差(部分机型 deltaPosition 不更新)
+    int _skip;                                          // v3.6.1: 404 连续跳过计数(一轮上限)
     readonly Dictionary<string, Texture2D> _texCache = new Dictionary<string, Texture2D>();
     readonly Dictionary<string, GameObject> _modelCache = new Dictionary<string, GameObject>();
     readonly Dictionary<string, string> _infoCache = new Dictionary<string, string>();   // v3.5: per-model 信息
@@ -1039,7 +1042,20 @@ public class CrtViewer : MonoBehaviour
         yield return req.SendWebRequest();
         if (req.result != UnityWebRequest.Result.Success)
         {
-            _status = "读取失败: " + req.error; _loading = false; yield break;
+            // v3.6.1: 失败清场(不残留上一件模型的影子) + 自动跳下一件(最多扫一整轮)
+            foreach (var kv in _modelCache) kv.Value.SetActive(false);
+            var g0 = Groups[_group];
+            var fname = path.Substring(path.LastIndexOf('/') + 1);
+            if (seq != _loadSeq) yield break;
+            if (_skip < g0.files.Length - 1)
+            {
+                _skip++;
+                _status = "✗ " + fname + " 不存在(" + req.error + ")  自动跳下一件 " + _skip + "/" + g0.files.Length;
+                Load(_group, (_idx + 1) % g0.files.Length);
+                yield break;
+            }
+            _status = "✗ 本组 " + g0.files.Length + " 个文件全部读取失败(" + req.error + ")";
+            _skip = 0; _loading = false; yield break;
         }
         byte[] d = req.downloadHandler.data;
         try
@@ -1072,6 +1088,7 @@ public class CrtViewer : MonoBehaviour
             Show(key);
             _info = info;
             _status = "";
+            _skip = 0;                            // v3.6.1: 成功即重置跳过计数
         }
         catch (Exception e)
         {
@@ -1173,12 +1190,32 @@ public class CrtViewer : MonoBehaviour
     void Update()
     {
         if (_pivot == null) return;
-        if (Input.touchCount == 1)
+        bool holding = false;
+        if (Input.touchCount == 1)                 // v3.6.1: 位置帧差(替代 deltaPosition, 兼容部分机型)
         {
             var t = Input.GetTouch(0);
-            if (t.phase == TouchPhase.Moved) { _yaw += t.deltaPosition.x * 0.4f; _pitch = Mathf.Clamp(_pitch - t.deltaPosition.y * 0.3f, -80f, 80f); }
+            if (t.phase == TouchPhase.Began) { _lastTouchPos = t.position; holding = true; }
+            else if (t.phase == TouchPhase.Moved)
+            {
+                _yaw   += (t.position.x - _lastTouchPos.x) * 0.4f;
+                _pitch  = Mathf.Clamp(_pitch - (t.position.y - _lastTouchPos.y) * 0.3f, -80f, 80f);
+                _lastTouchPos = t.position;
+                holding = true;
+            }
+            else if (t.phase == TouchPhase.Stationary) holding = true;
         }
-        _yaw += Time.unscaledDeltaTime * 12f;
+        else if (Input.GetMouseButton(0))          // v3.6.1: 鼠标回退(touchCount==0 才生效, 防触摸模拟双份)
+        {
+            var m = Input.mousePosition;
+            if (!Input.GetMouseButtonDown(0))
+            {
+                _yaw   += (m.x - _lastMousePos.x) * 0.4f;
+                _pitch  = Mathf.Clamp(_pitch - (m.y - _lastMousePos.y) * 0.3f, -80f, 80f);
+            }
+            _lastMousePos = m;
+            holding = true;
+        }
+        if (!holding) _yaw += Time.unscaledDeltaTime * 12f;   // 手指按住暂停自转 → 滑动即跟手
         _pivot.rotation = Quaternion.Euler(_pitch, _yaw, 0);
     }
 
@@ -1188,7 +1225,7 @@ public class CrtViewer : MonoBehaviour
         GUI.backgroundColor = new Color(0.1f, 0.1f, 0.14f, 0.85f);
 
         var title = new GUIStyle(GUI.skin.label) { fontSize = Mathf.Max(16, (int)(h * 0.030f)), alignment = TextAnchor.MiddleLeft, normal = { textColor = new Color(0.35f, 1f, 0.45f) } };
-        GUI.Label(new Rect(12, 8, w - 24, h * 0.05f), "v3.5 角色预览台 — CRT 直读 + 骨骼空间统一 (ski/act/dds)", title);
+        GUI.Label(new Rect(12, 8, w - 24, h * 0.05f), "v3.6.1 角色预览台 — CRT 直读 + 骨骼空间统一+孤骨吸附 (ski/act/dds)", title);
 
         var info = new GUIStyle(GUI.skin.label) { fontSize = Mathf.Max(11, (int)(h * 0.017f)), normal = { textColor = Color.white } };
         GUI.Label(new Rect(12, h * 0.052f, w - 24, h * 0.05f), _status.Length > 0 ? _status : _info, info);
@@ -1220,7 +1257,7 @@ public class CrtViewer : MonoBehaviour
 
         var tip = new GUIStyle(GUI.skin.label) { fontSize = Mathf.Max(10, (int)(h * 0.015f)), alignment = TextAnchor.UpperLeft, normal = { textColor = new Color(0.75f, 0.78f, 0.85f) }, wordWrap = true };
         GUI.Label(new Rect(12, h * 0.80f, w - 24, h * 0.19f),
-            "触摸滑动=旋转展台  ·  v3.5.1 骨骼空间统一(顶点内配对+Kabsch 6D+强弱边BFS)\n" +
+            "触摸滑动=旋转展台(按住暂停自转)  ·  v3.6 骨骼空间统一(顶点内配对+Kabsch 6D+强弱边BFS+孤骨吸附)\n" +
             "整装术士(身体拼合+骨骼动画)待 v4：需从游戏包提取 role_wt_m_01.act\n" +
             "Swap test: 服装/手套/鞋/外装/头/武器 已可实时切换", tip);
     }
