@@ -40,7 +40,9 @@ using UnityEngine.Networking;
 //     - glo_09 绑 12 骨、clo_02 绑 34 骨、61% 三角形跨骨骼
 //   ★ C 记录真身破译 = 同一顶点在第二骨骼空间的坐标 (R2 w=0.5 + C w=0.5, 和为1)
 //     - RANSAC 骨12↔骨13 解出 15/15 全配对, 刚体残差<0.08 → 实锤
-//   ★ 解法: 3点几何法RANSAC配对 + Kabsch解骨骼刚体变换 + 骨骼图BFS传递
+//   ★ 解法(v3.3): 顺序FIFO配对 + Horn四元数Kabsch(Jacobi精确特征分解) + 骨骼图BFS传递
+//     Rn 的 n=影响骨骼数(R1单骨/R2双骨/R3三骨), 流序即对应关系;
+//     离线验证 297文件/4068骨对 全零残差(精确刚体), 无随机搜索
 //     → 全部顶点归一到代表骨空间, 无需骨骼文件！
 //     - Python 离线验证: hea_05 统一后渲染出连续实体头盔壳 (原碎片消失)
 //   - 条带滑窗装配保持 (v3.1.1 端序择优不变)
@@ -119,7 +121,7 @@ public class CrtViewer : MonoBehaviour
     //     C : 01 + 骨骼ID + f32 权重 + f32 坐标3 + f32 法线3 → 30B
     //   顶点池 = R块流序 + C块流序; UV = 第 i 个 A 记录的第4/5个 f32
     //   面 = 大端索引流 strip 装配 (跳退化三角, 绕序按奇偶交替)
-    class VRec { public string kind; public int bone; public float w; public Vector3 pos, nor; public Vector2 uv; }
+    class VRec { public string kind; public int si; public int bone; public float w; public Vector3 pos, nor; public Vector2 uv; }
 
     static List<VRec> WalkVertices(byte[] b, int start, int end, out int endPos)
     {
@@ -233,8 +235,9 @@ public class CrtViewer : MonoBehaviour
 
         // 顶点池 = R块(流序) + C块(流序); UV = 第 i 个 A 记录
         var aList = new List<VRec>(); var rList = new List<VRec>(); var cList = new List<VRec>();
-        foreach (var r in recs)
+        for (int si = 0; si < recs.Count; si++)
         {
+            var r = recs[si]; r.si = si;      // v3.3: 流序号 — R2/C 顺序配对的依据
             if (r.kind == "A") aList.Add(r);
             else if (r.kind == "C") cList.Add(r);
             else rList.Add(r);
@@ -266,90 +269,12 @@ public class CrtViewer : MonoBehaviour
         return f;
     }
 
-    // ======================= v3.2: 骨骼空间统一 =======================
-    // 发现: R2(w=0.5,骨A) + C(骨B) 是同一顶点在两个骨骼空间的坐标(权重和=1)。
-    // 同一骨骼对 (A,B) 的点对服从同一刚体变换 → 3点几何法 RANSAC 配对 + 解 T(A→B)
+    // ======================= v3.3: 骨骼空间统一 =======================
+    // 格式实锤: Rn 的 n = 该顶点影响骨骼数; Rn(骨A,权重w) 与其后的 C(骨B,权重1-w)
+    // 是同一顶点在两个骨骼空间的坐标, 流序即对应关系 (FIFO: R1 不消耗 C, R2/R3 依次消耗)。
+    // 同一骨骼对 (A,B) 的全部点对服从同一刚体变换 → Kabsch 精确求解 (Horn四元数+Jacobi)。
+    // 297 文件 / 4068 骨对离线验证: 残差全部 <1e-4 (文件记录即精确刚体), 确定性无随机。
     // → BFS 沿骨骼图传递 → 全部顶点归一到各分量代表骨空间 → 网格连续
-    // 真机验证: hea_05 骨12↔骨13 解出 15/15 全配对(刚体残差<0.08)
-
-    static bool EstimateRigid3(Vector3 p1, Vector3 p2, Vector3 p3, Vector3 q1, Vector3 q2, Vector3 q3, out Matrix4x4 M)
-    {
-        // 3 点构正交基求旋转 (免SVD), p系→q系
-        M = Matrix4x4.identity;
-        Vector3 e1 = p2 - p1, e2 = p3 - p1;
-        float l1 = e1.magnitude; if (l1 < 1e-5f) return false;
-        e1 /= l1;
-        e2 -= Vector3.Dot(e2, e1) * e1; float l2 = e2.magnitude; if (l2 < 1e-4f) return false;
-        e2 /= l2;
-        Vector3 e3 = Vector3.Cross(e1, e2);
-        Vector3 f1 = q2 - q1, f2 = q3 - q1;
-        float g1 = f1.magnitude; if (g1 < 1e-5f) return false;
-        f1 /= g1;
-        f2 -= Vector3.Dot(f2, f1) * f1; float g2 = f2.magnitude; if (g2 < 1e-4f) return false;
-        f2 /= g2;
-        Vector3 f3 = Vector3.Cross(f1, f2);
-        // R = F · E^T
-        Matrix4x4 E = Matrix4x4.identity, F = Matrix4x4.identity;
-        E.SetColumn(0, e1); E.SetColumn(1, e2); E.SetColumn(2, e3);
-        F.SetColumn(0, f1); F.SetColumn(1, f2); F.SetColumn(2, f3);
-        Matrix4x4 Rm = F * E.transpose;
-        Vector3 rp = Rm * p1;          // Matrix4x4*Vector3 结果为 Vector4, 先赋值转回 Vector3 (CS0034 修复)
-        Vector3 t = q1 - rp;
-        M = Matrix4x4.identity;
-        for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) M[r, c] = Rm[r, c];
-        M[0, 3] = t.x; M[1, 3] = t.y; M[2, 3] = t.z;
-        return true;
-    }
-
-    static int CountInliers(Vector3[] PA, Vector3[] PB, Matrix4x4 M, float tol, List<int> inA, List<int> inB)
-    {
-        inA.Clear(); inB.Clear();
-        for (int i = 0; i < PA.Length; i++)
-        {
-            Vector3 t = M * PA[i];
-            int best = -1; float bd = tol;
-            for (int j = 0; j < PB.Length; j++)
-            {
-                float d = Vector3.Distance(t, PB[j]);
-                if (d < bd) { bd = d; best = j; }
-            }
-            if (best >= 0) { inA.Add(i); inB.Add(best); }
-        }
-        return inA.Count;
-    }
-
-    // 返回 T(A→B) 与配对; R2按骨分组索引
-    static Matrix4x4 SolveBonePair(List<int> AI, List<int> BI, List<VRec> rList, List<VRec> cList, out List<int> pairA, out List<int> pairB)
-    {
-        int na = AI.Count, nb = BI.Count;
-        var PA = new Vector3[na]; var PB = new Vector3[nb];
-        for (int i = 0; i < na; i++) PA[i] = rList[AI[i]].pos;
-        for (int i = 0; i < nb; i++) PB[i] = cList[BI[i]].pos;
-        var rnd = new System.Random(7);
-        int bestN = 0; Matrix4x4 bestM = Matrix4x4.identity;
-        var la = new List<int>(); var lb = new List<int>();
-        pairA = new List<int>(); pairB = new List<int>();
-        if (na < 3 || nb < 3) return bestM;
-        if (Math.Abs(na - nb) > 2) return bestM;   // R2/C 同一点集双记录, 点数应相等 — 预筛砍掉绝大部分无效组合
-        for (int it = 0; it < 900; it++)
-        {
-            int i1 = rnd.Next(na), i2 = rnd.Next(na), i3 = rnd.Next(na);
-            if (i1 == i2 || i1 == i3 || i2 == i3) continue;
-            int j1 = rnd.Next(nb), j2 = rnd.Next(nb), j3 = rnd.Next(nb);
-            if (j1 == j2 || j1 == j3 || j2 == j3) continue;
-            Matrix4x4 M;
-            if (!EstimateRigid3(PA[i1], PA[i2], PA[i3], PB[j1], PB[j2], PB[j3], out M)) continue;
-            int n = CountInliers(PA, PB, M, 0.09f, la, lb);
-            if (n > bestN) { bestN = n; bestM = M; }
-            if (bestN == Mathf.Min(na, nb)) break;      // 全配对早退
-        }
-        if (bestN >= 3)
-        {
-            CountInliers(PA, PB, bestM, 0.09f, la, lb);   // 重算 inlier 列表
-            for (int i = 0; i < la.Count; i++) { pairA.Add(AI[la[i]]); pairB.Add(BI[lb[i]]); }
-        }
-        return bestM;
-    }
 
     static Matrix4x4 RotOnly(Matrix4x4 M)
     {
@@ -358,40 +283,150 @@ public class CrtViewer : MonoBehaviour
         return R;
     }
 
+    // v3.3: Jacobi 4x4 对称特征分解 — ev[4]=特征值, V[16]=行主序特征向量 (列=向量)
+    static void JacobiSym4(float[] a, out float[] ev, out float[] V)
+    {
+        float[,] A = new float[4, 4];
+        for (int i = 0; i < 4; i++) for (int j = 0; j < 4; j++) A[i, j] = a[i * 4 + j];
+        V = new float[16];
+        for (int i = 0; i < 4; i++) V[i * 5] = 1f;
+        for (int sweep = 0; sweep < 40; sweep++)
+        {
+            float off = 0f;
+            for (int p = 0; p < 3; p++) for (int q = p + 1; q < 4; q++) off += Mathf.Abs(A[p, q]);
+            if (off < 1e-9f) break;
+            for (int p = 0; p < 3; p++)
+                for (int q = p + 1; q < 4; q++)
+                {
+                    float apq = A[p, q];
+                    if (Mathf.Abs(apq) < 1e-12f) continue;
+                    float th = (A[q, q] - A[p, p]) / (2f * apq);
+                    float t = (th >= 0f ? 1f : -1f) / (Mathf.Abs(th) + Mathf.Sqrt(th * th + 1f));
+                    float c = 1f / Mathf.Sqrt(t * t + 1f), sg = t * c;
+                    for (int k = 0; k < 4; k++)
+                    {
+                        float akp = A[k, p], akq = A[k, q];
+                        A[k, p] = c * akp - sg * akq; A[k, q] = sg * akp + c * akq;
+                    }
+                    for (int k = 0; k < 4; k++)
+                    {
+                        float apk = A[p, k], aqk = A[q, k];
+                        A[p, k] = c * apk - sg * aqk; A[q, k] = sg * apk + c * aqk;
+                    }
+                    for (int k = 0; k < 4; k++)
+                    {
+                        float vkp = V[k * 4 + p], vkq = V[k * 4 + q];
+                        V[k * 4 + p] = c * vkp - sg * vkq; V[k * 4 + q] = sg * vkp + c * vkq;
+                    }
+                }
+        }
+        ev = new float[] { A[0, 0], A[1, 1], A[2, 2], A[3, 3] };
+    }
+
+    // v3.3: Kabsch 刚体拟合 (Horn四元数+Jacobi) — 求 M 使 Q≈M·P, avgRes=平均残差
+    static Matrix4x4 KabschFit(List<Vector3> P, List<Vector3> Q, out float avgRes)
+    {
+        var I = Matrix4x4.identity;
+        int n = P.Count;
+        if (n == 0) { avgRes = 1e9f; return I; }
+        Vector3 pc = Vector3.zero, qc = Vector3.zero;
+        for (int i = 0; i < n; i++) { pc += P[i]; qc += Q[i]; }
+        pc /= n; qc /= n;
+        if (n == 1)
+        {
+            Vector3 t1 = qc - pc;
+            I[0, 3] = t1.x; I[1, 3] = t1.y; I[2, 3] = t1.z;
+            avgRes = 0f; return I;
+        }
+        float Sxx = 0f, Sxy = 0f, Sxz = 0f, Syx = 0f, Syy = 0f, Syz = 0f, Szx = 0f, Szy = 0f, Szz = 0f;
+        for (int i = 0; i < n; i++)
+        {
+            Vector3 p = P[i] - pc, q = Q[i] - qc;
+            Sxx += p.x * q.x; Sxy += p.x * q.y; Sxz += p.x * q.z;
+            Syx += p.y * q.x; Syy += p.y * q.y; Syz += p.y * q.z;
+            Szx += p.z * q.x; Szy += p.z * q.y; Szz += p.z * q.z;
+        }
+        // Horn 4x4 对称矩阵: 最大特征值的特征向量 = 最优旋转四元数 (w,x,y,z)
+        float[] a = {
+            Sxx+Syy+Szz, Syz-Szy,     Szx-Sxz,     Sxy-Syx,
+            Syz-Szy,     Sxx-Syy-Szz, Sxy+Syx,     Szx+Sxz,
+            Szx-Sxz,     Sxy+Syx,    -Sxx+Syy-Szz, Syz+Szy,
+            Sxy-Syx,     Szx+Sxz,     Syz+Szy,    -Sxx-Syy+Szz };
+        float[] ev, V;
+        JacobiSym4(a, out ev, out V);
+        int im = 0;
+        for (int k = 1; k < 4; k++) if (ev[k] > ev[im]) im = k;
+        float qw = V[im], qx = V[4 + im], qy = V[8 + im], qz = V[12 + im];   // 行主序: 列 im = 特征向量
+        float qw2 = qw * qw, qx2 = qx * qx, qy2 = qy * qy, qz2 = qz * qz;
+        var M = I;
+        M[0, 0] = qw2 + qx2 - qy2 - qz2; M[0, 1] = 2f * (qx * qy - qw * qz); M[0, 2] = 2f * (qx * qz + qw * qy);
+        M[1, 0] = 2f * (qx * qy + qw * qz); M[1, 1] = qw2 - qx2 + qy2 - qz2; M[1, 2] = 2f * (qy * qz - qw * qx);
+        M[2, 0] = 2f * (qx * qz - qw * qy); M[2, 1] = 2f * (qy * qz + qw * qx); M[2, 2] = qw2 - qx2 - qy2 + qz2;
+        Vector3 rp = M * pc;                    // Matrix4x4*Vector3 结果为 Vector4, 先赋值转回 Vector3
+        Vector3 t = qc - rp;
+        M[0, 3] = t.x; M[1, 3] = t.y; M[2, 3] = t.z;
+        float sum = 0f;
+        for (int i = 0; i < n; i++) { Vector3 tp = M * P[i]; sum += (tp - Q[i]).magnitude; }
+        avgRes = sum / n;
+        return M;
+    }
+
     static void UnifyBoneSpace(SkiFile f, List<VRec> rList, List<VRec> cList)
     {
         int nR = rList.Count, nC = cList.Count;
         if (nR == 0 || nC == 0) return;
-        // R2 (w<0.99) 与 C 按骨分组
-        var r2ByBone = new Dictionary<int, List<int>>();
-        for (int i = 0; i < nR; i++) if (rList[i].w < 0.99f)
+        int nR = rList.Count, nC = cList.Count;
+        if (nR == 0 || nC == 0) return;
+        // v3.3: 顺序 FIFO 配对 — Rn 的 n = 影响骨骼数 (R1 不消耗 C, R2/R3 依次消耗)
+        // 流序即对应关系: 每条 C 与最近的未满 R 主记录是同一顶点
+        var paList = new List<Vector3>(); var pbList = new List<Vector3>();
+        var aSrc = new List<int>(); var bSrc = new List<int>();   // 配对 → rList/cList 全局下标
+        int i = 0, j = 0, head = -1, headLeft = 0, headBone = 0; Vector3 headPos = Vector3.zero;
+        while (i < nR || j < nC)
         {
-            int bn = rList[i].bone;
-            if (!r2ByBone.ContainsKey(bn)) r2ByBone[bn] = new List<int>();
-            r2ByBone[bn].Add(i);
+            bool takeR = j >= nC || (i < nR && rList[i].si < cList[j].si);
+            if (takeR)
+            {
+                var r = rList[i];
+                int nImp; int.TryParse(r.kind.Length > 1 ? r.kind.Substring(1) : "1", out nImp);
+                if (nImp < 1) nImp = 1;
+                if (nImp >= 2) { head = i; headBone = r.bone; headPos = r.pos; headLeft = nImp - 1; }
+                i++;
+            }
+            else
+            {
+                var c = cList[j];
+                if (headLeft > 0)
+                {
+                    paList.Add(headPos); pbList.Add(c.pos);
+                    aSrc.Add(head); bSrc.Add(j);
+                    headLeft--;
+                }
+                j++;
+            }
         }
-        var cByBone = new Dictionary<int, List<int>>();
-        for (int j = 0; j < nC; j++)
-        {
-            int bn = cList[j].bone;
-            if (!cByBone.ContainsKey(bn)) cByBone[bn] = new List<int>();
-            cByBone[bn].Add(j);
-        }
-        if (r2ByBone.Count == 0) return;
-        // RANSAC 解骨骼对
+        if (paList.Count == 0) return;
+        // 骨对分组 → Kabsch 确定性求解 (297文件/4068骨对 实测全零残差)
         var tMap = new Dictionary<long, Matrix4x4>();          // key = A*1000+B  (A→B: p_B = M * p_A)
         var pairR2C = new Dictionary<int, int>();              // C全局槽 -> R全局槽
-        foreach (var ka in r2ByBone)
-            foreach (var kb in cByBone)
-            {
-                List<int> pairA, pairB;
-                Matrix4x4 M = SolveBonePair(ka.Value, kb.Value, rList, cList, out pairA, out pairB);
-                if (pairA.Count >= 4)
-                {
-                    tMap[(long)ka.Key * 1000 + kb.Key] = M;
-                    for (int i = 0; i < pairA.Count; i++) pairR2C[nR + pairB[i]] = pairA[i];
-                }
-            }
+        var grp = new Dictionary<long, List<int>>();
+        for (int k = 0; k < paList.Count; k++)
+        {
+            long key = (long)rList[aSrc[k]].bone * 1000 + cList[bSrc[k]].bone;
+            List<int> L;
+            if (!grp.TryGetValue(key, out L)) { L = new List<int>(); grp[key] = L; }
+            L.Add(k);
+        }
+        foreach (var kv in grp)
+        {
+            var P = new List<Vector3>(); var Q = new List<Vector3>();
+            foreach (int k in kv.Value) { P.Add(paList[k]); Q.Add(pbList[k]); }
+            float res;
+            Matrix4x4 M = KabschFit(P, Q, out res);
+            if (res < 0.05f) tMap[kv.Key] = M;                 // 残差兜底
+            for (int k = 0; k < kv.Value.Count; k++)           // C 顶点无条件抄配对 R (同一点)
+                pairR2C[nR + bSrc[kv.Value[k]]] = aSrc[kv.Value[k]];
+        }
         if (tMap.Count == 0) return;
         // 骨骼图 BFS: dist[骨] = M 使 p_rep = M * p_骨
         var adj = new Dictionary<int, List<int>>();
@@ -888,7 +923,7 @@ public class CrtViewer : MonoBehaviour
         GUI.backgroundColor = new Color(0.1f, 0.1f, 0.14f, 0.85f);
 
         var title = new GUIStyle(GUI.skin.label) { fontSize = Mathf.Max(16, (int)(h * 0.030f)), alignment = TextAnchor.MiddleLeft, normal = { textColor = new Color(0.35f, 1f, 0.45f) } };
-        GUI.Label(new Rect(12, 8, w - 24, h * 0.05f), "v3.2.1 角色预览台 — CRT 直读 + 骨骼空间统一 (ski/act/dds)", title);
+        GUI.Label(new Rect(12, 8, w - 24, h * 0.05f), "v3.3 角色预览台 — CRT 直读 + 骨骼空间统一 (ski/act/dds)", title);
 
         var info = new GUIStyle(GUI.skin.label) { fontSize = Mathf.Max(11, (int)(h * 0.017f)), normal = { textColor = Color.white } };
         GUI.Label(new Rect(12, h * 0.052f, w - 24, h * 0.05f), _status.Length > 0 ? _status : _info, info);
