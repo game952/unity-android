@@ -1,0 +1,6 @@
+# ski2obj v3  a_wt_m_sho_00
+newmtl a_wt_m_sho_00
+Kd 1.0 1.0 1.0
+d 1.0
+map_Kd ../texture/a_wt_m_sho_00.png
+# pass: Standard anchor=a_wt_m_sho_00 blend=Add

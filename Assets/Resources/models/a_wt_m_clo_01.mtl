@@ -1,0 +1,7 @@
+# ski2obj v3  a_wt_m_clo_01
+newmtl a_wt_m_clo_01
+Kd 1.0 1.0 1.0
+d 1.0
+map_Kd ../texture/a_wt_m_clo_00.png
+# pass: Standard anchor=a_wt_m_clo_00 blend=diffuse
+# pass: Standard anchor=a_wt_m_clo_01 blend=Add
