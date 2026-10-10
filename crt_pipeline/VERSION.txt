@@ -1,0 +1,7 @@
+crt_pipeline v3.2.1 - 抽样渲染手机适配版 (2026-10-10 23:57 后构建)
+v3.2 基础: bpf 裸流解析 (187 个披风家族失败修复)
+v3.2.1 修复:
+  - quick_check 抽样渲染临时文件 /tmp → pack 目录 (Termux 无 /tmp 写权限)
+  - 临时 PNG 用完即删, 不留垃圾
+用法: 在 游戏端 目录解压覆盖, 无需重跑量产
+自检: python3 quick_check.py --pack ./model_pack --samples 8

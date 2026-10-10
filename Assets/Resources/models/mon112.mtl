@@ -1,0 +1,3 @@
+newmtl mon112
+Kd 1 1 1
+map_Kd ../texture/mon112.png

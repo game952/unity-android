@@ -1,0 +1,3 @@
+newmtl bpf01
+Kd 1 1 1
+map_Kd ../texture/pfb01.png
