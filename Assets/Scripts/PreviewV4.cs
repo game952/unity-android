@@ -26,6 +26,26 @@ public class PreviewV4 : MonoBehaviour
     const float FitSize = 3.4f;    // 大件归一化最大边(甲袍/外装)
     static float _zoom = 1f;       // 手动缩放(底部＋－)
     static string _texSample = null;
+    // 骨骼动画播放状态
+    static ActSkel _animSk; static SkiData _animSd; static Mesh _animMesh;
+    static Coroutine _animCo; static int _skipGuard;
+    const float AnimFps = 24f;
+    static System.Collections.IEnumerator PlayAnimCo()
+    {
+        var wait = new WaitForSeconds(1f / AnimFps);
+        int nf = 0; foreach (var b in _animSk.bones) { if (b.nf > nf) nf = b.nf; }
+        if (nf <= 1) yield break;   // 静态部件无动画
+        while (_animSk != null && _animMesh != null && _animSd != null)
+        {
+            int f = (int)(Time.time * AnimFps) % nf;
+            var W2 = LoadSkeleton(_animSk, f);
+            var vs = new Vector3[_animMesh.vertexCount];
+            for (int i = 0; i < vs.Length; i++) vs[i] = BakeVertex(W2, _animSd.verts[i]);
+            _animMesh.vertices = vs;
+            _animMesh.RecalculateBounds();
+            yield return wait;
+        }
+    }
     // 按部件类型的合理预览尺寸: 小件不再被撑成大件
     static float FitFor(string name)
     {
@@ -83,7 +103,7 @@ public class PreviewV4 : MonoBehaviour
         lg.AddComponent<Light>().type = LightType.Directional;
         RenderSettings.ambientLight = new Color(0.55f, 0.55f, 0.58f);
         pivot = new GameObject("PreviewV4Pivot");
-        pivot.transform.position = new Vector3(1.5f, 0f, 0f);
+        pivot.transform.position = new Vector3(0.9f, 0f, 0f);
     }
 
     // ===== 资源路径探测: APK内StreamingAssets(AssetManager同步直读)优先, 外部目录兜底 =====
@@ -195,7 +215,7 @@ public class PreviewV4 : MonoBehaviour
             pool.Sort();
             actPool = pool; useAsset = true;
             actorDir = "asset:creature/actor"; texDir = "asset:creature/texture";
-            title = string.Format("v4.4 整装拼合 · APK数据注入 ({0} 骨架, StreamingAssets)", pool.Count);
+            title = string.Format("v4.5 整装拼合 · APK数据注入 ({0} 骨架, StreamingAssets)", pool.Count);
             return;
         }
         // 2) 外部目录兜底
@@ -214,7 +234,7 @@ public class PreviewV4 : MonoBehaviour
             actPool = new List<string>(acts); actPool.Sort();
             string t = Path.GetDirectoryName(c) + "/texture";
             texDir = Directory.Exists(t) ? t : c;
-            title = string.Format("v4.4 整装拼合 · act骨架池+LBS烘焙 ({0} 骨架, 外部目录)", actPool.Count);
+            title = string.Format("v4.5 整装拼合 · act骨架池+LBS烘焙 ({0} 骨架, 外部目录)", actPool.Count);
             return;
         }
         throw new Exception("未找到资源 (APK内StreamingAssets与外部目录均无 role_*.act)");
@@ -366,7 +386,8 @@ public class PreviewV4 : MonoBehaviour
     class FramePose { public float[] R = new float[9]; public float tx, ty, tz; }
 
     // mass_produce.load_skeleton: 每骨骼取指定帧本地 (R, t), 无父级复合
-    static List<FramePose> LoadSkeleton(ActSkel sk)
+    static List<FramePose> LoadSkeleton(ActSkel sk) { return LoadSkeleton(sk, FrameStand); }
+    static List<FramePose> LoadSkeleton(ActSkel sk, int frame)
     {
         var W = new List<FramePose>(sk.bones.Count);
         foreach (var b in sk.bones)
@@ -374,7 +395,7 @@ public class PreviewV4 : MonoBehaviour
             var fp = new FramePose();
             if (b.nf > 0)
             {
-                int f = FrameStand >= b.nf ? b.nf - 1 : FrameStand;   // clamp 保护
+                int f = frame >= b.nf ? b.nf - 1 : frame; if (f < 0) f = 0;   // clamp 保护
                 QuatToMat(new[] { b.quats[f * 4], b.quats[f * 4 + 1], b.quats[f * 4 + 2], b.quats[f * 4 + 3] }, fp.R);
                 fp.tx = b.trans[f * 3]; fp.ty = b.trans[f * 3 + 1]; fp.tz = b.trans[f * 3 + 2];
             }
@@ -924,6 +945,8 @@ public class PreviewV4 : MonoBehaviour
     static void StartShow(string name)
     {
         line2 = name + "  <" + Cats[catI] + ">  [" + CurJob + "_" + CurSex + "]";
+        _animSk = null; _animMesh = null; _animSd = null;
+        if (hostPv != null && _animCo != null) { hostPv.StopCoroutine(_animCo); _animCo = null; }
         if (hostPv == null) return;
         if (_loadCo != null) hostPv.StopCoroutine(_loadCo);
         _loadCo = hostPv.StartCoroutine(LoadShowCo(name));
@@ -979,7 +1002,8 @@ public class PreviewV4 : MonoBehaviour
             curModel = new GameObject(name);
             curModel.transform.SetParent(pivot.transform, false);
             curModel.transform.localScale = new Vector3(s, s, s);
-            curModel.transform.localPosition = new Vector3(0f, 1.55f, 0f);
+            var bc = mesh.bounds.center;   // 中心补偿: 部件中心对准显示点(z-up->y-up)
+            curModel.transform.localPosition = new Vector3(0f, 1.55f, 0f) - s * new Vector3(bc.x, bc.z, -bc.y);
             curModel.transform.localRotation = Quaternion.Euler(ModelRot);
             curModel.AddComponent<MeshFilter>().sharedMesh = mesh;
             var mr = curModel.AddComponent<MeshRenderer>();
@@ -999,6 +1023,16 @@ public class PreviewV4 : MonoBehaviour
                 vc, sd.tris.Count / 3, d.Length,
                 sk != null ? sk.srcName : "无");
 
+            // 骨骼动画播放 (act自带逐帧trans/quat)
+            int anf = sk != null && sk.bones.Count > 0 ? sk.bones[0].nf : 0;
+            if (sk != null && anf > 1)
+            {
+                _animSk = sk; _animSd = sd; _animMesh = mesh;
+                _animCo = hostPv.StartCoroutine(PlayAnimCo());
+                line3 += string.Format(" \u25b6动画{0}帧", anf);
+            }
+            _skipGuard = 0;
+
             // 贴图异步加载 (加载完成自动贴上)
             if (!string.IsNullOrEmpty(sd.anchor) && hostPv != null)
                 hostPv.StartCoroutine(LoadTexCo(sd.anchor, mat));
@@ -1007,6 +1041,13 @@ public class PreviewV4 : MonoBehaviour
         {
             line3 = "[v4] " + name + " 解析失败: " + e.Message;
             if (curModel != null) { UnityEngine.Object.Destroy(curModel); curModel = null; }
+            // 不完整部件自动跳过 (整圈全失败才停)
+            if (hostPv != null && curSkiList.Count > 1 && _skipGuard < curSkiList.Count)
+            {
+                _skipGuard++;
+                curIdx = (curIdx + 1) % curSkiList.Count;
+                StartShow(curSkiList[curIdx]);
+            }
         }
     }
 
@@ -1088,15 +1129,14 @@ public class PreviewV4 : MonoBehaviour
         GUI.Label(new Rect(12, 42, 700, 40), line2, label);
         GUI.Label(new Rect(716, 8, 356, 74), line3, small);
 
-        // 分类: 两列网格 (左侧, 4行)
-        float cw = 250f, ch = 48f;
-        GUI.Box(new Rect(0, 88, 2 * cw + 24, 4 * (ch + 4) + 10), GUIContent.none, box);
+        // 分类: 一竖排 (左侧)
+        float cw = 300f, ch = 40f;
+        GUI.Box(new Rect(0, 88, cw + 16, Cats.Length * (ch + 3) + 10), GUIContent.none, box);
         for (int i = 0; i < Cats.Length; i++)
         {
-            int r = i / 2, cc = i % 2;
             var old = GUI.backgroundColor;
             if (i == catI) GUI.backgroundColor = new Color(0.30f, 0.65f, 0.95f);
-            if (GUI.Button(new Rect(8 + cc * (cw + 8), 92 + r * (ch + 4), cw, ch), (i == catI ? "\u25b6 " : "") + Cats[i], i == catI ? btn : small))
+            if (GUI.Button(new Rect(8, 92 + i * (ch + 3), cw, ch), (i == catI ? "\u25b6 " : "") + Cats[i], i == catI ? btn : small))
             { catI = i; FilterCat(); ShowCurrent(); }
             GUI.backgroundColor = old;
         }
