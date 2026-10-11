@@ -23,7 +23,18 @@ public class PreviewV4 : MonoBehaviour
     // ===== 真机校准常量 (验收不对时只改这里重推) =====
     static readonly Vector3 ModelRot = new Vector3(-90f, 0f, 0f); // 源数据 z-up → Unity y-up
     const int FrameStand = 3736;   // 自然站立帧 (与量产 --frame 默认一致)
-    const float FitSize = 3.4f;    // 模型归一化最大边
+    const float FitSize = 3.4f;    // 大件归一化最大边(甲袍/外装)
+    static float _zoom = 1f;       // 手动缩放(底部＋－)
+    static string _texSample = null;
+    // 按部件类型的合理预览尺寸: 小件不再被撑成大件
+    static float FitFor(string name)
+    {
+        string n = (name ?? "").ToLower();
+        if (n.Contains("sho") || n.Contains("glo")) return 1.0f;  // 长靴/手套
+        if (n.Contains("hea")) return 0.9f;                       // 头部
+        if (n.Contains("swd") || n.Contains("axe") || n.Contains("spe") || n.Contains("bow")) return 1.7f; // 武器
+        return 1.8f;                                              // 甲袍/外装等大件
+    }
 
     // ===== 运行状态 =====
     static string actorDir, texDir;
@@ -184,7 +195,7 @@ public class PreviewV4 : MonoBehaviour
             pool.Sort();
             actPool = pool; useAsset = true;
             actorDir = "asset:creature/actor"; texDir = "asset:creature/texture";
-            title = string.Format("v4.3 整装拼合 · APK数据注入 ({0} 骨架, StreamingAssets)", pool.Count);
+            title = string.Format("v4.4 整装拼合 · APK数据注入 ({0} 骨架, StreamingAssets)", pool.Count);
             return;
         }
         // 2) 外部目录兜底
@@ -203,7 +214,7 @@ public class PreviewV4 : MonoBehaviour
             actPool = new List<string>(acts); actPool.Sort();
             string t = Path.GetDirectoryName(c) + "/texture";
             texDir = Directory.Exists(t) ? t : c;
-            title = string.Format("v4.3 整装拼合 · act骨架池+LBS烘焙 ({0} 骨架, 外部目录)", actPool.Count);
+            title = string.Format("v4.4 整装拼合 · act骨架池+LBS烘焙 ({0} 骨架, 外部目录)", actPool.Count);
             return;
         }
         throw new Exception("未找到资源 (APK内StreamingAssets与外部目录均无 role_*.act)");
@@ -962,7 +973,7 @@ public class PreviewV4 : MonoBehaviour
             // 包围盒归一化
             var b = mesh.bounds;
             float ext = Mathf.Max(b.extents.x, Mathf.Max(b.extents.y, b.extents.z));
-            float s = ext > 1e-5f ? FitSize / ext : 1f;
+            float s = ext > 1e-5f ? FitFor(name) * _zoom / ext : _zoom;
 
             if (curModel != null) UnityEngine.Object.Destroy(curModel);
             curModel = new GameObject(name);
@@ -1009,7 +1020,18 @@ public class PreviewV4 : MonoBehaviour
             yield break;
         }
         string p = ResolveTex(anchor);
-        if (p == null) { line3 += " ✗未找到"; yield break; }
+        if (p == null)
+        {
+            if (_texSample == null)
+            {
+                var ls = ListAssets("creature/texture");
+                var tsb = new System.Text.StringBuilder();
+                for (int i = 0; i < ls.Length && i < 6; i++) { if (i > 0) tsb.Append(','); tsb.Append(ls[i]); }
+                _texSample = ls.Length == 0 ? "(目录空)" : tsb.ToString();
+            }
+            line3 += " ✗未找到 样本[" + _texSample + "]";
+            yield break;
+        }
         byte[] raw = null;
         if (useAsset)
         {
@@ -1098,6 +1120,8 @@ public class PreviewV4 : MonoBehaviour
         GUI.Label(new Rect(210, yb, 700, 54), curSkiList.Count == 0
             ? "(本职业无此部件) 点右上「职业」换人 / 点左侧其他分类"
             : string.Format("{0}/{1}  {2}", curIdx + 1, curSkiList.Count, curSki), label);
+        if (GUI.Button(new Rect(922, yb, 64, 54), "\uff0b", btn)) { _zoom = Mathf.Clamp(_zoom * 1.2f, 0.2f, 8f); ShowCurrent(); }
+        if (GUI.Button(new Rect(992, yb, 64, 54), "\uff0d", btn)) { _zoom = Mathf.Clamp(_zoom / 1.2f, 0.2f, 8f); ShowCurrent(); }
 
         // 拖动旋转
         var e = Event.current;
