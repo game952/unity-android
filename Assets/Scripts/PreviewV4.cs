@@ -11,6 +11,7 @@
 // ============================================================
 using System;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 using System.IO;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -92,33 +93,51 @@ public class PreviewV4 : MonoBehaviour
     {
         try { return AM().Call<string[]>("list", dir); } catch (Exception) { return new string[0]; }
     }
+    [DllImport("libandroid.so", CharSet = CharSet.Ansi)]
+    static extern IntPtr AAssetManager_open(IntPtr mgr, string name, int mode);
+    [DllImport("libandroid.so")]
+    static extern int AAsset_read(IntPtr asset, IntPtr buf, IntPtr count);
+    [DllImport("libandroid.so")]
+    static extern long AAsset_getLength(IntPtr asset);
+    [DllImport("libandroid.so")]
+    static extern void AAsset_close(IntPtr asset);
+    static IntPtr _amp = IntPtr.Zero;
+    static IntPtr AMPtr()
+    {
+        var o = AM();
+        if (_amp == IntPtr.Zero && o != null) _amp = o.GetRawObject();
+        return _amp;
+    }
+    // native AAsset 读取: 绕开 JNI 原生数组 marshaling(全0数据坑)
     static byte[] ReadAsset(string rel)
     {
-        AndroidJavaObject is2 = null;
         try
         {
-            is2 = AM().Call<AndroidJavaObject>("open", rel, 2);
-            using (var bos = new MemoryStream())
+            IntPtr a = AAssetManager_open(AMPtr(), rel, 2);
+            if (a == IntPtr.Zero) return null;
+            long len = AAsset_getLength(a);
+            byte[] outp = new byte[len];
+            if (len > 0)
             {
-                var buf = new sbyte[65536]; int n;
-                while ((n = is2.Call<int>("read", buf)) > 0)
+                IntPtr buf = Marshal.AllocHGlobal((int)len);
+                try
                 {
-                    var tmp = new byte[n];
-                    System.Buffer.BlockCopy(buf, 0, tmp, 0, n);
-                    bos.Write(tmp, 0, n);
+                    int got = AAsset_read(a, buf, (IntPtr)len);
+                    if (got > 0) Marshal.Copy(buf, outp, 0, Math.Min(got, (int)len));
                 }
-                return bos.ToArray();
+                finally { Marshal.FreeHGlobal(buf); }
             }
+            AAsset_close(a);
+            return outp;
         }
         catch (Exception) { return null; }
-        finally { if (is2 != null) { try { is2.Call("close"); } catch (Exception) { } is2.Dispose(); } }
     }
     static bool HasAsset(string rel)
     {
-        AndroidJavaObject is2 = null;
-        try { is2 = AM().Call<AndroidJavaObject>("open", rel, 2); return true; }
-        catch (Exception) { return false; }
-        finally { if (is2 != null) { try { is2.Call("close"); } catch (Exception) { } is2.Dispose(); } }
+        IntPtr a = AAssetManager_open(AMPtr(), rel, 2);
+        if (a == IntPtr.Zero) return false;
+        AAsset_close(a);
+        return true;
     }
     static byte[] ReadActorFile(string fn)
     {
