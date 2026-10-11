@@ -897,7 +897,7 @@ public static class PreviewV4
 
     static void ApplyRot()
     {
-        if (pivot != null) pivot.rotation = Quaternion.Euler(0f, rotY, 0f);
+        if (pivot != null) pivot.transform.rotation = Quaternion.Euler(0f, rotY, 0f);
     }
 }
 
