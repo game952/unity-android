@@ -16,7 +16,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using UnityEngine;
 
-public static class PreviewV4
+public class PreviewV4 : MonoBehaviour
 {
     // ===== 真机校准常量 (验收不对时只改这里重推) =====
     static readonly Vector3 ModelRot = new Vector3(-90f, 0f, 0f); // 源数据 z-up → Unity y-up
@@ -50,6 +50,9 @@ public static class PreviewV4
     {
         try { SetupCam(); Scan(); RebuildCat(); ShowCurrent(); }
         catch (Exception e) { line3 = "[v4] 启动失败: " + e.Message; }
+        var host = new GameObject("~PreviewV4");
+        UnityEngine.Object.DontDestroyOnLoad(host);
+        host.AddComponent<PreviewV4>();
     }
 
     static void SetupCam()
@@ -849,7 +852,8 @@ public static class PreviewV4
         btn = new GUIStyle(GUI.skin.button); btn.fontSize = 28; btn.alignment = TextAnchor.MiddleLeft;
     }
 
-    static void OnGUI()
+    void OnGUI() { DrawUI(); }
+    static void DrawUI()
     {
         InitStyle();
         float sc = Screen.width / 1080f;
