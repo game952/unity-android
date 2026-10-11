@@ -977,40 +977,42 @@ public class PreviewV4 : MonoBehaviour
 
     static System.Collections.IEnumerator LoadTexCo(string anchor, Material mat)
     {
-        string a2 = anchor.ToLowerInvariant();
-        if (a2.EndsWith(".dds") || a2.EndsWith(".png")) a2 = Path.GetFileNameWithoutExtension(a2);
-        foreach (var c in TexCands(a2))
+        string key = anchor ?? "";
+        if (texCache.TryGetValue(key, out var tc) && tc != null)
         {
-            foreach (var e in new[] { ".dds", ".png" })
+            if (mat != null) { mat.mainTexture = tc; mat.color = Color.white; }
+            line3 += " ✓(缓存)";
+            yield break;
+        }
+        string p = ResolveTex(anchor);
+        if (p == null) { line3 += " ✗未找到"; yield break; }
+        byte[] raw = null;
+        if (useAsset)
+        {
+            using (var wr = UnityWebRequest.Get(Application.streamingAssetsPath + "/creature/texture/" + p))
             {
-                string fn = c + e;
-                byte[] raw = null;
-                if (useAsset)
-                {
-                    using (var wr = UnityWebRequest.Get(Application.streamingAssetsPath + "/creature/texture/" + fn))
-                    {
-                        yield return wr.SendWebRequest();
-                        if (wr.result == UnityWebRequest.Result.Success) raw = wr.downloadHandler.data;
-                    }
-                }
-                else
-                {
-                    string fp = Path.Combine(texDir, fn);
-                    if (File.Exists(fp)) { try { raw = File.ReadAllBytes(fp); } catch (Exception) { raw = null; } }
-                }
-                if (raw == null) continue;
-                Texture2D t = null;
-                if (fn.EndsWith(".dds")) t = DdsV4.LoadFromMemory(raw, c);
-                else { t = new Texture2D(2, 2, TextureFormat.RGBA32, false); if (!t.LoadImage(raw)) t = null; }
-                if (t != null)
-                {
-                    if (mat != null) { mat.mainTexture = t; mat.color = Color.white; }
-                    line3 += " ✓" + fn;
-                    yield break;
-                }
+                yield return wr.SendWebRequest();
+                if (wr.result == UnityWebRequest.Result.Success) raw = wr.downloadHandler.data;
             }
         }
-        line3 += " ✗未找到";
+        else
+        {
+            string fp = Path.Combine(texDir, p);
+            if (File.Exists(fp)) { try { raw = File.ReadAllBytes(fp); } catch (Exception) { raw = null; } }
+        }
+        Texture2D t = null;
+        if (raw != null)
+        {
+            if (p.EndsWith(".dds")) t = DdsV4.LoadFromMemory(raw, Path.GetFileNameWithoutExtension(p));
+            else { t = new Texture2D(2, 2, TextureFormat.RGBA32, false); if (!t.LoadImage(raw)) t = null; }
+        }
+        if (t != null)
+        {
+            texCache[key] = t;
+            if (mat != null) { mat.mainTexture = t; mat.color = Color.white; }
+            line3 += " ✓" + p;
+        }
+        else line3 += " ✗解码失败";
     }
 
     // ================================================================
