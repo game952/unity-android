@@ -103,7 +103,7 @@ public class PreviewV4 : MonoBehaviour
         lg.AddComponent<Light>().type = LightType.Directional;
         RenderSettings.ambientLight = new Color(0.55f, 0.55f, 0.58f);
         pivot = new GameObject("PreviewV4Pivot");
-        pivot.transform.position = new Vector3(0.9f, 0f, 0f);
+        pivot.transform.position = new Vector3(0.2f, 0f, 0f);
     }
 
     // ===== 资源路径探测: APK内StreamingAssets(AssetManager同步直读)优先, 外部目录兜底 =====
@@ -215,7 +215,7 @@ public class PreviewV4 : MonoBehaviour
             pool.Sort();
             actPool = pool; useAsset = true;
             actorDir = "asset:creature/actor"; texDir = "asset:creature/texture";
-            title = string.Format("v4.5 整装拼合 · APK数据注入 ({0} 骨架, StreamingAssets)", pool.Count);
+            title = string.Format("v4.5.2 整装拼合 · APK数据注入 ({0} 骨架, StreamingAssets)", pool.Count);
             return;
         }
         // 2) 外部目录兜底
@@ -234,7 +234,7 @@ public class PreviewV4 : MonoBehaviour
             actPool = new List<string>(acts); actPool.Sort();
             string t = Path.GetDirectoryName(c) + "/texture";
             texDir = Directory.Exists(t) ? t : c;
-            title = string.Format("v4.5 整装拼合 · act骨架池+LBS烘焙 ({0} 骨架, 外部目录)", actPool.Count);
+            title = string.Format("v4.5.2 整装拼合 · act骨架池+LBS烘焙 ({0} 骨架, 外部目录)", actPool.Count);
             return;
         }
         throw new Exception("未找到资源 (APK内StreamingAssets与外部目录均无 role_*.act)");
@@ -874,7 +874,11 @@ public class PreviewV4 : MonoBehaviour
         string n = anchor.ToLower();
         var cands = new List<string>();
         cands.Add(n);
-        if (n.Length > 1) cands.Add(n.Substring(0, n.Length - 1));
+        string na = Regex.Replace(n, @"a+$", "");              // aa/aaa/aaaa 配色变体
+        if (na.Length > 0 && na != n) cands.Add(na);
+        cands.Add(Regex.Replace(na, @"0[12]$", ""));           // 01/02 编号变体 (bpf0801->bpf08)
+        cands.Add(Regex.Replace(n, @"0[12]$", ""));
+        if (n.Length > 1) cands.Add(n.Substring(0, n.Length - 1));   // 保底单字符
         var mm = Regex.Match(n, @"^(.+?)[_\-]?[aA][lLtTgG]?$");
         if (mm.Success && mm.Groups[1].Value.Length > 0) cands.Add(mm.Groups[1].Value);
         cands.Add(n.Replace("_", ""));
@@ -883,6 +887,17 @@ public class PreviewV4 : MonoBehaviour
             foreach (var e in new[] { ".dds", ".png" })
             {
                 if (TexExists(c + e)) return c + e;
+            }
+            var m2 = Regex.Match(c, @"^(.*?)(\d+)$");          // 数字段递减回退
+            if (m2.Success && int.TryParse(m2.Groups[2].Value, out int k) && k > 0)
+            {
+                string pre = m2.Groups[1].Value, fmt = "D" + m2.Groups[2].Value.Length;
+                for (int d = k - 1; d >= 0 && d >= k - 3; d--)
+                {
+                    string c2 = pre + d.ToString(fmt);
+                    foreach (var e2 in new[] { ".dds", ".png" })
+                        if (TexExists(c2 + e2)) return c2 + e2;
+                }
             }
         }
         return null;
@@ -1024,7 +1039,8 @@ public class PreviewV4 : MonoBehaviour
                 sk != null ? sk.srcName : "无");
 
             // 骨骼动画播放 (act自带逐帧trans/quat)
-            int anf = sk != null && sk.bones.Count > 0 ? sk.bones[0].nf : 0;
+            int anf = 0;
+            if (sk != null) foreach (var bb in sk.bones) { if (bb.nf > anf) anf = bb.nf; }
             if (sk != null && anf > 1)
             {
                 _animSk = sk; _animSd = sd; _animMesh = mesh;
