@@ -93,51 +93,50 @@ public class PreviewV4 : MonoBehaviour
     {
         try { return AM().Call<string[]>("list", dir); } catch (Exception) { return new string[0]; }
     }
-    [DllImport("libandroid.so", CharSet = CharSet.Ansi)]
-    static extern IntPtr AAssetManager_open(IntPtr mgr, string name, int mode);
-    [DllImport("libandroid.so")]
-    static extern int AAsset_read(IntPtr asset, IntPtr buf, IntPtr count);
-    [DllImport("libandroid.so")]
-    static extern long AAsset_getLength(IntPtr asset);
-    [DllImport("libandroid.so")]
-    static extern void AAsset_close(IntPtr asset);
-    static IntPtr _amp = IntPtr.Zero;
-    static IntPtr AMPtr()
-    {
-        var o = AM();
-        if (_amp == IntPtr.Zero && o != null) _amp = o.GetRawObject();
-        return _amp;
-    }
-    // native AAsset 读取: 绕开 JNI 原生数组 marshaling(全0数据坑)
+    // 显式 JNI 数组拷出: 复用已验证的 open 链, read 数据经拷贝取回
     static byte[] ReadAsset(string rel)
     {
+        AndroidJavaObject is2 = null;
         try
         {
-            IntPtr a = AAssetManager_open(AMPtr(), rel, 2);
-            if (a == IntPtr.Zero) return null;
-            long len = AAsset_getLength(a);
-            byte[] outp = new byte[len];
-            if (len > 0)
+            is2 = AM().Call<AndroidJavaObject>("open", rel, 2);
+            IntPtr im = is2.GetRawObject();
+            IntPtr ic = AndroidJNI.GetObjectClass(im);
+            IntPtr mRead = AndroidJNI.GetMethodID(ic, "read", "([B)I");
+            IntPtr mAv = AndroidJNI.GetMethodID(ic, "available", "()I");
+            int total = AndroidJNI.CallIntMethod(im, mAv, new jvalue[0]);
+            if (total <= 0) total = 262144;
+            byte[] buf = new byte[total];
+            int off = 0;
+            IntPtr jb = AndroidJNI.NewByteArray(65536);
+            var ja = new jvalue[1];
+            while (off < buf.Length)
             {
-                IntPtr buf = Marshal.AllocHGlobal((int)len);
-                try
-                {
-                    int got = AAsset_read(a, buf, (IntPtr)len);
-                    if (got > 0) Marshal.Copy(buf, outp, 0, Math.Min(got, (int)len));
-                }
-                finally { Marshal.FreeHGlobal(buf); }
+                ja[0].l = jb;
+                int n = AndroidJNI.CallIntMethod(im, mRead, ja);
+                if (n <= 0) break;
+                if (off + n > buf.Length) { var g = new byte[off + n]; Buffer.BlockCopy(buf, 0, g, 0, off); buf = g; }
+                byte[] chunk = AndroidJNI.FromByteArray(jb);
+                Buffer.BlockCopy(chunk, 0, buf, off, n);
+                off += n;
             }
-            AAsset_close(a);
-            return outp;
+            AndroidJNI.DeleteLocalRef(jb);
+            AndroidJNI.DeleteLocalRef(ic);
+            if (off == 0) return new byte[0];
+            if (off == buf.Length) return buf;
+            var r = new byte[off];
+            Buffer.BlockCopy(buf, 0, r, 0, off);
+            return r;
         }
         catch (Exception) { return null; }
+        finally { if (is2 != null) { try { is2.Call("close"); } catch (Exception) { } is2.Dispose(); } }
     }
     static bool HasAsset(string rel)
     {
-        IntPtr a = AAssetManager_open(AMPtr(), rel, 2);
-        if (a == IntPtr.Zero) return false;
-        AAsset_close(a);
-        return true;
+        AndroidJavaObject is2 = null;
+        try { is2 = AM().Call<AndroidJavaObject>("open", rel, 2); return true; }
+        catch (Exception) { return false; }
+        finally { if (is2 != null) { try { is2.Call("close"); } catch (Exception) { } is2.Dispose(); } }
     }
     static byte[] ReadActorFile(string fn)
     {
@@ -281,8 +280,14 @@ public class PreviewV4 : MonoBehaviour
 
     static ActSkel ParseAct(byte[] d, string srcName)
     {
+        if (d == null) throw new Exception("act读取null " + srcName);
         if (d.Length < 16 || d[0] != 0xff || d[1] != 0xff)
-            throw new Exception("act 头非 CRT stream");
+        {
+            var sb = new System.Text.StringBuilder("act诊断 len=").Append(d.Length).Append(" head=");
+            int hn = Math.Min(16, d.Length);
+            for (int i = 0; i < hn; i++) sb.Append(d[i].ToString("x2")).Append(' ');
+            throw new Exception(sb.ToString());
+        }
         int tl = U16(d, 2);
         int o = FindPattern(d, tl + 4, new byte[] { 0x00, 0x00, 0x80, 0x3f }); // 1.0f 结束骨架名
         if (o < 0) throw new Exception("act 无 1.0f 头");
