@@ -15,6 +15,7 @@ using System.IO;
 using System.Text;
 using System.Text.RegularExpressions;
 using UnityEngine;
+using UnityEngine.Networking;
 
 public class PreviewV4 : MonoBehaviour
 {
@@ -53,6 +54,7 @@ public class PreviewV4 : MonoBehaviour
         var host = new GameObject("~PreviewV4");
         UnityEngine.Object.DontDestroyOnLoad(host);
         var pv = host.AddComponent<PreviewV4>();
+        hostPv = pv;
         pv.StartCoroutine(pv.KillLoop());
     }
 
@@ -69,9 +71,12 @@ public class PreviewV4 : MonoBehaviour
         lg.AddComponent<Light>().type = LightType.Directional;
         RenderSettings.ambientLight = new Color(0.55f, 0.55f, 0.58f);
         pivot = new GameObject("PreviewV4Pivot");
+        pivot.transform.position = new Vector3(1.5f, 0f, 0f);
     }
 
     // ===== 资源路径探测: APK内StreamingAssets(AssetManager同步直读)优先, 外部目录兜底 =====
+    static PreviewV4 hostPv;
+    static Coroutine _loadCo;
     static bool useAsset = false;
     static AndroidJavaObject _am;
     static AndroidJavaObject AM()
@@ -161,7 +166,7 @@ public class PreviewV4 : MonoBehaviour
             pool.Sort();
             actPool = pool; useAsset = true;
             actorDir = "asset:creature/actor"; texDir = "asset:creature/texture";
-            title = string.Format("v4.1 整装拼合 · APK数据注入 ({0} 骨架, StreamingAssets)", pool.Count);
+            title = string.Format("v4.3 整装拼合 · APK数据注入 ({0} 骨架, StreamingAssets)", pool.Count);
             return;
         }
         // 2) 外部目录兜底
@@ -180,7 +185,7 @@ public class PreviewV4 : MonoBehaviour
             actPool = new List<string>(acts); actPool.Sort();
             string t = Path.GetDirectoryName(c) + "/texture";
             texDir = Directory.Exists(t) ? t : c;
-            title = string.Format("v4.1 整装拼合 · act骨架池+LBS烘焙 ({0} 骨架, 外部目录)", actPool.Count);
+            title = string.Format("v4.3 整装拼合 · act骨架池+LBS烘焙 ({0} 骨架, 外部目录)", actPool.Count);
             return;
         }
         throw new Exception("未找到资源 (APK内StreamingAssets与外部目录均无 role_*.act)");
@@ -878,16 +883,42 @@ public class PreviewV4 : MonoBehaviour
         if (curSkiList.Count == 0) { line2 = "(本分类当前职业无模型)"; return; }
         if (curIdx >= curSkiList.Count) curIdx = 0;
         curSki = curSkiList[curIdx];
-        ShowSki(curSki);
+        StartShow(curSki);
     }
 
-    static void ShowSki(string name)
+    static void StartShow(string name)
     {
         line2 = name + "  <" + Cats[catI] + ">  [" + CurJob + "_" + CurSex + "]";
+        if (hostPv == null) return;
+        if (_loadCo != null) hostPv.StopCoroutine(_loadCo);
+        _loadCo = hostPv.StartCoroutine(LoadShowCo(name));
+    }
+
+    static System.Collections.IEnumerator LoadShowCo(string name)
+    {
+        byte[] d; string err = "";
+        if (useAsset)
+        {
+            using (var wr = UnityWebRequest.Get(Application.streamingAssetsPath + "/creature/actor/" + name + ".ski"))
+            {
+                yield return wr.SendWebRequest();
+                if (wr.result != UnityWebRequest.Result.Success) { d = null; err = wr.error; }
+                else d = wr.downloadHandler.data;
+            }
+        }
+        else
+        {
+            try { d = File.ReadAllBytes(Path.Combine(actorDir, name + ".ski")); }
+            catch (Exception e2) { d = null; err = e2.Message; }
+        }
+        ShowSkiData(name, d, err);
+    }
+
+    static void ShowSkiData(string name, byte[] d, string err)
+    {
         try
         {
-            byte[] d = ReadActorFile(name + ".ski");
-            if (d == null) throw new Exception("ski 读取失败(APK内缺失)");
+            if (d == null) throw new Exception("ski 读取失败: " + err);
             SkiData sd = ParseSki(d);
             string tag;
             ActSkel sk = MatchSkel(name, out tag);
@@ -918,24 +949,68 @@ public class PreviewV4 : MonoBehaviour
             curModel.AddComponent<MeshFilter>().sharedMesh = mesh;
             var mr = curModel.AddComponent<MeshRenderer>();
 
-            Texture2D tex = LoadTex(sd.anchor);
-            var mat = new Material(Shader.Find("Standard"));
-            if (tex != null) mat.mainTexture = tex;
-            else mat.color = new Color(0.72f, 0.72f, 0.76f);
+            // Shader 保底链 (Standard 可能被构建裁剪)
+            Shader sh = Shader.Find("Standard");
+            if (sh == null) sh = Shader.Find("Legacy Shaders/Diffuse");
+            if (sh == null) sh = Shader.Find("Mobile/Diffuse");
+            if (sh == null) sh = Shader.Find("Unlit/Texture");
+            if (sh == null) throw new Exception("无可用Shader(构建裁剪)");
+            var mat = new Material(sh);
+            mat.color = new Color(0.72f, 0.72f, 0.76f);
             mr.sharedMaterial = mat;
 
-            line3 = string.Format("[v4] {0} {1} 顶点{2} 面{3} ski:{4}B | 骨架={5} | 贴图={6}{7}",
+            line3 = string.Format("[v4] {0} {1} 顶点{2} 面{3} ski:{4}B | 骨架={5} | 贴图=...",
                 sd.fmt, tag == "STATIC" ? "静态" : tag + ":" + (sk != null ? sk.srcName : ""),
                 vc, sd.tris.Count / 3, d.Length,
-                sk != null ? sk.srcName : "无",
-                string.IsNullOrEmpty(sd.anchor) ? "(无锚)" : sd.anchor,
-                tex != null ? "✓" : "✗(白模)");
+                sk != null ? sk.srcName : "无");
+
+            // 贴图异步加载 (加载完成自动贴上)
+            if (!string.IsNullOrEmpty(sd.anchor) && hostPv != null)
+                hostPv.StartCoroutine(LoadTexCo(sd.anchor, mat));
         }
         catch (Exception e)
         {
             line3 = "[v4] " + name + " 解析失败: " + e.Message;
             if (curModel != null) { UnityEngine.Object.Destroy(curModel); curModel = null; }
         }
+    }
+
+    static System.Collections.IEnumerator LoadTexCo(string anchor, Material mat)
+    {
+        string a2 = anchor.ToLowerInvariant();
+        if (a2.EndsWith(".dds") || a2.EndsWith(".png")) a2 = Path.GetFileNameWithoutExtension(a2);
+        foreach (var c in TexCands(a2))
+        {
+            foreach (var e in new[] { ".dds", ".png" })
+            {
+                string fn = c + e;
+                byte[] raw = null;
+                if (useAsset)
+                {
+                    using (var wr = UnityWebRequest.Get(Application.streamingAssetsPath + "/creature/texture/" + fn))
+                    {
+                        yield return wr.SendWebRequest();
+                        if (wr.result == UnityWebRequest.Result.Success) raw = wr.downloadHandler.data;
+                    }
+                }
+                else
+                {
+                    string fp = Path.Combine(texDir, fn);
+                    if (File.Exists(fp)) { try { raw = File.ReadAllBytes(fp); } catch (Exception) { raw = null; } }
+                }
+                if (raw == null) continue;
+                Texture2D t = null;
+                if (fn.EndsWith(".dds")) t = DdsV4.LoadFromMemory(raw, c);
+                else { t = new Texture2D(2, 2, TextureFormat.RGBA32, false); if (!t.LoadImage(raw)) t = null; }
+                if (t != null)
+                {
+                    if (mat != null) { mat.mainTexture = t; mat.color = Color.white; }
+                    line3 += " ✓" + fn;
+                    yield break;
+                }
+            }
+        }
+        line3 += " ✗未找到";
     }
 
     // ================================================================
@@ -945,10 +1020,10 @@ public class PreviewV4 : MonoBehaviour
     static void InitStyle()
     {
         if (box != null) return;
-        box = new GUIStyle(GUI.skin.box); box.fontSize = 34; box.alignment = TextAnchor.MiddleLeft;
-        label = new GUIStyle(GUI.skin.label); label.fontSize = 30;
-        small = new GUIStyle(GUI.skin.label); small.fontSize = 24;
-        btn = new GUIStyle(GUI.skin.button); btn.fontSize = 28; btn.alignment = TextAnchor.MiddleLeft;
+        box = new GUIStyle(GUI.skin.box); box.fontSize = 22; box.alignment = TextAnchor.MiddleLeft;
+        label = new GUIStyle(GUI.skin.label); label.fontSize = 22;
+        small = new GUIStyle(GUI.skin.label); small.fontSize = 16; small.wordWrap = true;
+        btn = new GUIStyle(GUI.skin.button); btn.fontSize = 20; btn.alignment = TextAnchor.MiddleLeft;
     }
 
     void OnGUI() { DrawUI(); }
@@ -957,27 +1032,29 @@ public class PreviewV4 : MonoBehaviour
         InitStyle();
         float sc = Screen.width / 1080f;
         GUI.matrix = Matrix4x4.TRS(Vector3.zero, Quaternion.identity, new Vector3(sc, sc, 1f));
-        float H = Screen.height / sc;
+        float H = Screen.height / sc;   // 横屏约 508
 
-        // 顶部信息栏 (不透明, 标题+状态+异常)
-        GUI.Box(new Rect(0, 0, 1080, 118), GUIContent.none, box);
-        GUI.Label(new Rect(14, 8, 1052, 44), title, label);
-        GUI.Label(new Rect(14, 54, 1052, 40), line2, label);
-        GUI.Label(new Rect(14, 94, 1052, 22), line3, small);
+        // 顶栏 (紧凑, 状态右置)
+        GUI.Box(new Rect(0, 0, 1080, 86), GUIContent.none, box);
+        GUI.Label(new Rect(12, 4, 700, 40), title, label);
+        GUI.Label(new Rect(12, 42, 700, 40), line2, label);
+        GUI.Label(new Rect(716, 8, 356, 74), line3, small);
 
-        // 左侧分类列 (带底框, 当前项高亮)
-        GUI.Box(new Rect(0, 124, 296, Cats.Length * 60 + 14), GUIContent.none, box);
+        // 分类: 两列网格 (左侧, 4行)
+        float cw = 250f, ch = 48f;
+        GUI.Box(new Rect(0, 88, 2 * cw + 24, 4 * (ch + 4) + 10), GUIContent.none, box);
         for (int i = 0; i < Cats.Length; i++)
         {
+            int r = i / 2, cc = i % 2;
             var old = GUI.backgroundColor;
             if (i == catI) GUI.backgroundColor = new Color(0.30f, 0.65f, 0.95f);
-            if (GUI.Button(new Rect(6, 131 + i * 60, 284, 52), (i == catI ? "\u25b6 " : "") + Cats[i], i == catI ? btn : small))
+            if (GUI.Button(new Rect(8 + cc * (cw + 8), 92 + r * (ch + 4), cw, ch), (i == catI ? "\u25b6 " : "") + Cats[i], i == catI ? btn : small))
             { catI = i; FilterCat(); ShowCurrent(); }
             GUI.backgroundColor = old;
         }
 
-        // 右上: 职业切换
-        if (GUI.Button(new Rect(1080 - 296, 131, 290, 60), "职业 " + CurJob + "_" + CurSex + " \u25b6", btn))
+        // 职业按钮 (右上)
+        if (GUI.Button(new Rect(1080 - 300, 94, 292, 52), "职业 " + CurJob + "_" + CurSex + " \u25b6", btn))
         {
             sexI++;
             if (sexI >= Sexes.Length) { sexI = 0; jobI = (jobI + 1) % Jobs.Length; }
@@ -985,15 +1062,15 @@ public class PreviewV4 : MonoBehaviour
             RebuildCat(); ShowCurrent();
         }
 
-        // 底部翻页条 (不透明, 空列表时给引导)
-        float yb = H - 132;
-        GUI.Box(new Rect(0, H - 138, 1080, 138), GUIContent.none, box);
-        if (GUI.Button(new Rect(14, yb, 150, 116), "\u25c0", btn))
+        // 底部翻页条
+        float yb = H - 62;
+        GUI.Box(new Rect(0, yb - 6, 1080, 68), GUIContent.none, box);
+        if (GUI.Button(new Rect(10, yb, 90, 54), "\u25c0", btn))
         { curIdx = (curIdx - 1 + curSkiList.Count) % Math.Max(1, curSkiList.Count); ShowCurrent(); }
-        if (GUI.Button(new Rect(186, yb, 150, 116), "\u25b6", btn))
+        if (GUI.Button(new Rect(108, yb, 90, 54), "\u25b6", btn))
         { curIdx = (curIdx + 1) % Math.Max(1, curSkiList.Count); ShowCurrent(); }
-        GUI.Label(new Rect(360, yb + 6, 706, 124), curSkiList.Count == 0
-            ? "(本职业没有此部件)\n点右上「职业」换人, 或点左侧其他分类"
+        GUI.Label(new Rect(210, yb, 700, 54), curSkiList.Count == 0
+            ? "(本职业无此部件) 点右上「职业」换人 / 点左侧其他分类"
             : string.Format("{0}/{1}  {2}", curIdx + 1, curSkiList.Count, curSki), label);
 
         // 拖动旋转
