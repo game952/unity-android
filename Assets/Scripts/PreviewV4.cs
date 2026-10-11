@@ -52,7 +52,8 @@ public class PreviewV4 : MonoBehaviour
         catch (Exception e) { line3 = "[v4.1] 启动失败: " + e.Message; }
         var host = new GameObject("~PreviewV4");
         UnityEngine.Object.DontDestroyOnLoad(host);
-        host.AddComponent<PreviewV4>();
+        var pv = host.AddComponent<PreviewV4>();
+        pv.StartCoroutine(pv.KillLoop());
     }
 
     static void SetupCam()
@@ -94,8 +95,13 @@ public class PreviewV4 : MonoBehaviour
             is2 = AM().Call<AndroidJavaObject>("open", rel, 2);
             using (var bos = new MemoryStream())
             {
-                var buf = new byte[65536]; int n;
-                while ((n = is2.Call<int>("read", buf)) > 0) bos.Write(buf, 0, n);
+                var buf = new sbyte[65536]; int n;
+                while ((n = is2.Call<int>("read", buf)) > 0)
+                {
+                    var tmp = new byte[n];
+                    System.Buffer.BlockCopy(buf, 0, tmp, 0, n);
+                    bos.Write(tmp, 0, n);
+                }
                 return bos.ToArray();
             }
         }
@@ -128,14 +134,21 @@ public class PreviewV4 : MonoBehaviour
     {
         try
         {
-            foreach (var go in UnityEngine.SceneManagement.SceneManager.GetActiveScene().GetRootGameObjects())
-                foreach (var b in go.GetComponentsInChildren<MonoBehaviour>(true))
-                {
-                    if (b == null || b.GetType().Name == "PreviewV4") continue;
-                    b.enabled = false;
-                }
+            foreach (var b in UnityEngine.Object.FindObjectsOfType<MonoBehaviour>(true))
+            {
+                if (b == null || b.GetType().Name == "PreviewV4") continue;
+                b.enabled = false;
+            }
         }
         catch (Exception) { }
+    }
+    System.Collections.IEnumerator KillLoop()
+    {
+        for (int t = 0; t < 5; t++)
+        {
+            yield return new WaitForSeconds(0.6f);
+            KillOthers();
+        }
     }
     static void Scan()
     {
@@ -911,11 +924,10 @@ public class PreviewV4 : MonoBehaviour
             else mat.color = new Color(0.72f, 0.72f, 0.76f);
             mr.sharedMaterial = mat;
 
-            line3 = string.Format("[v4] {0} {1} 顶点{2} 面{3} | 骨架={4}{5} | 贴图={6}{7}",
+            line3 = string.Format("[v4] {0} {1} 顶点{2} 面{3} ski:{4}B | 骨架={5} | 贴图={6}{7}",
                 sd.fmt, tag == "STATIC" ? "静态" : tag + ":" + (sk != null ? sk.srcName : ""),
-                vc, sd.tris.Count / 3,
+                vc, sd.tris.Count / 3, d.Length,
                 sk != null ? sk.srcName : "无",
-                tag == "STATIC" ? "" : "",
                 string.IsNullOrEmpty(sd.anchor) ? "(无锚)" : sd.anchor,
                 tex != null ? "✓" : "✗(白模)");
         }
@@ -947,25 +959,25 @@ public class PreviewV4 : MonoBehaviour
         GUI.matrix = Matrix4x4.TRS(Vector3.zero, Quaternion.identity, new Vector3(sc, sc, 1f));
         float H = Screen.height / sc;
 
-        GUI.Box(new Rect(6, 6, 1068, 46), title, box);
-        GUI.Box(new Rect(6, 54, 1068, 100), GUIContent.none, box);
-        GUI.Label(new Rect(18, 56, 1040, 38), line2, label);
-        GUI.Label(new Rect(18, 92, 1040, 60), line3, small);
+        // 顶部信息栏 (不透明, 标题+状态+异常)
+        GUI.Box(new Rect(0, 0, 1080, 118), GUIContent.none, box);
+        GUI.Label(new Rect(14, 8, 1052, 44), title, label);
+        GUI.Label(new Rect(14, 54, 1052, 40), line2, label);
+        GUI.Label(new Rect(14, 94, 1052, 22), line3, small);
 
+        // 左侧分类列 (带底框, 当前项高亮)
+        GUI.Box(new Rect(0, 124, 296, Cats.Length * 60 + 14), GUIContent.none, box);
         for (int i = 0; i < Cats.Length; i++)
         {
-            var st = i == catI ? small : small;
             var old = GUI.backgroundColor;
-            if (i == catI) GUI.backgroundColor = new Color(0.4f, 0.8f, 0.5f);
-            if (GUI.Button(new Rect(8, 160 + i * 64, 268, 56), Cats[i], st))
-            {
-                catI = i; FilterCat(); ShowCurrent();
-            }
+            if (i == catI) GUI.backgroundColor = new Color(0.30f, 0.65f, 0.95f);
+            if (GUI.Button(new Rect(6, 131 + i * 60, 284, 52), (i == catI ? "\u25b6 " : "") + Cats[i], i == catI ? btn : small))
+            { catI = i; FilterCat(); ShowCurrent(); }
             GUI.backgroundColor = old;
         }
 
-        // 职业切换
-        if (GUI.Button(new Rect(1080 - 260, 160, 250, 60), "职业 " + CurJob + "_" + CurSex + " ▶", btn))
+        // 右上: 职业切换
+        if (GUI.Button(new Rect(1080 - 296, 131, 290, 60), "职业 " + CurJob + "_" + CurSex + " \u25b6", btn))
         {
             sexI++;
             if (sexI >= Sexes.Length) { sexI = 0; jobI = (jobI + 1) % Jobs.Length; }
@@ -973,14 +985,16 @@ public class PreviewV4 : MonoBehaviour
             RebuildCat(); ShowCurrent();
         }
 
-        // 翻页
-        float yb = H - 150;
-        if (GUI.Button(new Rect(8, yb, 110, 90), "◀", btn))
+        // 底部翻页条 (不透明, 空列表时给引导)
+        float yb = H - 132;
+        GUI.Box(new Rect(0, H - 138, 1080, 138), GUIContent.none, box);
+        if (GUI.Button(new Rect(14, yb, 150, 116), "\u25c0", btn))
         { curIdx = (curIdx - 1 + curSkiList.Count) % Math.Max(1, curSkiList.Count); ShowCurrent(); }
-        if (GUI.Button(new Rect(126, yb, 110, 90), "▶", btn))
+        if (GUI.Button(new Rect(186, yb, 150, 116), "\u25b6", btn))
         { curIdx = (curIdx + 1) % Math.Max(1, curSkiList.Count); ShowCurrent(); }
-        GUI.Label(new Rect(250, yb + 10, 640, 70),
-            string.Format("{0}/{1}  ({2})", curSkiList.Count == 0 ? 0 : curIdx + 1, curSkiList.Count, curSki), label);
+        GUI.Label(new Rect(360, yb + 6, 706, 124), curSkiList.Count == 0
+            ? "(本职业没有此部件)\n点右上「职业」换人, 或点左侧其他分类"
+            : string.Format("{0}/{1}  {2}", curIdx + 1, curSkiList.Count, curSki), label);
 
         // 拖动旋转
         var e = Event.current;
