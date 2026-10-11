@@ -1,4 +1,4 @@
-// PreviewV4.cs — v4.0 整装拼合预览台 (2026-10-11)
+// PreviewV4.cs — v4.1 整装拼合预览台(APK数据注入) (2026-10-11)
 // ============================================================
 // 移植自 crt_pipeline v3.2.1（3603/3603 全绿实证方案, 逐行等价翻译）:
 //   ski_core.py     → ski 双格式解析 (老格式 组30B/尾21B + 新格式v3全链+裸流兜底)
@@ -48,8 +48,8 @@ public class PreviewV4 : MonoBehaviour
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     static void Boot()
     {
-        try { SetupCam(); Scan(); RebuildCat(); ShowCurrent(); }
-        catch (Exception e) { line3 = "[v4] 启动失败: " + e.Message; }
+        try { SetupCam(); KillOthers(); Scan(); RebuildCat(); ShowCurrent(); }
+        catch (Exception e) { line3 = "[v4.1] 启动失败: " + e.Message; }
         var host = new GameObject("~PreviewV4");
         UnityEngine.Object.DontDestroyOnLoad(host);
         host.AddComponent<PreviewV4>();
@@ -70,36 +70,122 @@ public class PreviewV4 : MonoBehaviour
         pivot = new GameObject("PreviewV4Pivot");
     }
 
-    // ===== 资源路径探测 (多候选自动判分支) =====
+    // ===== 资源路径探测: APK内StreamingAssets(AssetManager同步直读)优先, 外部目录兜底 =====
+    static bool useAsset = false;
+    static AndroidJavaObject _am;
+    static AndroidJavaObject AM()
+    {
+        if (_am == null)
+        {
+            using (var up = new AndroidJavaClass("com.unity3d.player.UnityPlayer"))
+                _am = up.GetStatic<AndroidJavaObject>("currentActivity").Call<AndroidJavaObject>("getAssets");
+        }
+        return _am;
+    }
+    static string[] ListAssets(string dir)
+    {
+        try { return AM().Call<string[]>("list", dir); } catch (Exception) { return new string[0]; }
+    }
+    static byte[] ReadAsset(string rel)
+    {
+        AndroidJavaObject is2 = null;
+        try
+        {
+            is2 = AM().Call<AndroidJavaObject>("open", rel, 2);
+            using (var bos = new MemoryStream())
+            {
+                var buf = new byte[65536]; int n;
+                while ((n = is2.Call<int>("read", buf)) > 0) bos.Write(buf, 0, n);
+                return bos.ToArray();
+            }
+        }
+        catch (Exception) { return null; }
+        finally { if (is2 != null) { try { is2.Call("close"); } catch (Exception) { } is2.Dispose(); } }
+    }
+    static bool HasAsset(string rel)
+    {
+        AndroidJavaObject is2 = null;
+        try { is2 = AM().Call<AndroidJavaObject>("open", rel, 2); return true; }
+        catch (Exception) { return false; }
+        finally { if (is2 != null) { try { is2.Call("close"); } catch (Exception) { } is2.Dispose(); } }
+    }
+    static byte[] ReadActorFile(string fn)
+    {
+        return useAsset ? ReadAsset("creature/actor/" + fn)
+                        : File.ReadAllBytes(Path.Combine(actorDir, fn));
+    }
+    static byte[] ReadTexFile(string fn)
+    {
+        return useAsset ? ReadAsset("creature/texture/" + fn)
+                        : File.ReadAllBytes(Path.Combine(texDir, fn));
+    }
+    static bool TexExists(string fn)
+    {
+        return useAsset ? HasAsset("creature/texture/" + fn)
+                        : File.Exists(Path.Combine(texDir, fn));
+    }
+    static void KillOthers()
+    {
+        try
+        {
+            foreach (var go in UnityEngine.SceneManagement.SceneManager.GetActiveScene().GetRootGameObjects())
+                foreach (var b in go.GetComponentsInChildren<MonoBehaviour>(true))
+                {
+                    if (b == null || b.GetType().Name == "PreviewV4") continue;
+                    b.enabled = false;
+                }
+        }
+        catch (Exception) { }
+    }
     static void Scan()
     {
+        // 1) APK 内 StreamingAssets (AssetManager 直读, 不依赖文件系统)
+        var pool = new List<string>();
+        foreach (var n in ListAssets("creature/actor"))
+            if (n.StartsWith("role_") && n.EndsWith(".act")) pool.Add(n);
+        if (pool.Count > 0)
+        {
+            pool.Sort();
+            actPool = pool; useAsset = true;
+            actorDir = "asset:creature/actor"; texDir = "asset:creature/texture";
+            title = string.Format("v4.1 整装拼合 · APK数据注入 ({0} 骨架, StreamingAssets)", pool.Count);
+            return;
+        }
+        // 2) 外部目录兜底
         string pd = Application.persistentDataPath;
         string[] cands = {
             "/storage/emulated/0/Game/pak_out/creature/actor",
             pd + "/pak_out/creature/actor",
             pd + "/creature/actor",
-            Application.streamingAssetsPath + "/creature/actor",
         };
         foreach (var c in cands)
         {
             if (!Directory.Exists(c)) continue;
             var acts = Directory.GetFiles(c, "role_*.act");
             if (acts.Length == 0) continue;
-            actorDir = c; actPool = new List<string>(acts); actPool.Sort();
+            actorDir = c; useAsset = false;
+            actPool = new List<string>(acts); actPool.Sort();
             string t = Path.GetDirectoryName(c) + "/texture";
             texDir = Directory.Exists(t) ? t : c;
-            title = string.Format("v4.0 整装拼合 · act骨架池+LBS烘焙 ({0} 骨架, ski/act/dds)",
-                                  actPool.Count);
+            title = string.Format("v4.1 整装拼合 · act骨架池+LBS烘焙 ({0} 骨架, 外部目录)", actPool.Count);
             return;
         }
-        throw new Exception("未找到资源目录 (探测过 " + cands.Length + " 个候选, 均无 role_*.act)");
+        throw new Exception("未找到资源 (APK内StreamingAssets与外部目录均无 role_*.act)");
     }
 
     // ===== 池 + 分类 =====
     static void RebuildCat()
     {
+        if (actPool == null) { curSkiList.Clear(); curIdx = 0; return; }
         catFiles.Clear();
-        var all = Directory.GetFiles(actorDir, "*.ski");
+        IEnumerable<string> all;
+        if (useAsset)
+        {
+            var l = new List<string>();
+            foreach (var f in ListAssets("creature/actor")) if (f.EndsWith(".ski")) l.Add(f);
+            all = l;
+        }
+        else all = Directory.GetFiles(actorDir, "*.ski");
         foreach (var f in all)
         {
             string n = Path.GetFileNameWithoutExtension(f);
@@ -267,7 +353,7 @@ public class PreviewV4 : MonoBehaviour
         ActSkel sk;
         if (!skelCache.TryGetValue(path, out sk))
         {
-            sk = ParseAct(File.ReadAllBytes(path), Path.GetFileName(path));
+            sk = ParseAct(ReadActorFile(Path.GetFileName(path)), Path.GetFileName(path));
             skelCache[path] = sk;
         }
         return sk;
@@ -722,8 +808,7 @@ public class PreviewV4 : MonoBehaviour
         {
             foreach (var e in new[] { ".dds", ".png" })
             {
-                string p = Path.Combine(texDir, c + e);
-                if (File.Exists(p)) return p;
+                if (TexExists(c + e)) return c + e;
             }
         }
         return null;
@@ -738,7 +823,8 @@ public class PreviewV4 : MonoBehaviour
         {
             try
             {
-                byte[] raw = File.ReadAllBytes(p);
+                byte[] raw = ReadTexFile(p);
+            if (raw == null) throw new Exception("tex miss");
                 if (p.EndsWith(".dds")) tex = DdsV4.LoadFromMemory(raw, Path.GetFileNameWithoutExtension(p));
                 else
                 {
@@ -787,7 +873,8 @@ public class PreviewV4 : MonoBehaviour
         line2 = name + "  <" + Cats[catI] + ">  [" + CurJob + "_" + CurSex + "]";
         try
         {
-            byte[] d = File.ReadAllBytes(Path.Combine(actorDir, name + ".ski"));
+            byte[] d = ReadActorFile(name + ".ski");
+            if (d == null) throw new Exception("ski 读取失败(APK内缺失)");
             SkiData sd = ParseSki(d);
             string tag;
             ActSkel sk = MatchSkel(name, out tag);
@@ -861,6 +948,7 @@ public class PreviewV4 : MonoBehaviour
         float H = Screen.height / sc;
 
         GUI.Box(new Rect(6, 6, 1068, 46), title, box);
+        GUI.Box(new Rect(6, 54, 1068, 100), GUIContent.none, box);
         GUI.Label(new Rect(18, 56, 1040, 38), line2, label);
         GUI.Label(new Rect(18, 92, 1040, 60), line3, small);
 
