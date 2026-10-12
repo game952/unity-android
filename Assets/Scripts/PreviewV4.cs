@@ -30,14 +30,21 @@ public class PreviewV4 : MonoBehaviour
     static ActSkel _animSk; static SkiData _animSd; static Mesh _animMesh;
     static Coroutine _animCo; static int _skipGuard;
     const float AnimFps = 24f;
+    public static bool AnimPaused = false;
+    static float _animClock = 0f, _lastT = -1f;
+
     static System.Collections.IEnumerator PlayAnimCo()
     {
         var wait = new WaitForSeconds(1f / AnimFps);
         int nf = 0; foreach (var b in _animSk.bones) { if (b.nf > nf) nf = b.nf; }
         if (nf <= 1) yield break;   // 静态部件无动画
+        _animClock = 0f; _lastT = -1f;
         while (_animSk != null && _animMesh != null && _animSd != null)
         {
-            int f = (int)(Time.time * AnimFps) % nf;
+            float now = Time.realtimeSinceStartup;
+            if (_lastT >= 0f && !AnimPaused) _animClock += now - _lastT;
+            _lastT = now;
+            int f = (int)(_animClock * AnimFps) % nf;
             var W2 = LoadSkeleton(_animSk, f);
             var vs = new Vector3[_animMesh.vertexCount];
             for (int i = 0; i < vs.Length; i++) vs[i] = BakeVertex(W2, _animSd.verts[i]);
@@ -209,13 +216,13 @@ public class PreviewV4 : MonoBehaviour
         // 1) APK 内 StreamingAssets (AssetManager 直读, 不依赖文件系统)
         var pool = new List<string>();
         foreach (var n in ListAssets("creature/actor"))
-            if (n.StartsWith("role_") && n.EndsWith(".act")) pool.Add(n);
+            if (n.EndsWith(".act")) pool.Add(n);
         if (pool.Count > 0)
         {
             pool.Sort();
             actPool = pool; useAsset = true;
             actorDir = "asset:creature/actor"; texDir = "asset:creature/texture";
-            title = string.Format("v4.5.2 整装拼合 · APK数据注入 ({0} 骨架, StreamingAssets)", pool.Count);
+            title = string.Format("v4.6.0 整装拼合 · APK数据注入 ({0} 骨架, StreamingAssets)", pool.Count);
             return;
         }
         // 2) 外部目录兜底
@@ -228,13 +235,13 @@ public class PreviewV4 : MonoBehaviour
         foreach (var c in cands)
         {
             if (!Directory.Exists(c)) continue;
-            var acts = Directory.GetFiles(c, "role_*.act");
+            var acts = Directory.GetFiles(c, "*.act");
             if (acts.Length == 0) continue;
             actorDir = c; useAsset = false;
             actPool = new List<string>(acts); actPool.Sort();
             string t = Path.GetDirectoryName(c) + "/texture";
             texDir = Directory.Exists(t) ? t : c;
-            title = string.Format("v4.5.2 整装拼合 · act骨架池+LBS烘焙 ({0} 骨架, 外部目录)", actPool.Count);
+            title = string.Format("v4.6.0 整装拼合 · act骨架池+LBS烘焙 ({0} 骨架, 外部目录)", actPool.Count);
             return;
         }
         throw new Exception("未找到资源 (APK内StreamingAssets与外部目录均无 role_*.act)");
@@ -876,8 +883,10 @@ public class PreviewV4 : MonoBehaviour
         cands.Add(n);
         string na = Regex.Replace(n, @"a+$", "");              // aa/aaa/aaaa 配色变体
         if (na.Length > 0 && na != n) cands.Add(na);
-        cands.Add(Regex.Replace(na, @"0[12]$", ""));           // 01/02 编号变体 (bpf0801->bpf08)
-        cands.Add(Regex.Replace(n, @"0[12]$", ""));
+        var tv1 = Regex.Replace(na, @"0[12]$", "").TrimEnd('_'); if (tv1.Length > 0) cands.Add(tv1);   // 01/02 编号变体
+        var tv3 = Regex.Replace(n, @"_\d+$", "").TrimEnd('_'); if (tv3.Length > 0 && !cands.Contains(tv3)) cands.Add(tv3);   // 变体尾号 _NN (wai_02_01 -> wai_02)
+        var tv4 = Regex.Replace(tv3, @"_\d+$", "").TrimEnd('_'); if (tv4.Length > 0 && !cands.Contains(tv4)) cands.Add(tv4);   // 两级尾号
+        var tv2 = Regex.Replace(n, @"0[12]$", "").TrimEnd('_'); if (tv2.Length > 0 && !cands.Contains(tv2)) cands.Add(tv2);
         if (n.Length > 1) cands.Add(n.Substring(0, n.Length - 1));   // 保底单字符
         var mm = Regex.Match(n, @"^(.+?)[_\-]?[aA][lLtTgG]?$");
         if (mm.Success && mm.Groups[1].Value.Length > 0) cands.Add(mm.Groups[1].Value);
@@ -1131,7 +1140,13 @@ public class PreviewV4 : MonoBehaviour
         btn = new GUIStyle(GUI.skin.button); btn.fontSize = 20; btn.alignment = TextAnchor.MiddleLeft;
     }
 
-    void OnGUI() { DrawUI(); }
+    void PauseBtn()
+    {
+        if (GUI.Button(new Rect(12, 12, 150, 64), AnimPaused ? "▶ 继续" : "⏸ 暂停"))
+            AnimPaused = !AnimPaused;
+    }
+
+    void OnGUI() { PauseBtn(); DrawUI(); }
     static void DrawUI()
     {
         InitStyle();

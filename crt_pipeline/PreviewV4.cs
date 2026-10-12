@@ -1,4 +1,4 @@
-// PreviewV4.cs — v4.0 整装拼合预览台 (2026-10-11)
+// PreviewV4.cs — v4.1 整装拼合预览台(APK数据注入) (2026-10-11)
 // ============================================================
 // 移植自 crt_pipeline v3.2.1（3603/3603 全绿实证方案, 逐行等价翻译）:
 //   ski_core.py     → ski 双格式解析 (老格式 组30B/尾21B + 新格式v3全链+裸流兜底)
@@ -11,17 +11,50 @@
 // ============================================================
 using System;
 using System.Collections.Generic;
+using System.Runtime.InteropServices;
 using System.IO;
 using System.Text;
 using System.Text.RegularExpressions;
 using UnityEngine;
+using UnityEngine.Networking;
 
-public static class PreviewV4
+public class PreviewV4 : MonoBehaviour
 {
     // ===== 真机校准常量 (验收不对时只改这里重推) =====
     static readonly Vector3 ModelRot = new Vector3(-90f, 0f, 0f); // 源数据 z-up → Unity y-up
     const int FrameStand = 3736;   // 自然站立帧 (与量产 --frame 默认一致)
-    const float FitSize = 3.4f;    // 模型归一化最大边
+    const float FitSize = 3.4f;    // 大件归一化最大边(甲袍/外装)
+    static float _zoom = 1f;       // 手动缩放(底部＋－)
+    static string _texSample = null;
+    // 骨骼动画播放状态
+    static ActSkel _animSk; static SkiData _animSd; static Mesh _animMesh;
+    static Coroutine _animCo; static int _skipGuard;
+    const float AnimFps = 24f;
+    static System.Collections.IEnumerator PlayAnimCo()
+    {
+        var wait = new WaitForSeconds(1f / AnimFps);
+        int nf = 0; foreach (var b in _animSk.bones) { if (b.nf > nf) nf = b.nf; }
+        if (nf <= 1) yield break;   // 静态部件无动画
+        while (_animSk != null && _animMesh != null && _animSd != null)
+        {
+            int f = (int)(Time.time * AnimFps) % nf;
+            var W2 = LoadSkeleton(_animSk, f);
+            var vs = new Vector3[_animMesh.vertexCount];
+            for (int i = 0; i < vs.Length; i++) vs[i] = BakeVertex(W2, _animSd.verts[i]);
+            _animMesh.vertices = vs;
+            _animMesh.RecalculateBounds();
+            yield return wait;
+        }
+    }
+    // 按部件类型的合理预览尺寸: 小件不再被撑成大件
+    static float FitFor(string name)
+    {
+        string n = (name ?? "").ToLower();
+        if (n.Contains("sho") || n.Contains("glo")) return 1.0f;  // 长靴/手套
+        if (n.Contains("hea")) return 0.9f;                       // 头部
+        if (n.Contains("swd") || n.Contains("axe") || n.Contains("spe") || n.Contains("bow")) return 1.7f; // 武器
+        return 1.8f;                                              // 甲袍/外装等大件
+    }
 
     // ===== 运行状态 =====
     static string actorDir, texDir;
@@ -48,8 +81,13 @@ public static class PreviewV4
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     static void Boot()
     {
-        try { SetupCam(); Scan(); RebuildCat(); ShowCurrent(); }
-        catch (Exception e) { line3 = "[v4] 启动失败: " + e.Message; }
+        try { SetupCam(); KillOthers(); Scan(); RebuildCat(); ShowCurrent(); }
+        catch (Exception e) { line3 = "[v4.1] 启动失败: " + e.Message; }
+        var host = new GameObject("~PreviewV4");
+        UnityEngine.Object.DontDestroyOnLoad(host);
+        var pv = host.AddComponent<PreviewV4>();
+        hostPv = pv;
+        pv.StartCoroutine(pv.KillLoop());
     }
 
     static void SetupCam()
@@ -65,38 +103,156 @@ public static class PreviewV4
         lg.AddComponent<Light>().type = LightType.Directional;
         RenderSettings.ambientLight = new Color(0.55f, 0.55f, 0.58f);
         pivot = new GameObject("PreviewV4Pivot");
+        pivot.transform.position = new Vector3(0.2f, 0f, 0f);
     }
 
-    // ===== 资源路径探测 (多候选自动判分支) =====
+    // ===== 资源路径探测: APK内StreamingAssets(AssetManager同步直读)优先, 外部目录兜底 =====
+    static PreviewV4 hostPv;
+    static Coroutine _loadCo;
+    static bool useAsset = false;
+    static AndroidJavaObject _am;
+    static AndroidJavaObject AM()
+    {
+        if (_am == null)
+        {
+            using (var up = new AndroidJavaClass("com.unity3d.player.UnityPlayer"))
+                _am = up.GetStatic<AndroidJavaObject>("currentActivity").Call<AndroidJavaObject>("getAssets");
+        }
+        return _am;
+    }
+    static string[] ListAssets(string dir)
+    {
+        try { return AM().Call<string[]>("list", dir); } catch (Exception) { return new string[0]; }
+    }
+    // 显式 JNI 数组拷出: 复用已验证的 open 链, read 数据经拷贝取回
+    static byte[] ReadAsset(string rel)
+    {
+        AndroidJavaObject is2 = null;
+        try
+        {
+            is2 = AM().Call<AndroidJavaObject>("open", rel, 2);
+            IntPtr im = is2.GetRawObject();
+            IntPtr ic = AndroidJNI.GetObjectClass(im);
+            IntPtr mRead = AndroidJNI.GetMethodID(ic, "read", "([B)I");
+            IntPtr mAv = AndroidJNI.GetMethodID(ic, "available", "()I");
+            int total = AndroidJNI.CallIntMethod(im, mAv, new jvalue[0]);
+            if (total <= 0) total = 262144;
+            byte[] buf = new byte[total];
+            int off = 0;
+            IntPtr jb = AndroidJNI.NewByteArray(65536);
+            var ja = new jvalue[1];
+            while (off < buf.Length)
+            {
+                ja[0].l = jb;
+                int n = AndroidJNI.CallIntMethod(im, mRead, ja);
+                if (n <= 0) break;
+                if (off + n > buf.Length) { var g = new byte[off + n]; Buffer.BlockCopy(buf, 0, g, 0, off); buf = g; }
+                byte[] chunk = AndroidJNI.FromByteArray(jb);
+                Buffer.BlockCopy(chunk, 0, buf, off, n);
+                off += n;
+            }
+            AndroidJNI.DeleteLocalRef(jb);
+            AndroidJNI.DeleteLocalRef(ic);
+            if (off == 0) return new byte[0];
+            if (off == buf.Length) return buf;
+            var r = new byte[off];
+            Buffer.BlockCopy(buf, 0, r, 0, off);
+            return r;
+        }
+        catch (Exception) { return null; }
+        finally { if (is2 != null) { try { is2.Call("close"); } catch (Exception) { } is2.Dispose(); } }
+    }
+    static bool HasAsset(string rel)
+    {
+        AndroidJavaObject is2 = null;
+        try { is2 = AM().Call<AndroidJavaObject>("open", rel, 2); return true; }
+        catch (Exception) { return false; }
+        finally { if (is2 != null) { try { is2.Call("close"); } catch (Exception) { } is2.Dispose(); } }
+    }
+    static byte[] ReadActorFile(string fn)
+    {
+        return useAsset ? ReadAsset("creature/actor/" + fn)
+                        : File.ReadAllBytes(Path.Combine(actorDir, fn));
+    }
+    static byte[] ReadTexFile(string fn)
+    {
+        return useAsset ? ReadAsset("creature/texture/" + fn)
+                        : File.ReadAllBytes(Path.Combine(texDir, fn));
+    }
+    static bool TexExists(string fn)
+    {
+        return useAsset ? HasAsset("creature/texture/" + fn)
+                        : File.Exists(Path.Combine(texDir, fn));
+    }
+    static void KillOthers()
+    {
+        try
+        {
+            foreach (var b in UnityEngine.Object.FindObjectsOfType<MonoBehaviour>(true))
+            {
+                if (b == null || b.GetType().Name == "PreviewV4") continue;
+                b.enabled = false;
+            }
+        }
+        catch (Exception) { }
+    }
+    System.Collections.IEnumerator KillLoop()
+    {
+        for (int t = 0; t < 5; t++)
+        {
+            yield return new WaitForSeconds(0.6f);
+            KillOthers();
+        }
+    }
     static void Scan()
     {
+        // 1) APK 内 StreamingAssets (AssetManager 直读, 不依赖文件系统)
+        var pool = new List<string>();
+        foreach (var n in ListAssets("creature/actor"))
+            if (n.EndsWith(".act")) pool.Add(n);
+        if (pool.Count > 0)
+        {
+            pool.Sort();
+            actPool = pool; useAsset = true;
+            actorDir = "asset:creature/actor"; texDir = "asset:creature/texture";
+            title = string.Format("v4.6.0 整装拼合 · APK数据注入 ({0} 骨架, StreamingAssets)", pool.Count);
+            return;
+        }
+        // 2) 外部目录兜底
         string pd = Application.persistentDataPath;
         string[] cands = {
             "/storage/emulated/0/Game/pak_out/creature/actor",
             pd + "/pak_out/creature/actor",
             pd + "/creature/actor",
-            Application.streamingAssetsPath + "/creature/actor",
         };
         foreach (var c in cands)
         {
             if (!Directory.Exists(c)) continue;
-            var acts = Directory.GetFiles(c, "role_*.act");
+            var acts = Directory.GetFiles(c, "*.act");
             if (acts.Length == 0) continue;
-            actorDir = c; actPool = new List<string>(acts); actPool.Sort();
+            actorDir = c; useAsset = false;
+            actPool = new List<string>(acts); actPool.Sort();
             string t = Path.GetDirectoryName(c) + "/texture";
             texDir = Directory.Exists(t) ? t : c;
-            title = string.Format("v4.0 整装拼合 · act骨架池+LBS烘焙 ({0} 骨架, ski/act/dds)",
-                                  actPool.Count);
+            title = string.Format("v4.6.0 整装拼合 · act骨架池+LBS烘焙 ({0} 骨架, 外部目录)", actPool.Count);
             return;
         }
-        throw new Exception("未找到资源目录 (探测过 " + cands.Length + " 个候选, 均无 role_*.act)");
+        throw new Exception("未找到资源 (APK内StreamingAssets与外部目录均无 role_*.act)");
     }
 
     // ===== 池 + 分类 =====
     static void RebuildCat()
     {
+        if (actPool == null) { curSkiList.Clear(); curIdx = 0; return; }
         catFiles.Clear();
-        var all = Directory.GetFiles(actorDir, "*.ski");
+        IEnumerable<string> all;
+        if (useAsset)
+        {
+            var l = new List<string>();
+            foreach (var f in ListAssets("creature/actor")) if (f.EndsWith(".ski")) l.Add(f);
+            all = l;
+        }
+        else all = Directory.GetFiles(actorDir, "*.ski");
         foreach (var f in all)
         {
             string n = Path.GetFileNameWithoutExtension(f);
@@ -155,8 +311,14 @@ public static class PreviewV4
 
     static ActSkel ParseAct(byte[] d, string srcName)
     {
+        if (d == null) throw new Exception("act读取null " + srcName);
         if (d.Length < 16 || d[0] != 0xff || d[1] != 0xff)
-            throw new Exception("act 头非 CRT stream");
+        {
+            var sb = new System.Text.StringBuilder("act诊断 len=").Append(d.Length).Append(" head=");
+            int hn = Math.Min(16, d.Length);
+            for (int i = 0; i < hn; i++) sb.Append(d[i].ToString("x2")).Append(' ');
+            throw new Exception(sb.ToString());
+        }
         int tl = U16(d, 2);
         int o = FindPattern(d, tl + 4, new byte[] { 0x00, 0x00, 0x80, 0x3f }); // 1.0f 结束骨架名
         if (o < 0) throw new Exception("act 无 1.0f 头");
@@ -224,7 +386,8 @@ public static class PreviewV4
     class FramePose { public float[] R = new float[9]; public float tx, ty, tz; }
 
     // mass_produce.load_skeleton: 每骨骼取指定帧本地 (R, t), 无父级复合
-    static List<FramePose> LoadSkeleton(ActSkel sk)
+    static List<FramePose> LoadSkeleton(ActSkel sk) { return LoadSkeleton(sk, FrameStand); }
+    static List<FramePose> LoadSkeleton(ActSkel sk, int frame)
     {
         var W = new List<FramePose>(sk.bones.Count);
         foreach (var b in sk.bones)
@@ -232,7 +395,7 @@ public static class PreviewV4
             var fp = new FramePose();
             if (b.nf > 0)
             {
-                int f = FrameStand >= b.nf ? b.nf - 1 : FrameStand;   // clamp 保护
+                int f = frame >= b.nf ? b.nf - 1 : frame; if (f < 0) f = 0;   // clamp 保护
                 QuatToMat(new[] { b.quats[f * 4], b.quats[f * 4 + 1], b.quats[f * 4 + 2], b.quats[f * 4 + 3] }, fp.R);
                 fp.tx = b.trans[f * 3]; fp.ty = b.trans[f * 3 + 1]; fp.tz = b.trans[f * 3 + 2];
             }
@@ -264,7 +427,7 @@ public static class PreviewV4
         ActSkel sk;
         if (!skelCache.TryGetValue(path, out sk))
         {
-            sk = ParseAct(File.ReadAllBytes(path), Path.GetFileName(path));
+            sk = ParseAct(ReadActorFile(Path.GetFileName(path)), Path.GetFileName(path));
             skelCache[path] = sk;
         }
         return sk;
@@ -711,7 +874,11 @@ public static class PreviewV4
         string n = anchor.ToLower();
         var cands = new List<string>();
         cands.Add(n);
-        if (n.Length > 1) cands.Add(n.Substring(0, n.Length - 1));
+        string na = Regex.Replace(n, @"a+$", "");              // aa/aaa/aaaa 配色变体
+        if (na.Length > 0 && na != n) cands.Add(na);
+        cands.Add(Regex.Replace(na, @"0[12]$", ""));           // 01/02 编号变体 (bpf0801->bpf08)
+        cands.Add(Regex.Replace(n, @"0[12]$", ""));
+        if (n.Length > 1) cands.Add(n.Substring(0, n.Length - 1));   // 保底单字符
         var mm = Regex.Match(n, @"^(.+?)[_\-]?[aA][lLtTgG]?$");
         if (mm.Success && mm.Groups[1].Value.Length > 0) cands.Add(mm.Groups[1].Value);
         cands.Add(n.Replace("_", ""));
@@ -719,8 +886,18 @@ public static class PreviewV4
         {
             foreach (var e in new[] { ".dds", ".png" })
             {
-                string p = Path.Combine(texDir, c + e);
-                if (File.Exists(p)) return p;
+                if (TexExists(c + e)) return c + e;
+            }
+            var m2 = Regex.Match(c, @"^(.*?)(\d+)$");          // 数字段递减回退
+            if (m2.Success && int.TryParse(m2.Groups[2].Value, out int k) && k > 0)
+            {
+                string pre = m2.Groups[1].Value, fmt = "D" + m2.Groups[2].Value.Length;
+                for (int d = k - 1; d >= 0 && d >= k - 3; d--)
+                {
+                    string c2 = pre + d.ToString(fmt);
+                    foreach (var e2 in new[] { ".dds", ".png" })
+                        if (TexExists(c2 + e2)) return c2 + e2;
+                }
             }
         }
         return null;
@@ -735,7 +912,8 @@ public static class PreviewV4
         {
             try
             {
-                byte[] raw = File.ReadAllBytes(p);
+                byte[] raw = ReadTexFile(p);
+            if (raw == null) throw new Exception("tex miss");
                 if (p.EndsWith(".dds")) tex = DdsV4.LoadFromMemory(raw, Path.GetFileNameWithoutExtension(p));
                 else
                 {
@@ -776,15 +954,44 @@ public static class PreviewV4
         if (curSkiList.Count == 0) { line2 = "(本分类当前职业无模型)"; return; }
         if (curIdx >= curSkiList.Count) curIdx = 0;
         curSki = curSkiList[curIdx];
-        ShowSki(curSki);
+        StartShow(curSki);
     }
 
-    static void ShowSki(string name)
+    static void StartShow(string name)
     {
         line2 = name + "  <" + Cats[catI] + ">  [" + CurJob + "_" + CurSex + "]";
+        _animSk = null; _animMesh = null; _animSd = null;
+        if (hostPv != null && _animCo != null) { hostPv.StopCoroutine(_animCo); _animCo = null; }
+        if (hostPv == null) return;
+        if (_loadCo != null) hostPv.StopCoroutine(_loadCo);
+        _loadCo = hostPv.StartCoroutine(LoadShowCo(name));
+    }
+
+    static System.Collections.IEnumerator LoadShowCo(string name)
+    {
+        byte[] d; string err = "";
+        if (useAsset)
+        {
+            using (var wr = UnityWebRequest.Get(Application.streamingAssetsPath + "/creature/actor/" + name + ".ski"))
+            {
+                yield return wr.SendWebRequest();
+                if (wr.result != UnityWebRequest.Result.Success) { d = null; err = wr.error; }
+                else d = wr.downloadHandler.data;
+            }
+        }
+        else
+        {
+            try { d = File.ReadAllBytes(Path.Combine(actorDir, name + ".ski")); }
+            catch (Exception e2) { d = null; err = e2.Message; }
+        }
+        ShowSkiData(name, d, err);
+    }
+
+    static void ShowSkiData(string name, byte[] d, string err)
+    {
         try
         {
-            byte[] d = File.ReadAllBytes(Path.Combine(actorDir, name + ".ski"));
+            if (d == null) throw new Exception("ski 读取失败: " + err);
             SkiData sd = ParseSki(d);
             string tag;
             ActSkel sk = MatchSkel(name, out tag);
@@ -804,36 +1011,111 @@ public static class PreviewV4
             // 包围盒归一化
             var b = mesh.bounds;
             float ext = Mathf.Max(b.extents.x, Mathf.Max(b.extents.y, b.extents.z));
-            float s = ext > 1e-5f ? FitSize / ext : 1f;
+            float s = ext > 1e-5f ? FitFor(name) * _zoom / ext : _zoom;
 
             if (curModel != null) UnityEngine.Object.Destroy(curModel);
             curModel = new GameObject(name);
             curModel.transform.SetParent(pivot.transform, false);
             curModel.transform.localScale = new Vector3(s, s, s);
-            curModel.transform.localPosition = new Vector3(0f, 1.55f, 0f);
+            var bc = mesh.bounds.center;   // 中心补偿: 部件中心对准显示点(z-up->y-up)
+            curModel.transform.localPosition = new Vector3(0f, 1.55f, 0f) - s * new Vector3(bc.x, bc.z, -bc.y);
             curModel.transform.localRotation = Quaternion.Euler(ModelRot);
             curModel.AddComponent<MeshFilter>().sharedMesh = mesh;
             var mr = curModel.AddComponent<MeshRenderer>();
 
-            Texture2D tex = LoadTex(sd.anchor);
-            var mat = new Material(Shader.Find("Standard"));
-            if (tex != null) mat.mainTexture = tex;
-            else mat.color = new Color(0.72f, 0.72f, 0.76f);
+            // Shader 保底链 (Standard 可能被构建裁剪)
+            Shader sh = Shader.Find("Standard");
+            if (sh == null) sh = Shader.Find("Legacy Shaders/Diffuse");
+            if (sh == null) sh = Shader.Find("Mobile/Diffuse");
+            if (sh == null) sh = Shader.Find("Unlit/Texture");
+            if (sh == null) throw new Exception("无可用Shader(构建裁剪)");
+            var mat = new Material(sh);
+            mat.color = new Color(0.72f, 0.72f, 0.76f);
             mr.sharedMaterial = mat;
 
-            line3 = string.Format("[v4] {0} {1} 顶点{2} 面{3} | 骨架={4}{5} | 贴图={6}{7}",
+            line3 = string.Format("[v4] {0} {1} 顶点{2} 面{3} ski:{4}B | 骨架={5} | 贴图=...",
                 sd.fmt, tag == "STATIC" ? "静态" : tag + ":" + (sk != null ? sk.srcName : ""),
-                vc, sd.tris.Count / 3,
-                sk != null ? sk.srcName : "无",
-                tag == "STATIC" ? "" : "",
-                string.IsNullOrEmpty(sd.anchor) ? "(无锚)" : sd.anchor,
-                tex != null ? "✓" : "✗(白模)");
+                vc, sd.tris.Count / 3, d.Length,
+                sk != null ? sk.srcName : "无");
+
+            // 骨骼动画播放 (act自带逐帧trans/quat)
+            int anf = 0;
+            if (sk != null) foreach (var bb in sk.bones) { if (bb.nf > anf) anf = bb.nf; }
+            if (sk != null && anf > 1)
+            {
+                _animSk = sk; _animSd = sd; _animMesh = mesh;
+                _animCo = hostPv.StartCoroutine(PlayAnimCo());
+                line3 += string.Format(" \u25b6动画{0}帧", anf);
+            }
+            _skipGuard = 0;
+
+            // 贴图异步加载 (加载完成自动贴上)
+            if (!string.IsNullOrEmpty(sd.anchor) && hostPv != null)
+                hostPv.StartCoroutine(LoadTexCo(sd.anchor, mat));
         }
         catch (Exception e)
         {
             line3 = "[v4] " + name + " 解析失败: " + e.Message;
             if (curModel != null) { UnityEngine.Object.Destroy(curModel); curModel = null; }
+            // 不完整部件自动跳过 (整圈全失败才停)
+            if (hostPv != null && curSkiList.Count > 1 && _skipGuard < curSkiList.Count)
+            {
+                _skipGuard++;
+                curIdx = (curIdx + 1) % curSkiList.Count;
+                StartShow(curSkiList[curIdx]);
+            }
         }
+    }
+
+    static System.Collections.IEnumerator LoadTexCo(string anchor, Material mat)
+    {
+        string key = anchor ?? "";
+        if (texCache.TryGetValue(key, out var tc) && tc != null)
+        {
+            if (mat != null) { mat.mainTexture = tc; mat.color = Color.white; }
+            line3 += " ✓(缓存)";
+            yield break;
+        }
+        string p = ResolveTex(anchor);
+        if (p == null)
+        {
+            if (_texSample == null)
+            {
+                var ls = ListAssets("creature/texture");
+                var tsb = new System.Text.StringBuilder();
+                for (int i = 0; i < ls.Length && i < 6; i++) { if (i > 0) tsb.Append(','); tsb.Append(ls[i]); }
+                _texSample = ls.Length == 0 ? "(目录空)" : tsb.ToString();
+            }
+            line3 += " ✗未找到 样本[" + _texSample + "]";
+            yield break;
+        }
+        byte[] raw = null;
+        if (useAsset)
+        {
+            using (var wr = UnityWebRequest.Get(Application.streamingAssetsPath + "/creature/texture/" + p))
+            {
+                yield return wr.SendWebRequest();
+                if (wr.result == UnityWebRequest.Result.Success) raw = wr.downloadHandler.data;
+            }
+        }
+        else
+        {
+            string fp = Path.Combine(texDir, p);
+            if (File.Exists(fp)) { try { raw = File.ReadAllBytes(fp); } catch (Exception) { raw = null; } }
+        }
+        Texture2D t = null;
+        if (raw != null)
+        {
+            if (p.EndsWith(".dds")) t = DdsV4.LoadFromMemory(raw, Path.GetFileNameWithoutExtension(p));
+            else { t = new Texture2D(2, 2, TextureFormat.RGBA32, false); if (!t.LoadImage(raw)) t = null; }
+        }
+        if (t != null)
+        {
+            texCache[key] = t;
+            if (mat != null) { mat.mainTexture = t; mat.color = Color.white; }
+            line3 += " ✓" + p;
+        }
+        else line3 += " ✗解码失败";
     }
 
     // ================================================================
@@ -843,37 +1125,40 @@ public static class PreviewV4
     static void InitStyle()
     {
         if (box != null) return;
-        box = new GUIStyle(GUI.skin.box); box.fontSize = 34; box.alignment = TextAnchor.MiddleLeft;
-        label = new GUIStyle(GUI.skin.label); label.fontSize = 30;
-        small = new GUIStyle(GUI.skin.label); small.fontSize = 24;
-        btn = new GUIStyle(GUI.skin.button); btn.fontSize = 28; btn.alignment = TextAnchor.MiddleLeft;
+        box = new GUIStyle(GUI.skin.box); box.fontSize = 22; box.alignment = TextAnchor.MiddleLeft;
+        label = new GUIStyle(GUI.skin.label); label.fontSize = 22;
+        small = new GUIStyle(GUI.skin.label); small.fontSize = 16; small.wordWrap = true;
+        btn = new GUIStyle(GUI.skin.button); btn.fontSize = 20; btn.alignment = TextAnchor.MiddleLeft;
     }
 
-    static void OnGUI()
+    void OnGUI() { DrawUI(); }
+    static void DrawUI()
     {
         InitStyle();
         float sc = Screen.width / 1080f;
         GUI.matrix = Matrix4x4.TRS(Vector3.zero, Quaternion.identity, new Vector3(sc, sc, 1f));
-        float H = Screen.height / sc;
+        float H = Screen.height / sc;   // 横屏约 508
 
-        GUI.Box(new Rect(6, 6, 1068, 46), title, box);
-        GUI.Label(new Rect(18, 56, 1040, 38), line2, label);
-        GUI.Label(new Rect(18, 92, 1040, 60), line3, small);
+        // 顶栏 (紧凑, 状态右置)
+        GUI.Box(new Rect(0, 0, 1080, 86), GUIContent.none, box);
+        GUI.Label(new Rect(12, 4, 700, 40), title, label);
+        GUI.Label(new Rect(12, 42, 700, 40), line2, label);
+        GUI.Label(new Rect(716, 8, 356, 74), line3, small);
 
+        // 分类: 一竖排 (左侧)
+        float cw = 300f, ch = 40f;
+        GUI.Box(new Rect(0, 88, cw + 16, Cats.Length * (ch + 3) + 10), GUIContent.none, box);
         for (int i = 0; i < Cats.Length; i++)
         {
-            var st = i == catI ? small : small;
             var old = GUI.backgroundColor;
-            if (i == catI) GUI.backgroundColor = new Color(0.4f, 0.8f, 0.5f);
-            if (GUI.Button(new Rect(8, 160 + i * 64, 268, 56), Cats[i], st))
-            {
-                catI = i; FilterCat(); ShowCurrent();
-            }
+            if (i == catI) GUI.backgroundColor = new Color(0.30f, 0.65f, 0.95f);
+            if (GUI.Button(new Rect(8, 92 + i * (ch + 3), cw, ch), (i == catI ? "\u25b6 " : "") + Cats[i], i == catI ? btn : small))
+            { catI = i; FilterCat(); ShowCurrent(); }
             GUI.backgroundColor = old;
         }
 
-        // 职业切换
-        if (GUI.Button(new Rect(1080 - 260, 160, 250, 60), "职业 " + CurJob + "_" + CurSex + " ▶", btn))
+        // 职业按钮 (右上)
+        if (GUI.Button(new Rect(1080 - 300, 94, 292, 52), "职业 " + CurJob + "_" + CurSex + " \u25b6", btn))
         {
             sexI++;
             if (sexI >= Sexes.Length) { sexI = 0; jobI = (jobI + 1) % Jobs.Length; }
@@ -881,14 +1166,18 @@ public static class PreviewV4
             RebuildCat(); ShowCurrent();
         }
 
-        // 翻页
-        float yb = H - 150;
-        if (GUI.Button(new Rect(8, yb, 110, 90), "◀", btn))
+        // 底部翻页条
+        float yb = H - 62;
+        GUI.Box(new Rect(0, yb - 6, 1080, 68), GUIContent.none, box);
+        if (GUI.Button(new Rect(10, yb, 90, 54), "\u25c0", btn))
         { curIdx = (curIdx - 1 + curSkiList.Count) % Math.Max(1, curSkiList.Count); ShowCurrent(); }
-        if (GUI.Button(new Rect(126, yb, 110, 90), "▶", btn))
+        if (GUI.Button(new Rect(108, yb, 90, 54), "\u25b6", btn))
         { curIdx = (curIdx + 1) % Math.Max(1, curSkiList.Count); ShowCurrent(); }
-        GUI.Label(new Rect(250, yb + 10, 640, 70),
-            string.Format("{0}/{1}  ({2})", curSkiList.Count == 0 ? 0 : curIdx + 1, curSkiList.Count, curSki), label);
+        GUI.Label(new Rect(210, yb, 700, 54), curSkiList.Count == 0
+            ? "(本职业无此部件) 点右上「职业」换人 / 点左侧其他分类"
+            : string.Format("{0}/{1}  {2}", curIdx + 1, curSkiList.Count, curSki), label);
+        if (GUI.Button(new Rect(922, yb, 64, 54), "\uff0b", btn)) { _zoom = Mathf.Clamp(_zoom * 1.2f, 0.2f, 8f); ShowCurrent(); }
+        if (GUI.Button(new Rect(992, yb, 64, 54), "\uff0d", btn)) { _zoom = Mathf.Clamp(_zoom / 1.2f, 0.2f, 8f); ShowCurrent(); }
 
         // 拖动旋转
         var e = Event.current;
