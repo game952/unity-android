@@ -103,7 +103,7 @@ public class PreviewV4 : MonoBehaviour
         lg.AddComponent<Light>().type = LightType.Directional;
         RenderSettings.ambientLight = new Color(0.55f, 0.55f, 0.58f);
         pivot = new GameObject("PreviewV4Pivot");
-        pivot.transform.position = new Vector3(0.2f, 0f, 0f);
+        pivot.transform.position = new Vector3(0.9f, 0f, 0f);
     }
 
     // ===== 资源路径探测: APK内StreamingAssets(AssetManager同步直读)优先, 外部目录兜底 =====
@@ -209,13 +209,13 @@ public class PreviewV4 : MonoBehaviour
         // 1) APK 内 StreamingAssets (AssetManager 直读, 不依赖文件系统)
         var pool = new List<string>();
         foreach (var n in ListAssets("creature/actor"))
-            if (n.EndsWith(".act")) pool.Add(n);
+            if ((n.StartsWith("role_") || n.StartsWith("mon")) && n.EndsWith(".act")) pool.Add(n);
         if (pool.Count > 0)
         {
             pool.Sort();
             actPool = pool; useAsset = true;
             actorDir = "asset:creature/actor"; texDir = "asset:creature/texture";
-            title = string.Format("v4.6.0 整装拼合 · APK数据注入 ({0} 骨架, StreamingAssets)", pool.Count);
+            title = string.Format("v4.5 整装拼合 · APK数据注入 ({0} 骨架, StreamingAssets)", pool.Count);
             return;
         }
         // 2) 外部目录兜底
@@ -228,13 +228,14 @@ public class PreviewV4 : MonoBehaviour
         foreach (var c in cands)
         {
             if (!Directory.Exists(c)) continue;
-            var acts = Directory.GetFiles(c, "*.act");
+            var acts = Directory.GetFiles(c, "role_*.act");
+            if (acts.Length == 0) acts = Directory.GetFiles(c, "mon*.act");
             if (acts.Length == 0) continue;
             actorDir = c; useAsset = false;
             actPool = new List<string>(acts); actPool.Sort();
             string t = Path.GetDirectoryName(c) + "/texture";
             texDir = Directory.Exists(t) ? t : c;
-            title = string.Format("v4.6.0 整装拼合 · act骨架池+LBS烘焙 ({0} 骨架, 外部目录)", actPool.Count);
+            title = string.Format("v4.5 整装拼合 · act骨架池+LBS烘焙 ({0} 骨架, 外部目录)", actPool.Count);
             return;
         }
         throw new Exception("未找到资源 (APK内StreamingAssets与外部目录均无 role_*.act)");
@@ -261,6 +262,18 @@ public class PreviewV4 : MonoBehaviour
             else if (n.StartsWith("w_") && n.Contains("_" + CurJob)) take = true;      // 当前职业武器
             else if (!n.StartsWith("a_") && !n.StartsWith("w_")) take = true;          // 怪物/坐骑/通用
             if (take) catFiles.Add(n);
+        }
+        // 武器三合一: w_*.act 自含骨骼+网格+材质 (本游戏武器无独立ski), 同样进分类
+        if (useAsset)
+        {
+            foreach (var f in ListAssets("creature/actor"))
+                if (f.StartsWith("w_") && f.EndsWith(".act"))
+                { string nm = Path.GetFileNameWithoutExtension(f); if (!catFiles.Contains(nm)) catFiles.Add(nm); }
+        }
+        else
+        {
+            foreach (var f in Directory.GetFiles(actorDir, "w_*.act"))
+            { string nm = Path.GetFileNameWithoutExtension(f); if (!catFiles.Contains(nm)) catFiles.Add(nm); }
         }
         catFiles.Sort();
         FilterCat();
@@ -410,7 +423,34 @@ public class PreviewV4 : MonoBehaviour
     {
         tag = "STATIC";
         var m = Regex.Match(skiName, @"^a_([a-z]+)_([fm])_");
-        if (!m.Success) return null;                                 // 怪物/武器/宠物 → 静态
+        if (!m.Success)
+        {
+            // 怪物/坐骑: monXXX*.ski → 同编号前缀 monXXX*.act (骨架池已收mon*.act)
+            var mm = Regex.Match(skiName, @"^(mon[a-z]*[0-9]+)");
+            if (mm.Success)
+            {
+                string want2 = mm.Groups[1].Value;
+                string p2 = null;
+                foreach (var p in actPool)
+                {
+                    string fn = Path.GetFileName(p);
+                    if (fn.StartsWith(want2)) { p2 = p; break; }
+                }
+                if (p2 != null)
+                {
+                    tag = "MON:" + Path.GetFileName(p2);
+                    ActSkel sk2;
+                    if (!skelCache.TryGetValue(p2, out sk2))
+                    {
+                        sk2 = ParseAct(ReadActorFile(Path.GetFileName(p2)), Path.GetFileName(p2));
+                        skelCache[p2] = sk2;
+                    }
+                    return sk2;
+                }
+                tag = "STATIC(缺" + want2 + "*.act)";
+            }
+            return null;
+        }
         string want = "role_" + m.Groups[1].Value + "_" + m.Groups[2].Value + "_";
         string path = null;
         foreach (var p in actPool)
@@ -874,11 +914,7 @@ public class PreviewV4 : MonoBehaviour
         string n = anchor.ToLower();
         var cands = new List<string>();
         cands.Add(n);
-        string na = Regex.Replace(n, @"a+$", "");              // aa/aaa/aaaa 配色变体
-        if (na.Length > 0 && na != n) cands.Add(na);
-        cands.Add(Regex.Replace(na, @"0[12]$", ""));           // 01/02 编号变体 (bpf0801->bpf08)
-        cands.Add(Regex.Replace(n, @"0[12]$", ""));
-        if (n.Length > 1) cands.Add(n.Substring(0, n.Length - 1));   // 保底单字符
+        if (n.Length > 1) cands.Add(n.Substring(0, n.Length - 1));
         var mm = Regex.Match(n, @"^(.+?)[_\-]?[aA][lLtTgG]?$");
         if (mm.Success && mm.Groups[1].Value.Length > 0) cands.Add(mm.Groups[1].Value);
         cands.Add(n.Replace("_", ""));
@@ -887,17 +923,6 @@ public class PreviewV4 : MonoBehaviour
             foreach (var e in new[] { ".dds", ".png" })
             {
                 if (TexExists(c + e)) return c + e;
-            }
-            var m2 = Regex.Match(c, @"^(.*?)(\d+)$");          // 数字段递减回退
-            if (m2.Success && int.TryParse(m2.Groups[2].Value, out int k) && k > 0)
-            {
-                string pre = m2.Groups[1].Value, fmt = "D" + m2.Groups[2].Value.Length;
-                for (int d = k - 1; d >= 0 && d >= k - 3; d--)
-                {
-                    string c2 = pre + d.ToString(fmt);
-                    foreach (var e2 in new[] { ".dds", ".png" })
-                        if (TexExists(c2 + e2)) return c2 + e2;
-                }
             }
         }
         return null;
@@ -984,17 +1009,45 @@ public class PreviewV4 : MonoBehaviour
             try { d = File.ReadAllBytes(Path.Combine(actorDir, name + ".ski")); }
             catch (Exception e2) { d = null; err = e2.Message; }
         }
-        ShowSkiData(name, d, err);
+        // 武器三合一: w_*.act 自含骨骼+网格+材质, 无独立ski → 回退读act
+        bool isAct = false;
+        if (d == null && name.StartsWith("w_"))
+        {
+            if (useAsset)
+            {
+                using (var wr = UnityWebRequest.Get(Application.streamingAssetsPath + "/creature/actor/" + name + ".act"))
+                {
+                    yield return wr.SendWebRequest();
+                    if (wr.result != UnityWebRequest.Result.Success) err = wr.error;
+                    else { d = wr.downloadHandler.data; isAct = true; }
+                }
+            }
+            else
+            {
+                try { d = File.ReadAllBytes(Path.Combine(actorDir, name + ".act")); isAct = true; }
+                catch (Exception e2) { err = e2.Message; }
+            }
+        }
+        ShowSkiData(name, d, err, isAct);
     }
 
-    static void ShowSkiData(string name, byte[] d, string err)
+    static void ShowSkiData(string name, byte[] d, string err, bool isAct = false)
     {
         try
         {
-            if (d == null) throw new Exception("ski 读取失败: " + err);
+            if (d == null) throw new Exception("读取失败: " + err);
             SkiData sd = ParseSki(d);
             string tag;
-            ActSkel sk = MatchSkel(name, out tag);
+            ActSkel sk;
+            if (isAct) { sk = ParseAct(d, name + ".act"); tag = "ACT自含"; }   // 武器act: 骨骼段同构
+            else sk = MatchSkel(name, out tag);
+            // 蒙皮骨骼索引越界保护: 索引超骨架数→静态烘焙 (坏匹配兜底, 防炸裂)
+            if (sk != null)
+            {
+                int maxBid = -1;
+                foreach (var v in sd.verts) foreach (byte bb in v.bid) if (bb > maxBid) maxBid = bb;
+                if (maxBid >= sk.bones.Count) { tag += "\u2192BID溢出STATIC"; sk = null; }
+            }
             List<FramePose> W = (sk != null) ? LoadSkeleton(sk) : null;
 
             // 烘焙 → mesh
@@ -1039,8 +1092,7 @@ public class PreviewV4 : MonoBehaviour
                 sk != null ? sk.srcName : "无");
 
             // 骨骼动画播放 (act自带逐帧trans/quat)
-            int anf = 0;
-            if (sk != null) foreach (var bb in sk.bones) { if (bb.nf > anf) anf = bb.nf; }
+            int anf = sk != null && sk.bones.Count > 0 ? sk.bones[0].nf : 0;
             if (sk != null && anf > 1)
             {
                 _animSk = sk; _animSd = sd; _animMesh = mesh;
