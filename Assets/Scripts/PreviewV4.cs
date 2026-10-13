@@ -27,25 +27,18 @@ public class PreviewV4 : MonoBehaviour
     static float _zoom = 1f;       // 手动缩放(底部＋－)
     static string _texSample = null;
     // 骨骼动画播放状态
-    static ActSkel _animSk; static SkiData _animSd; static Mesh _animMesh;
+    static ActSkel _animSk; static SkiData _animSd; static Mesh _animMesh; static List<FramePose> _animBind;
     static Coroutine _animCo; static int _skipGuard;
     const float AnimFps = 24f;
-    public static bool AnimPaused = false;
-    static float _animClock = 0f, _lastT = -1f;
-
     static System.Collections.IEnumerator PlayAnimCo()
     {
         var wait = new WaitForSeconds(1f / AnimFps);
         int nf = 0; foreach (var b in _animSk.bones) { if (b.nf > nf) nf = b.nf; }
         if (nf <= 1) yield break;   // 静态部件无动画
-        _animClock = 0f; _lastT = -1f;
         while (_animSk != null && _animMesh != null && _animSd != null)
         {
-            float now = Time.realtimeSinceStartup;
-            if (_lastT >= 0f && !AnimPaused) _animClock += now - _lastT;
-            _lastT = now;
-            int f = (int)(_animClock * AnimFps) % nf;
-            var W2 = LoadSkeleton(_animSk, f);
+            int f = (int)(Time.time * AnimFps) % nf;
+            var W2 = LoadSkeleton(_animSk, f, _animBind);   // 绑定相对调色板 (站姿=恒等)
             var vs = new Vector3[_animMesh.vertexCount];
             for (int i = 0; i < vs.Length; i++) vs[i] = BakeVertex(W2, _animSd.verts[i]);
             _animMesh.vertices = vs;
@@ -89,7 +82,7 @@ public class PreviewV4 : MonoBehaviour
     static void Boot()
     {
         try { SetupCam(); KillOthers(); Scan(); RebuildCat(); ShowCurrent(); }
-        catch (Exception e) { line3 = "[v4.1] 启动失败: " + e.Message; }
+        catch (Exception e) { line3 = "[v4.7] 启动失败: " + e.Message; }
         var host = new GameObject("~PreviewV4");
         UnityEngine.Object.DontDestroyOnLoad(host);
         var pv = host.AddComponent<PreviewV4>();
@@ -110,7 +103,7 @@ public class PreviewV4 : MonoBehaviour
         lg.AddComponent<Light>().type = LightType.Directional;
         RenderSettings.ambientLight = new Color(0.55f, 0.55f, 0.58f);
         pivot = new GameObject("PreviewV4Pivot");
-        pivot.transform.position = new Vector3(0.2f, 0f, 0f);
+        pivot.transform.position = new Vector3(0.9f, 0f, 0f);
     }
 
     // ===== 资源路径探测: APK内StreamingAssets(AssetManager同步直读)优先, 外部目录兜底 =====
@@ -216,13 +209,13 @@ public class PreviewV4 : MonoBehaviour
         // 1) APK 内 StreamingAssets (AssetManager 直读, 不依赖文件系统)
         var pool = new List<string>();
         foreach (var n in ListAssets("creature/actor"))
-            if (n.EndsWith(".act")) pool.Add(n);
+            if (n.StartsWith("role_") && n.EndsWith(".act")) pool.Add(n);
         if (pool.Count > 0)
         {
             pool.Sort();
             actPool = pool; useAsset = true;
             actorDir = "asset:creature/actor"; texDir = "asset:creature/texture";
-            title = string.Format("v4.6.0 整装拼合 · APK数据注入 ({0} 骨架, StreamingAssets)", pool.Count);
+            title = string.Format("v4.7 整装拼合 · APK数据注入 ({0} 骨架, StreamingAssets)", pool.Count);
             return;
         }
         // 2) 外部目录兜底
@@ -235,19 +228,21 @@ public class PreviewV4 : MonoBehaviour
         foreach (var c in cands)
         {
             if (!Directory.Exists(c)) continue;
-            var acts = Directory.GetFiles(c, "*.act");
+            var acts = Directory.GetFiles(c, "role_*.act");
             if (acts.Length == 0) continue;
             actorDir = c; useAsset = false;
             actPool = new List<string>(acts); actPool.Sort();
             string t = Path.GetDirectoryName(c) + "/texture";
             texDir = Directory.Exists(t) ? t : c;
-            title = string.Format("v4.6.0 整装拼合 · act骨架池+LBS烘焙 ({0} 骨架, 外部目录)", actPool.Count);
+            title = string.Format("v4.7 整装拼合 · act骨架池+LBS烘焙 ({0} 骨架, 外部目录)", actPool.Count);
             return;
         }
         throw new Exception("未找到资源 (APK内StreamingAssets与外部目录均无 role_*.act)");
     }
 
     // ===== 池 + 分类 =====
+    static string poolStat = "(未统计)";
+    static void AddCnt(Dictionary<string, int> d, string k) { int c; d.TryGetValue(k, out c); d[k] = c + 1; }
     static void RebuildCat()
     {
         if (actPool == null) { curSkiList.Clear(); curIdx = 0; return; }
@@ -260,6 +255,29 @@ public class PreviewV4 : MonoBehaviour
             all = l;
         }
         else all = Directory.GetFiles(actorDir, "*.ski");
+
+        // 池内家族统计 (跨职业, 定位注入缺口)
+        var fam = new Dictionary<string, int>();
+        int nw = 0, nm = 0;
+        foreach (var f in all)
+        {
+            string n = Path.GetFileNameWithoutExtension(f);
+            if (n.StartsWith("a_")) { var seg = n.Split('_'); AddCnt(fam, seg.Length >= 3 ? seg[0] + "_" + seg[1] + "_" + seg[2] : "a_?"); }
+            else if (n.StartsWith("w_")) nw++;
+            else nm++;
+        }
+        {
+            var sb = new System.Text.StringBuilder();
+            foreach (var j in Jobs) foreach (var sx in Sexes)
+            {
+                int c; fam.TryGetValue("a_" + j + "_" + sx, out c);
+                if (sb.Length > 0) sb.Append(' ');
+                sb.Append("a_").Append(j).Append('_').Append(sx).Append('×').Append(c);
+            }
+            sb.Append(" 武器×").Append(nw).Append(" 怪×").Append(nm);
+            poolStat = sb.ToString();
+        }
+
         foreach (var f in all)
         {
             string n = Path.GetFileNameWithoutExtension(f);
@@ -392,25 +410,71 @@ public class PreviewV4 : MonoBehaviour
 
     class FramePose { public float[] R = new float[9]; public float tx, ty, tz; }
 
-    // mass_produce.load_skeleton: 每骨骼取指定帧本地 (R, t), 无父级复合
-    static List<FramePose> LoadSkeleton(ActSkel sk) { return LoadSkeleton(sk, FrameStand); }
-    static List<FramePose> LoadSkeleton(ActSkel sk, int frame)
+    // v4.7: 层级复合世界矩阵 + 绑定相对调色板 (station帧=绑定姿态 → 恒等)
+    static FramePose MatMul(FramePose A, FramePose B)   // A∘B
     {
-        var W = new List<FramePose>(sk.bones.Count);
-        foreach (var b in sk.bones)
+        var M = new FramePose();
+        float[] a = A.R, b = B.R;
+        M.R[0] = a[0]*b[0] + a[1]*b[3] + a[2]*b[6];
+        M.R[1] = a[0]*b[1] + a[1]*b[4] + a[2]*b[7];
+        M.R[2] = a[0]*b[2] + a[1]*b[5] + a[2]*b[8];
+        M.R[3] = a[3]*b[0] + a[4]*b[3] + a[5]*b[6];
+        M.R[4] = a[3]*b[1] + a[4]*b[4] + a[5]*b[7];
+        M.R[5] = a[3]*b[2] + a[4]*b[5] + a[5]*b[8];
+        M.R[6] = a[6]*b[0] + a[7]*b[3] + a[8]*b[6];
+        M.R[7] = a[6]*b[1] + a[7]*b[4] + a[8]*b[7];
+        M.R[8] = a[6]*b[2] + a[7]*b[5] + a[8]*b[8];
+        M.tx = a[0]*B.tx + a[1]*B.ty + a[2]*B.tz + A.tx;
+        M.ty = a[3]*B.tx + a[4]*B.ty + a[5]*B.tz + A.ty;
+        M.tz = a[6]*B.tx + a[7]*B.ty + a[8]*B.tz + A.tz;
+        return M;
+    }
+    static FramePose MatInv(FramePose A)
+    {
+        var M = new FramePose();
+        float[] a = A.R;
+        M.R[0]=a[0]; M.R[1]=a[3]; M.R[2]=a[6];
+        M.R[3]=a[1]; M.R[4]=a[4]; M.R[5]=a[7];
+        M.R[6]=a[2]; M.R[7]=a[5]; M.R[8]=a[8];
+        M.tx = -(a[0]*A.tx + a[3]*A.ty + a[6]*A.tz);
+        M.ty = -(a[1]*A.tx + a[4]*A.ty + a[7]*A.tz);
+        M.tz = -(a[2]*A.tx + a[5]*A.ty + a[8]*A.tz);
+        return M;
+    }
+    static FramePose BoneLocal(Bone b, int frame)
+    {
+        var fp = new FramePose();
+        if (b.nf > 0)
         {
-            var fp = new FramePose();
-            if (b.nf > 0)
-            {
-                int f = frame >= b.nf ? b.nf - 1 : frame; if (f < 0) f = 0;   // clamp 保护
-                QuatToMat(new[] { b.quats[f * 4], b.quats[f * 4 + 1], b.quats[f * 4 + 2], b.quats[f * 4 + 3] }, fp.R);
-                fp.tx = b.trans[f * 3]; fp.ty = b.trans[f * 3 + 1]; fp.tz = b.trans[f * 3 + 2];
-            }
-            else { fp.R[0] = fp.R[4] = fp.R[8] = 1f; }               // 静态骨恒等
-            W.Add(fp);
+            int f = frame >= b.nf ? b.nf - 1 : frame; if (f < 0) f = 0;   // clamp 保护
+            QuatToMat(new[] { b.quats[f * 4], b.quats[f * 4 + 1], b.quats[f * 4 + 2], b.quats[f * 4 + 3] }, fp.R);
+            fp.tx = b.trans[f * 3]; fp.ty = b.trans[f * 3 + 1]; fp.tz = b.trans[f * 3 + 2];
         }
+        else { fp.R[0] = fp.R[4] = fp.R[8] = 1f; }               // 静态骨恒等
+        return fp;
+    }
+    // bind = 站姿世界矩阵; 返回 world(frame)×bind⁻¹; bind=null → 直接返回 world
+    static List<FramePose> LoadSkeleton(ActSkel sk, int frame, List<FramePose> bind)
+    {
+        int nb = sk.bones.Count;
+        var idx = new Dictionary<string, int>();
+        for (int i = 0; i < nb; i++) idx[sk.bones[i].name] = i;
+        var world = new FramePose[nb];
+        for (int i = 0; i < nb; i++)
+        {
+            var L = BoneLocal(sk.bones[i], frame);
+            int pi;
+            if (sk.bones[i].parent != null && idx.TryGetValue(sk.bones[i].parent, out pi)
+                && pi != i && pi < i && world[pi] != null)
+                world[i] = MatMul(world[pi], L);
+            else world[i] = L;
+        }
+        var W = new List<FramePose>(nb);
+        for (int i = 0; i < nb; i++)
+            W.Add((bind != null && bind[i] != null) ? MatMul(world[i], MatInv(bind[i])) : world[i]);
         return W;
     }
+    static List<FramePose> LoadBind(ActSkel sk) { return LoadSkeleton(sk, FrameStand, null); }
 
     // ===== 骨架匹配 (mass_produce: a_(职业)_(性别)_ → role_x_y_*.act, 否则静态) =====
     static ActSkel MatchSkel(string skiName, out string tag)
@@ -450,6 +514,7 @@ public class PreviewV4 : MonoBehaviour
         public List<Vtx> verts = new List<Vtx>();
         public List<Vector2> uv = new List<Vector2>();
         public List<int> tris = new List<int>();
+        public List<string> anchors = new List<string>();
         public string anchor = "", fmt = "";
         public int rawN;
     }
@@ -488,453 +553,264 @@ public class PreviewV4 : MonoBehaviour
         return -1;
     }
 
-    // ---- 老格式顶点链 walk: 组30B(bone u8+w f32+pos3f+nrm3f+pad1B) 尾21B(flag+tang3f+uv2f) ----
-    // 返回: 法线合格率; 失败 verts=null
-    static float Walk(byte[] d, int start, int vc, out int endP, List<Vtx> verts, List<Vector2> uvs)
-    {
-        int p = start; long ok = 0, tot = 0; int F = d.Length;
-        endP = p; verts.Clear(); if (uvs != null) uvs.Clear();
-        for (int i = 0; i < vc; i++)
-        {
-            if (p + 4 > F) { endP = p; return -1f; }
-            int nb = U32(d, p); p += 4;
-            if (nb < 1 || nb > 8) { endP = p; return -1f; }
-            var v = new Vtx(); v.bid = new byte[nb]; v.w = new float[nb]; v.pos = new Vector3[nb];
-            for (int j = 0; j < nb; j++)
-            {
-                if (p + 29 > F) { endP = p; return -1f; }
-                byte bone = d[p]; float w = F32(d, p + 1);
-                if (bone > 128 || w < 0f || w > 1.02f) { endP = p; return -1f; }
-                float x = F32(d, p + 5), y = F32(d, p + 9), z = F32(d, p + 13);
-                if (x <= -60f || x >= 60f || y <= -60f || y >= 60f || z <= -60f || z >= 60f) { endP = p; return -1f; }
-                float nx = F32(d, p + 17), ny = F32(d, p + 21), nz = F32(d, p + 25);
-                float n2 = nx * nx + ny * ny + nz * nz;
-                tot++; if (n2 > 0.8f && n2 < 1.2f) ok++;
-                v.bid[j] = bone; v.w[j] = w; v.pos[j] = new Vector3(x, y, z);
-                p += 30;
-            }
-            if (p + 21 <= F)
-            {
-                p += 1;                                        // flag
-                p += 12;                                       // tangent (不入 mesh)
-                if (uvs != null) uvs.Add(new Vector2(F32(d, p), F32(d, p + 4)));
-                p += 8;
-            }
-            else { if (uvs != null) uvs.Add(Vector2.zero); p += 21; }
-            verts.Add(v);
-        }
-        endP = p;
-        return tot > 0 ? (float)ok / tot : 0f;
-    }
+    // ================================================================
+    //  ski 解析 v4.7 — A/R/C 已验证模型 (ski_export.py 297/297 文件闭环)
+    //  顶点 = R 记录; C = 当前顶点附加绑定 (R2+C 权重和=1); A = 法线+UV (A_k 配 R_k);
+    //  面表 = BE-u16 顶点序号 三角形列表 (引擎 rtc_skin_subset: GetFaceNum=size/3);
+    //  绑定坐标 = 模型空间 (点云已验证) → 静止渲染 = Σ w×pos
+    // ================================================================
+    class SkiRec { public char t; public int n, vc; public byte bone; public float w;
+                   public Vector3 pos, nor; public Vector2 uv; }
 
-    // ---- find_chain: MaterialLib 后 0x800 内扫 vc 声明 → 老格式 walk ----
-    static bool FindChain(byte[] d, out int mtl, out int chainP, out int vc, List<Vtx> verts, List<Vector2> uvs)
+    static List<SkiRec> WalkVerts(byte[] d, int start)
     {
-        mtl = IndexOf(d, "CRT_MaterialLib", 0);
-        if (mtl < 0) mtl = IndexOf(d, "CRT_Mtl", 0);
-        chainP = -1; vc = 0;
-        if (mtl < 0) return false;
-        int F = d.Length;
-        int hi = Math.Min(mtl + 0x800, F - 64);
-        for (int p = mtl + 4; p < hi; p++)
+        int F = d.Length, o = start; bool firstA = true;
+        var recs = new List<SkiRec>();
+        while (o < F - 3)
         {
-            int v = U32(d, p);
-            if (v <= 3 || v >= 4000) continue;
-            bool ok5 = true;
-            for (int k = 0; k < 5; k++) if (Math.Abs(F32(d, p + 4 + 4 * k)) >= 100f) { ok5 = false; break; }
-            if (!ok5) continue;
-            int u = U32(d, p + 24);
-            if (u < 1 || u > 4) continue;
-            int endP;
-            float rate = Walk(d, p + 24, v, out endP, verts, uvs);
-            if (rate >= 0f && rate > 0.9f)
+            if (o + 4 > F) return null;
+            byte t0 = d[o], t1 = d[o + 1];
+            if (t0 == 1 && t1 == 1)
             {
-                int gap = endP - F;
-                if (gap >= -2 && gap <= 23) { chainP = p; vc = v; return true; }
-            }
-        }
-        return false;
-    }
-
-    // ---- 老格式索引定位 (MaterialLib 前 0x4000) ----
-    static bool FindIndices(byte[] d, int mtl, out int ih, out int icnt, out int idx0)
-    {
-        ih = -1; icnt = 0; idx0 = 0;
-        int segEnd = mtl - 4, lo = Math.Max(0x20, mtl - 0x4000);
-        for (int o = lo; o < segEnd - 16; o++)
-        {
-            int c = U32(d, o);
-            int n = (segEnd - o - 4) / 2;
-            if (c <= 3 || c > n + 4 || Math.Abs(c - n) > 4) continue;
-            int chk = Math.Min(8, n);
-            bool ok = true;
-            for (int i = 0; i < chk; i++)
-            {
-                int v = U16(d, o + 4 + 2 * i);
-                if (v >= 0x0fff && v != 0xffff) { ok = false; break; }
-            }
-            if (!ok) continue;
-            ih = o; icnt = c; idx0 = o + 4; return true;
-        }
-        return false;
-    }
-
-    // ---- 新格式 walk2: 组30B/尾21B, pos 放宽 ±500, 支持部分解析 ----
-    static float Walk2(byte[] d, int start, int vc, bool allowPartial, out int endP, List<Vtx> verts, List<Vector2> uvs)
-    {
-        int p = start; long ok = 0, tot = 0; int F = d.Length;
-        endP = p; verts.Clear(); if (uvs != null) uvs.Clear();
-        for (int i = 0; i < vc; i++)
-        {
-            if (p + 4 > F)
-            {
-                if (allowPartial && verts.Count >= 3) { endP = p; return tot > 0 ? (float)ok / tot : 0f; }
-                endP = p; return -1f;
-            }
-            int nb = U32(d, p); p += 4;
-            if (nb < 1 || nb > 8)
-            {
-                if (allowPartial && verts.Count >= 3) { endP = p; return tot > 0 ? (float)ok / tot : 0f; }
-                endP = p; return -1f;
-            }
-            var v = new Vtx(); v.bid = new byte[nb]; v.w = new float[nb]; v.pos = new Vector3[nb];
-            bool bad = false;
-            for (int j = 0; j < nb; j++)
-            {
-                if (p + 29 > F) { bad = true; break; }
-                byte bone = d[p]; float w = F32(d, p + 1);
-                if (bone > 200 || w < 0f || w > 1.02f) { bad = true; break; }
-                float x = F32(d, p + 5), y = F32(d, p + 9), z = F32(d, p + 13);
-                if (x <= -500f || x >= 500f || y <= -500f || y >= 500f || z <= -500f || z >= 500f) { bad = true; break; }
-                float nx = F32(d, p + 17), ny = F32(d, p + 21), nz = F32(d, p + 25);
-                float n2 = nx * nx + ny * ny + nz * nz;
-                tot++; if (n2 > 0.8f && n2 < 1.2f) ok++;
-                v.bid[j] = bone; v.w[j] = w; v.pos[j] = new Vector3(x, y, z);
-                p += 30;
-            }
-            if (bad)
-            {
-                if (allowPartial && verts.Count >= 3) { endP = p; return tot > 0 ? (float)ok / tot : 0f; }
-                endP = p; return -1f;
-            }
-            if (p + 21 <= F)
-            {
-                p += 21;                                       // flag + tangent + uv
-                if (uvs != null) uvs.Add(new Vector2(F32(d, p - 8), F32(d, p - 4)));
-            }
-            else
-            {
-                if (allowPartial && verts.Count >= 3) { endP = p; return tot > 0 ? (float)ok / tot : 0f; }
-                endP = p; return -1f;
-            }
-            verts.Add(v);
-        }
-        endP = p;
-        return tot > 0 ? (float)ok / tot : 0f;
-    }
-
-    // ---- 裸顶点流兜底 (无 vc 声明, 逐顶点校验直到失败) ----
-    static float WalkFree(byte[] d, int start, out int endP, List<Vtx> verts, List<Vector2> uvs)
-    {
-        int p = start; long ok = 0, tot = 0; int F = d.Length;
-        endP = p; verts.Clear(); if (uvs != null) uvs.Clear();
-        while (p + 55 <= F)
-        {
-            int nb = U32(d, p);
-            if (nb < 1 || nb > 8) break;
-            int q = p + 4; bool good = true;
-            var v = new Vtx(); v.bid = new byte[nb]; v.w = new float[nb]; v.pos = new Vector3[nb];
-            for (int j = 0; j < nb; j++)
-            {
-                if (q + 30 > F) { good = false; break; }
-                byte bone = d[q]; float w = F32(d, q + 1);
-                if (bone > 200 || w < 0f || w > 1.02f) { good = false; break; }
-                float x = F32(d, q + 5), y = F32(d, q + 9), z = F32(d, q + 13);
-                if (x <= -500f || x >= 500f || y <= -500f || y >= 500f || z <= -500f || z >= 500f) { good = false; break; }
-                float nx = F32(d, q + 17), ny = F32(d, q + 21), nz = F32(d, q + 25);
-                float n2 = nx * nx + ny * ny + nz * nz;
-                tot++; if (n2 > 0.8f && n2 < 1.2f) ok++;
-                v.bid[j] = bone; v.w[j] = w; v.pos[j] = new Vector3(x, y, z);
-                q += 30;
-            }
-            if (!good) break;
-            if (q + 21 > F) break;
-            q += 1;                                            // flag
-            q += 12;                                           // tangent
-            if (uvs != null) uvs.Add(new Vector2(F32(d, q), F32(d, q + 4)));
-            q += 8;
-            verts.Add(v); p = q;
-        }
-        endP = p;
-        float rate = tot > 0 ? (float)ok / tot : 0f;
-        return (verts.Count >= 30 && rate >= 0.85f) ? rate : -1f;
-    }
-
-    // ---- 新格式全解析 (parse_ski_v3): 索引表前置 + partN 链 + MaterialLib 后顶点块 ----
-    static SkiData ParseSkiV3(byte[] d)
-    {
-        var sd = new SkiData();
-        int F = d.Length;
-        int mtl = IndexOf(d, "CRT_MaterialLib", 0);
-        if (mtl < 0) throw new Exception("新格式: 无 MaterialLib");
-        // A. 索引表区
-        int p1 = -1;
-        int hiA = Math.Min(0x160, mtl - 16);
-        for (int p = 0x10; p < hiA; p++)
-        {
-            int v = U32(d, p);
-            if (v < 3 || v > 30000) continue;
-            if (p + 4 + 2 * v > mtl + 8) continue;
-            bool ok = true;
-            int chk = Math.Min(16, v);
-            for (int i = 0; i < chk; i++)
-            {
-                int w = U16(d, p + 4 + 2 * i);
-                if (w >= 8192 && w != 0xffff) { ok = false; break; }
-            }
-            if (!ok) continue;
-            int end = p + 4 + 2 * v;
-            if (end + 8 >= mtl || d[end] == 0x01 || U32(d, end) <= 1) { p1 = p; break; }
-        }
-        if (p1 < 0) throw new Exception("新格式: 索引表头未定位");
-        int cur = p1 + 4 + 2 * U32(d, p1);
-        int nparts = 1;
-        while (cur + 20 < mtl && nparts < 32)
-        {
-            while (cur < mtl && d[cur] == 0) cur++;
-            if (cur >= mtl - 20 || d[cur] != 0x01) break;
-            int q = cur + 1; bool good = true;
-            for (int t = 0; t < 2; t++)
-            {
-                int ln = U32(d, q);
-                if (ln < 2 || ln > 48 || q + 4 + ln > F) { good = false; break; }
-                if (!Printable(d, q + 4, ln)) { good = false; break; }
-                q += 4 + ln;
-            }
-            if (!good) break;
-            int icnt = U32(d, q);
-            if (icnt < 3 || icnt > 30000 || q + 4 + 2 * icnt > mtl + 8) break;
-            nparts++;
-            cur = q + 4 + 2 * icnt;
-        }
-        int idxEnd = cur;
-        // B. 顶点区
-        var tVerts = new List<Vtx>(); var tUvs = new List<Vector2>();
-        var tmpV = new List<Vtx>(); var tmpU = new List<Vector2>();
-        int pB = mtl;
-        while (pB < F - 64)
-        {
-            bool advanced = false;
-            int ln = U32(d, pB);
-            string name = null;
-            if (ln >= 4 && ln <= 40 && pB + 4 + ln <= F)
-            {
-                if (Printable(d, pB + 4, ln)) name = Str(d, pB + 4, ln);
-            }
-            if (name != null)
-            {
-                int qHi = Math.Min(pB + 4 + ln + 260, F - 64);
-                for (int q = pB + 4 + ln; q < qHi; q++)
+                if (firstA)
                 {
-                    int vc = U32(d, q);
-                    if (vc < 3 || vc > 30000) continue;
-                    int sHi = Math.Min(q + 4 + 80, F - 64);
-                    for (int s0 = q + 4; s0 < sHi; s0++)
-                    {
-                        int end2;
-                        float r = Walk2(d, s0, vc, true, out end2, tmpV, tmpU);
-                        if (r >= 0f && r >= 0.85f)
-                        {
-                            tVerts.AddRange(tmpV); tUvs.AddRange(tmpU);
-                            pB = end2; advanced = true; break;
-                        }
-                    }
-                    if (advanced) break;
+                    if (o + 26 > F) return null;
+                    var r = new SkiRec(); r.t = 'A'; r.vc = U32(d, o + 2);
+                    r.nor = new Vector3(F32(d, o + 6), F32(d, o + 10), F32(d, o + 14));
+                    r.uv = new Vector2(F32(d, o + 18), F32(d, o + 22));
+                    recs.Add(r); o += 26; firstA = false;
                 }
-                if (advanced) continue;
-                pB += 4 + ln; continue;
-            }
-            // 无名字块: vc续排 / 裸流 / 前进1B
-            bool hit = false;
-            int vc2 = U32(d, pB);
-            if (vc2 >= 3 && vc2 <= 30000)
-            {
-                int sHi = Math.Min(pB + 4 + 120, F - 64);
-                for (int s0 = pB + 4; s0 < sHi; s0++)
+                else
                 {
-                    int end2;
-                    float r = Walk2(d, s0, vc2, true, out end2, tmpV, tmpU);
-                    if (r >= 0f && r >= 0.85f)
-                    {
-                        tVerts.AddRange(tmpV); tUvs.AddRange(tmpU);
-                        pB = end2; hit = true; break;
-                    }
+                    if (o + 22 > F) return null;
+                    var r = new SkiRec(); r.t = 'A';
+                    r.nor = new Vector3(F32(d, o + 2), F32(d, o + 6), F32(d, o + 10));
+                    r.uv = new Vector2(F32(d, o + 14), F32(d, o + 18));
+                    recs.Add(r); o += 22;
                 }
             }
-            if (!hit)
+            else if (t0 == 1 && t1 != 0)
             {
-                int end2;
-                float r = WalkFree(d, pB, out end2, tmpV, tmpU);
-                if (r >= 0f) { tVerts.AddRange(tmpV); tUvs.AddRange(tmpU); pB = end2; hit = true; }
+                if (o + 30 > F) return null;
+                var r = new SkiRec(); r.t = 'C'; r.bone = t1; r.w = F32(d, o + 2);
+                r.pos = new Vector3(F32(d, o + 6), F32(d, o + 10), F32(d, o + 14));
+                r.nor = new Vector3(F32(d, o + 18), F32(d, o + 22), F32(d, o + 26));
+                recs.Add(r); o += 30;
             }
-            if (hit) continue;
-            pB += 1;
+            else if (t0 >= 1 && t0 <= 8 && t1 == 0 && d[o + 2] == 0 && d[o + 3] == 0)
+            {
+                if (o + 33 > F) return null;
+                var r = new SkiRec(); r.t = 'R'; r.n = t0; r.bone = d[o + 4]; r.w = F32(d, o + 5);
+                r.pos = new Vector3(F32(d, o + 9), F32(d, o + 13), F32(d, o + 17));
+                r.nor = new Vector3(F32(d, o + 21), F32(d, o + 25), F32(d, o + 29));
+                recs.Add(r); o += 33;
+            }
+            else return null;   // 未识别 → 起点错误
         }
-        if (tVerts.Count == 0) throw new Exception("新格式: 顶点区未解析");
-        // C. 索引 → 三角 (全局池)
-        int vtot = tVerts.Count;
-        var raw = new List<int>();
-        int n1 = U32(d, p1);
-        for (int i = 0; i < n1; i++) raw.Add(U16(d, p1 + 4 + 2 * i));
-        cur = p1 + 4 + 2 * U32(d, p1);
-        while (cur + 20 < idxEnd)
+        return recs;
+    }
+
+    static int FindVertStart(byte[] d, int mtl)
+    {
+        int F = d.Length, best = -1, bestn = 0;
+        int lo = mtl > 0 ? mtl : 0;
+        int hi = Math.Min(lo + 0x400, F - 40);
+        for (int p = lo; p < hi; p++)
         {
-            while (cur < idxEnd && d[cur] == 0) cur++;
-            if (cur >= idxEnd - 20 || d[cur] != 0x01) break;
-            int q = cur + 1;
-            for (int t = 0; t < 2; t++)
-            {
-                int l2 = U32(d, q);
-                if (l2 < 2 || l2 > 48) break;
-                q += 4 + l2;
-            }
-            int ic = U32(d, q);
-            if (ic >= 3 && ic <= 30000 && q + 4 + 2 * ic <= idxEnd + 8)
-            {
-                for (int i = 0; i < ic; i++) raw.Add(U16(d, q + 4 + 2 * i));
-                cur = q + 4 + 2 * ic;
-            }
-            else break;
+            if (d[p] != 1 || d[p + 1] != 1) continue;
+            var recs = WalkVerts(d, p);
+            if (recs == null) continue;
+            if (recs.Count > bestn) { best = p; bestn = recs.Count; }
+            if (recs.Count > 10 && d[F - 3] == 1 && d[F - 2] == 1 && d[F - 1] == 1)
+                return p;   // walk 恰好贯穿到 EOF-3 尾标 → 唯一真起点
         }
-        for (int i = 0; i + 2 < raw.Count; i += 3)
+        return best;
+    }
+
+    // 所有 CRT_Mtl* 块后的候选锚名 (wai_01 第一块引用头部贴图、第二块才是本体 → 全收集按序尝试)
+    static List<string> ExtractAnchors(byte[] d)
+    {
+        var res = new List<string>();
+        int from = 0;
+        while (true)
         {
-            int a = raw[i], b = raw[i + 1], c = raw[i + 2];
-            if (a < vtot && b < vtot && c < vtot) { sd.tris.Add(a); sd.tris.Add(b); sd.tris.Add(c); }
+            int m = IndexOf(d, "CRT_Mtl", from);
+            if (m < 0) break;
+            int s = m + 7, hi = Math.Min(s + 220, d.Length);
+            int i = s;
+            while (i < hi)
+            {
+                int j = i;
+                while (j < hi && IsW(d[j])) j++;
+                if (j - i >= 4 && j - i <= 32)
+                {
+                    string cand = Encoding.ASCII.GetString(d, i, j - i);
+                    if (!cand.StartsWith("CRT") && !cand.StartsWith("0_") && cand != "Standard" && cand != "Mu" && !res.Contains(cand)) res.Add(cand);
+                }
+                i = (j > i) ? j + 1 : i + 1;
+            }
+            from = m + 7;
         }
-        sd.verts = tVerts; sd.uv = tUvs; sd.rawN = raw.Count;
-        double lost = sd.rawN > 0 ? 1.0 - (sd.tris.Count * 3.0 / sd.rawN) : 0;
-        sd.fmt = "new(" + nparts + "段)" + (lost > 0.05 ? string.Format(" PARTIAL{0:P0}", lost) : "");
-        return sd;
+        return res;
+    }
+
+    static void FlushVtx(List<Vtx> vtx, List<int> b, List<float> w, List<Vector3> p)
+    {
+        float s = 0; foreach (var x in w) s += x;
+        var v = new Vtx();
+        v.bid = b.ToArray(); v.w = w.ToArray(); v.pos = p.ToArray();
+        if (s > 1e-6f) for (int i = 0; i < v.w.Length; i++) v.w[i] /= s;
+        vtx.Add(v);
     }
 
     static SkiData ParseSki(byte[] d)
     {
+        int F = d.Length;
+        if (F < 64 || d[0] != 0xFF || d[1] != 0xFF) throw new Exception("非CRT对象流");
         var sd = new SkiData();
-        int mtl, chainP, vc;
-        var verts = new List<Vtx>(); var uvs = new List<Vector2>();
-        sd.fmt = "old";
-        bool okOld = FindChain(d, out mtl, out chainP, out vc, verts, uvs);
-        List<int> tris = null;
-        if (okOld)
+
+        // ---- A. CRT_SkelSkin: 骨架引用 + 子网格面表(大端) ----
+        int o = 4 + "CRT_SkelSkin".Length;
+        int nl = U32(d, o); o += 4;
+        if (nl < 1 || nl > 64 || o + nl + 6 > F) throw new Exception("SkelSkin头坏");
+        string skelRef = Str(d, o, nl); o += nl + 2;
+        int nsub = U32(d, o); o += 4;
+        if (nsub < 1 || nsub > 16) throw new Exception("子网格数异常 " + nsub);
+        for (int s = 0; s < nsub; s++)
         {
-            int ih, icnt, idx0;
-            if (FindIndices(d, mtl, out ih, out icnt, out idx0) && icnt >= Math.Max(12, vc / 2))
+            int l1 = U32(d, o); o += 4; if (l1 < 1 || l1 > 64 || o + l1 + 8 > F) throw new Exception("子网格名1坏");
+            o += l1;
+            int l2 = U32(d, o); o += 4; if (l2 < 1 || l2 > 64 || o + l2 + 8 > F) throw new Exception("子网格名2坏");
+            o += l2;
+            int cnt = U32(d, o); o += 4;
+            if (cnt < 3 || cnt > 60000 || o + 1 + cnt * 2 > F) throw new Exception("面表数异常 " + cnt);
+            o += 1;                                          // flag
+            for (int i = 0; i + 2 < cnt; i += 3)
             {
-                tris = new List<int>();
-                for (int i = 0; i + 2 < icnt; i += 3)
-                {
-                    int a = U16(d, idx0 + 2 * i), b = U16(d, idx0 + 2 * (i + 1)), c = U16(d, idx0 + 2 * (i + 2));
-                    if (a < vc && b < vc && c < vc) { tris.Add(a); tris.Add(b); tris.Add(c); }
-                }
+                int a = (d[o + 2 * i] << 8) | d[o + 2 * i + 1];           // ★大端★
+                int b2 = (d[o + 2 * i + 2] << 8) | d[o + 2 * i + 3];
+                int c = (d[o + 2 * i + 4] << 8) | d[o + 2 * i + 5];
+                if (a == b2 || b2 == c || a == c) continue;               // 退化剔除
+                sd.tris.Add(a); sd.tris.Add(b2); sd.tris.Add(c);
+            }
+            o += cnt * 2;
+        }
+
+        // ---- B. 材质锚名候选 ----
+        sd.anchors = ExtractAnchors(d);
+        sd.anchor = sd.anchors.Count > 0 ? sd.anchors[0] : "";
+
+        // ---- C. 顶点流 ----
+        int mtl0 = IndexOf(d, "CRT_Mtl", 0);
+        int start = FindVertStart(d, mtl0);
+        if (start < 0) throw new Exception("顶点流未定位");
+        var recs = WalkVerts(d, start);
+        if (recs == null || recs.Count < 3) throw new Exception("顶点流walk失败");
+
+        var aList = new List<SkiRec>();
+        int nR = 0, cCount = 0, declared = -1;
+        foreach (var r in recs)
+        {
+            if (r.t == 'A') { aList.Add(r); if (declared < 0 && r.vc > 0) declared = r.vc; }
+            else if (r.t == 'R') nR++;
+            else if (r.t == 'C') cCount++;
+        }
+        if (nR == 0) throw new Exception("0 顶点记录");
+
+        // 装配: R 开新顶点(首绑定), C 并入当前顶点, 权重归一
+        var vtx = new List<Vtx>(nR);
+        var curB = new List<int>(); var curW = new List<float>(); var curP = new List<Vector3>();
+        bool open = false;
+        foreach (var r in recs)
+        {
+            if (r.t == 'R')
+            {
+                if (open) FlushVtx(vtx, curB, curW, curP);
+                curB.Clear(); curW.Clear(); curP.Clear();
+                curB.Add(r.bone); curW.Add(r.w); curP.Add(r.pos);
+                open = true;
+            }
+            else if (r.t == 'C' && open)
+            {
+                curB.Add(r.bone); curW.Add(r.w); curP.Add(r.pos);
             }
         }
-        if (tris == null || tris.Count == 0 || verts.Count == 0)
-        {
-            var v3 = ParseSkiV3(d);
-            sd.verts = v3.verts; sd.uv = v3.uv; sd.tris = v3.tris; sd.fmt = v3.fmt; sd.rawN = v3.rawN;
-        }
-        else { sd.verts = verts; sd.uv = uvs; sd.tris = tris; }
-        sd.anchor = ExtractAnchor(d);
+        if (open) FlushVtx(vtx, curB, curW, curP);
+        sd.verts = vtx;
+
+        // UV: A_k 配顶点 k
+        sd.uv.Clear();
+        for (int k = 0; k < vtx.Count; k++)
+            sd.uv.Add(k < aList.Count ? aList[k].uv : Vector2.zero);
+
+        // 面表越界过滤
+        int vcp = vtx.Count, kept = 0;
+        var tris2 = new List<int>(sd.tris.Count);
+        for (int i = 0; i + 2 < sd.tris.Count; i += 3)
+            if (sd.tris[i] < vcp && sd.tris[i + 1] < vcp && sd.tris[i + 2] < vcp)
+            { tris2.Add(sd.tris[i]); tris2.Add(sd.tris[i + 1]); tris2.Add(sd.tris[i + 2]); kept += 3; }
+        int dropped = sd.tris.Count - kept;
+        sd.tris = tris2;
+        sd.rawN = kept;
+
+        sd.fmt = string.Format("v4.7(list) R{0}/C{1}/A{2}{3}{4}", nR, cCount, aList.Count,
+            (declared >= 0 && declared != nR) ? " 声明" + declared + "!" : "",
+            dropped > 0 ? " 丢" + (dropped / 3) + "角" : "") + " skel=" + skelRef;
         if (sd.verts.Count == 0) throw new Exception("0 顶点");
         if (sd.tris.Count == 0) throw new Exception("0 三角");
         return sd;
     }
 
-    // ---- 贴图锚名 (mass_produce v5 定案): CRT_Mtl(Standard|Mu) 后 160B 内首个非 CRT/0_ 串 ----
-    static string ExtractAnchor(byte[] d)
-    {
-        int m = IndexOf(d, "CRT_MtlStandard", 0);
-        int m2 = IndexOf(d, "CRT_MtlMu", 0);
-        int baseP = (m >= 0 && (m2 < 0 || m < m2)) ? m : m2;
-        if (baseP < 0) return "";
-        int s = baseP + 15, hi = Math.Min(s + 160, d.Length);
-        int i = s;
-        while (i < hi)
-        {
-            int j = i;
-            while (j < hi && IsW(d[j])) j++;
-            if (j - i >= 4 && j - i <= 32)
-            {
-                string cand = Encoding.ASCII.GetString(d, i, j - i);
-                if (!cand.StartsWith("CRT") && !cand.StartsWith("0_")) return cand;
-            }
-            i = (j > i) ? j : i + 1;
-        }
-        return "";
-    }
     static bool IsW(byte c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'; }
 
-    // ---- resolve_tex 链: 原名 → 剥尾字符 → 层后缀 → 无下划线 ----
-    static string ResolveTex(string anchor)
+    // ---- v4.7 贴图解析: 多锚名 × {裸名, a_前缀} × {全名, 剥尾字符} × {dds,png}, 同族优先 ----
+    static bool IsDigits(string s) { if (s.Length == 0) return false; foreach (var ch in s) if (ch < '0' || ch > '9') return false; return true; }
+
+    static string ResolveTex(string skiName, List<string> anchors)
     {
-        if (string.IsNullOrEmpty(anchor)) return null;
-        string n = anchor.ToLower();
-        var cands = new List<string>();
-        cands.Add(n);
-        string na = Regex.Replace(n, @"a+$", "");              // aa/aaa/aaaa 配色变体
-        if (na.Length > 0 && na != n) cands.Add(na);
-        var tv1 = Regex.Replace(na, @"0[12]$", "").TrimEnd('_'); if (tv1.Length > 0) cands.Add(tv1);   // 01/02 编号变体
-        var tv3 = Regex.Replace(n, @"_\d+$", "").TrimEnd('_'); if (tv3.Length > 0 && !cands.Contains(tv3)) cands.Add(tv3);   // 变体尾号 _NN (wai_02_01 -> wai_02)
-        var tv4 = Regex.Replace(tv3, @"_\d+$", "").TrimEnd('_'); if (tv4.Length > 0 && !cands.Contains(tv4)) cands.Add(tv4);   // 两级尾号
-        var tv2 = Regex.Replace(n, @"0[12]$", "").TrimEnd('_'); if (tv2.Length > 0 && !cands.Contains(tv2)) cands.Add(tv2);
-        if (n.Length > 1) cands.Add(n.Substring(0, n.Length - 1));   // 保底单字符
-        var mm = Regex.Match(n, @"^(.+?)[_\-]?[aA][lLtTgG]?$");
-        if (mm.Success && mm.Groups[1].Value.Length > 0) cands.Add(mm.Groups[1].Value);
-        cands.Add(n.Replace("_", ""));
-        foreach (var c in cands)
+        if (anchors == null || anchors.Count == 0) return null;
+        string ski = (skiName ?? "").ToLower();
+        for (int pass = 0; pass < 2; pass++)
         {
-            foreach (var e in new[] { ".dds", ".png" })
+            foreach (var a0 in anchors)
             {
-                if (TexExists(c + e)) return c + e;
-            }
-            var m2 = Regex.Match(c, @"^(.*?)(\d+)$");          // 数字段递减回退
-            if (m2.Success && int.TryParse(m2.Groups[2].Value, out int k) && k > 0)
-            {
-                string pre = m2.Groups[1].Value, fmt = "D" + m2.Groups[2].Value.Length;
-                for (int d = k - 1; d >= 0 && d >= k - 3; d--)
+                string a = a0.ToLower();
+                bool fam = ski.Contains(a) || a.Contains(ski);
+                if (pass == 0 && !fam) continue;
+                if (pass == 1 && fam) continue;
+                for (int v = 0; v < 2; v++)
                 {
-                    string c2 = pre + d.ToString(fmt);
-                    foreach (var e2 in new[] { ".dds", ".png" })
-                        if (TexExists(c2 + e2)) return c2 + e2;
+                    string b = (v == 0 ? "" : "a_") + a;
+                    for (int k = 0; k < 3; k++)
+                    {
+                        string c = k == 0 ? b : (k == 1 && b.Length > 1 ? b.Substring(0, b.Length - 1) : b.Replace("_", ""));
+                        if (k == 2 && b.IndexOf('_') < 0) continue;
+                        foreach (var e in new[] { ".dds", ".png" })
+                            if (TexExists(c + e)) return c + e;
+                    }
                 }
             }
+        }
+        // 兜底: 由 ski 文件名派生 (a_wt_m_wai_01 → wt_m_wai_01 / a_wt_m_wai_01 / wt_m_wai ...)
+        string b2 = ski.StartsWith("a_") ? ski.Substring(2) : ski;
+        while (b2.Length > 3)
+        {
+            foreach (var pre in new[] { "", "a_" })
+            {
+                string b = pre + b2;
+                foreach (var c in new[] { b, b.Replace("_", "") })
+                    foreach (var e in new[] { ".dds", ".png" })
+                        if (TexExists(c + e)) return c + e;
+            }
+            int k = b2.LastIndexOf('_');
+            if (k < 0) break;
+            if (!IsDigits(b2.Substring(k + 1))) break;
+            b2 = b2.Substring(0, k);
         }
         return null;
     }
 
-    static Texture2D LoadTex(string anchor)
-    {
-        if (texCache.ContainsKey(anchor ?? "")) return texCache[anchor ?? ""];
-        string p = ResolveTex(anchor);
-        Texture2D tex = null;
-        if (p != null)
-        {
-            try
-            {
-                byte[] raw = ReadTexFile(p);
-            if (raw == null) throw new Exception("tex miss");
-                if (p.EndsWith(".dds")) tex = DdsV4.LoadFromMemory(raw, Path.GetFileNameWithoutExtension(p));
-                else
-                {
-                    tex = new Texture2D(2, 2, TextureFormat.RGBA32, false);
-                    if (!tex.LoadImage(raw)) tex = null;
-                }
-            }
-            catch (Exception) { tex = null; }
-        }
-        texCache[anchor ?? ""] = tex;
-        return tex;
-    }
+
 
     // ================================================================
     //                    LBS 烘焙 (mass_produce.bake_vertex 等价)
@@ -960,7 +836,7 @@ public class PreviewV4 : MonoBehaviour
     // ================================================================
     static void ShowCurrent()
     {
-        if (curSkiList.Count == 0) { line2 = "(本分类当前职业无模型)"; return; }
+        if (curSkiList.Count == 0) { line2 = "(本分类当前职业无模型) 池内: " + poolStat; return; }
         if (curIdx >= curSkiList.Count) curIdx = 0;
         curSki = curSkiList[curIdx];
         StartShow(curSki);
@@ -1004,12 +880,13 @@ public class PreviewV4 : MonoBehaviour
             SkiData sd = ParseSki(d);
             string tag;
             ActSkel sk = MatchSkel(name, out tag);
-            List<FramePose> W = (sk != null) ? LoadSkeleton(sk) : null;
+            List<FramePose> bind = (sk != null) ? LoadBind(sk) : null;
+            // 站姿调色板 = world(stand)×world(stand)⁻¹ = 恒等 → 静止渲染 = Σ w×pos (模型空间原样呈现)
 
             // 烘焙 → mesh
             int vc = sd.verts.Count;
             var vs = new Vector3[vc];
-            for (int i = 0; i < vc; i++) vs[i] = BakeVertex(W, sd.verts[i]);
+            for (int i = 0; i < vc; i++) vs[i] = BakeVertex(bind, sd.verts[i]);
             var mesh = new Mesh();
             mesh.vertices = vs;
             mesh.uv = sd.uv.GetRange(0, Math.Min(sd.uv.Count, vc)).ToArray();
@@ -1042,29 +919,28 @@ public class PreviewV4 : MonoBehaviour
             mat.color = new Color(0.72f, 0.72f, 0.76f);
             mr.sharedMaterial = mat;
 
-            line3 = string.Format("[v4] {0} {1} 顶点{2} 面{3} ski:{4}B | 骨架={5} | 贴图=...",
+            line3 = string.Format("[v4.7] {0} {1} 顶点{2} 面{3} ski:{4}B | 骨架={5} | 贴图=...",
                 sd.fmt, tag == "STATIC" ? "静态" : tag + ":" + (sk != null ? sk.srcName : ""),
                 vc, sd.tris.Count / 3, d.Length,
                 sk != null ? sk.srcName : "无");
 
-            // 骨骼动画播放 (act自带逐帧trans/quat)
-            int anf = 0;
-            if (sk != null) foreach (var bb in sk.bones) { if (bb.nf > anf) anf = bb.nf; }
+            // 骨骼动画播放 (act自带逐帧trans/quat, 层级复合+绑定相对)
+            int anf = sk != null && sk.bones.Count > 0 ? sk.bones[0].nf : 0;
             if (sk != null && anf > 1)
             {
-                _animSk = sk; _animSd = sd; _animMesh = mesh;
+                _animSk = sk; _animSd = sd; _animMesh = mesh; _animBind = bind;
                 _animCo = hostPv.StartCoroutine(PlayAnimCo());
                 line3 += string.Format(" \u25b6动画{0}帧", anf);
             }
             _skipGuard = 0;
 
-            // 贴图异步加载 (加载完成自动贴上)
-            if (!string.IsNullOrEmpty(sd.anchor) && hostPv != null)
-                hostPv.StartCoroutine(LoadTexCo(sd.anchor, mat));
+            // 贴图异步加载 (多锚名依次解析, 加载完成自动贴上)
+            if (sd.anchors != null && sd.anchors.Count > 0 && hostPv != null)
+                hostPv.StartCoroutine(LoadTexCo(name, sd.anchors, mat));
         }
         catch (Exception e)
         {
-            line3 = "[v4] " + name + " 解析失败: " + e.Message;
+            line3 = "[v4.7] " + name + " 解析失败: " + e.Message;
             if (curModel != null) { UnityEngine.Object.Destroy(curModel); curModel = null; }
             // 不完整部件自动跳过 (整圈全失败才停)
             if (hostPv != null && curSkiList.Count > 1 && _skipGuard < curSkiList.Count)
@@ -1076,16 +952,21 @@ public class PreviewV4 : MonoBehaviour
         }
     }
 
-    static System.Collections.IEnumerator LoadTexCo(string anchor, Material mat)
+    static readonly Dictionary<string, string> texResCache = new Dictionary<string, string>();
+
+    static string ResolveTexCached(string skiName, List<string> anchors)
     {
-        string key = anchor ?? "";
-        if (texCache.TryGetValue(key, out var tc) && tc != null)
-        {
-            if (mat != null) { mat.mainTexture = tc; mat.color = Color.white; }
-            line3 += " ✓(缓存)";
-            yield break;
-        }
-        string p = ResolveTex(anchor);
+        string key = skiName + "|" + (anchors != null && anchors.Count > 0 ? anchors[0] : "");
+        string p;
+        if (texResCache.TryGetValue(key, out p)) return p;
+        p = ResolveTex(skiName, anchors);
+        texResCache[key] = p;
+        return p;
+    }
+
+    static System.Collections.IEnumerator LoadTexCo(string skiName, List<string> anchors, Material mat)
+    {
+        string p = ResolveTexCached(skiName, anchors);
         if (p == null)
         {
             if (_texSample == null)
@@ -1095,7 +976,15 @@ public class PreviewV4 : MonoBehaviour
                 for (int i = 0; i < ls.Length && i < 6; i++) { if (i > 0) tsb.Append(','); tsb.Append(ls[i]); }
                 _texSample = ls.Length == 0 ? "(目录空)" : tsb.ToString();
             }
-            line3 += " ✗未找到 样本[" + _texSample + "]";
+            string baseN = skiName.ToLower(); if (baseN.StartsWith("a_")) baseN = baseN.Substring(2);
+            bool famTex = TexExists(baseN + ".dds") || TexExists("a_" + baseN + ".dds");
+            line3 += " ✗未找到[" + (famTex ? "池有同名贴图但锚名未命中" : "池无此贴图→需注入") + "] 样本[" + _texSample + "]";
+            yield break;
+        }
+        if (texCache.TryGetValue(p, out var tc) && tc != null)
+        {
+            if (mat != null) { mat.mainTexture = tc; mat.color = Color.white; }
+            line3 += " ✓(缓存)";
             yield break;
         }
         byte[] raw = null;
@@ -1109,8 +998,7 @@ public class PreviewV4 : MonoBehaviour
         }
         else
         {
-            string fp = Path.Combine(texDir, p);
-            if (File.Exists(fp)) { try { raw = File.ReadAllBytes(fp); } catch (Exception) { raw = null; } }
+            try { raw = File.ReadAllBytes(Path.Combine(texDir, p)); } catch (Exception) { raw = null; }
         }
         Texture2D t = null;
         if (raw != null)
@@ -1120,11 +1008,11 @@ public class PreviewV4 : MonoBehaviour
         }
         if (t != null)
         {
-            texCache[key] = t;
+            texCache[p] = t;
             if (mat != null) { mat.mainTexture = t; mat.color = Color.white; }
             line3 += " ✓" + p;
         }
-        else line3 += " ✗解码失败";
+        else line3 += " ✗解码失败:" + p;
     }
 
     // ================================================================
@@ -1140,13 +1028,7 @@ public class PreviewV4 : MonoBehaviour
         btn = new GUIStyle(GUI.skin.button); btn.fontSize = 20; btn.alignment = TextAnchor.MiddleLeft;
     }
 
-    void PauseBtn()
-    {
-        if (GUI.Button(new Rect(12, 12, 150, 64), AnimPaused ? "▶ 继续" : "⏸ 暂停"))
-            AnimPaused = !AnimPaused;
-    }
-
-    void OnGUI() { PauseBtn(); DrawUI(); }
+    void OnGUI() { DrawUI(); }
     static void DrawUI()
     {
         InitStyle();
