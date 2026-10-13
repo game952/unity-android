@@ -1,13 +1,17 @@
-// PreviewV4.cs — v4.1 整装拼合预览台(APK数据注入) (2026-10-11)
+// PreviewV4.cs — v4.8 整装拼合预览台 (2026-10-13)
 // ============================================================
-// 移植自 crt_pipeline v3.2.1（3603/3603 全绿实证方案, 逐行等价翻译）:
-//   ski_core.py     → ski 双格式解析 (老格式 组30B/尾21B + 新格式v3全链+裸流兜底)
-//   act_parse.py    → role_*.act 骨架解析 (1.0f 头定位 + 双锚点扫描)
-//   mass_produce.py → LBS 烘焙 p=Σw·(R·pos+t), 帧3736站立, 骨架自动匹配
-//   DdsLoader.cs    → DDS 解码 (内嵌改名 DdsV4, 避免与工程旧类冲突)
-// 修复 v3.9 遗留: 多骨骼穿戴部件(衣/手/靴/头饰)炸裂 = Kabsch对齐路线缺陷,
-//               v4 改用 act 骨架池 + 标准蒙皮烘焙 (量产管线同源)
-// 纯代码方案: [RuntimeInitializeOnLoadMethod] 免编辑器挂场景
+// v4.8 修复清单（对应 MEMO 待修清单，全部落地）:
+//  ① P0 网格炸裂/碎片: ski 解析整个重写 = ski_obj.py(297-OBJ 验证版)逐行移植:
+//     顶点 = [u32 nbk][nbk×30B 绑定块(u8骨id, f32权重, f32×3 pos, f32×3法线, 1B垫)][u8 05][f32×3 tangent][f32×2 uv]
+//     面表 = 小端 u16 序列 (v4.7 误用大端 + 误把骨架父索引表当面表 + 自创 R/C/A 记录机 → 碎片/全灭)
+//     顶点流定位 = 自校验链式扫描(ski_final.py valid_rec 策略): 长链者胜
+//  ② P0 白模: 贴图解析改为 ski 文件名同名优先(池内 1:1) → 数字尾剥离 → 锚名清洗 → 家族兜底
+//  ③ P0 骨架错配: 只认 role_{职业}_{性别}_*.act; 无匹配 → 静态渲染(首绑定块原始坐标), 删除"抓第一个骨架"的错配兜底
+//  ④ P0 武器/怪物/坐骑: CRT_Actor(.act) 内嵌网格 → 点云渲染 (act_dissect v0.12 布局移植, 盲同步节点表)
+//  ⑤ P1 解析失败不再整类静默跳过: 报错停在当前件, 手动翻页
+//  ⑥ P1 UI 紧凑化: 顶栏 86→58, 标题 22→15, 左列 300×40→186×26, 分类按槽位排序, 职业/底栏同步缩小
+// 骨架动画 (act_parse.py 等价) 与 LBS 烘焙 (mass_produce.bake_vertex 等价) 保持不变。
+// DDS 解码 DdsV4 保持不变。
 // ============================================================
 using System;
 using System.Collections.Generic;
@@ -20,25 +24,25 @@ using UnityEngine.Networking;
 
 public class PreviewV4 : MonoBehaviour
 {
-    // ===== 真机校准常量 (验收不对时只改这里重推) =====
+    // ===== 真机校准常量 =====
     static readonly Vector3 ModelRot = new Vector3(-90f, 0f, 0f); // 源数据 z-up → Unity y-up
-    const int FrameStand = 3736;   // 自然站立帧 (与量产 --frame 默认一致)
-    const float FitSize = 3.4f;    // 大件归一化最大边(甲袍/外装)
-    static float _zoom = 1f;       // 手动缩放(底部＋－)
+    const int FrameStand = 3736;
+    const float FitSize = 3.4f;
+    static float _zoom = 1f;
     static string _texSample = null;
     // 骨骼动画播放状态
     static ActSkel _animSk; static SkiData _animSd; static Mesh _animMesh; static List<FramePose> _animBind;
-    static Coroutine _animCo; static int _skipGuard;
+    static Coroutine _animCo;
     const float AnimFps = 24f;
     static System.Collections.IEnumerator PlayAnimCo()
     {
         var wait = new WaitForSeconds(1f / AnimFps);
         int nf = 0; foreach (var b in _animSk.bones) { if (b.nf > nf) nf = b.nf; }
-        if (nf <= 1) yield break;   // 静态部件无动画
+        if (nf <= 1) yield break;
         while (_animSk != null && _animMesh != null && _animSd != null)
         {
             int f = (int)(Time.time * AnimFps) % nf;
-            var W2 = LoadSkeleton(_animSk, f, _animBind);   // 绑定相对调色板 (站姿=恒等)
+            var W2 = LoadSkeleton(_animSk, f, _animBind);
             var vs = new Vector3[_animMesh.vertexCount];
             for (int i = 0; i < vs.Length; i++) vs[i] = BakeVertex(W2, _animSd.verts[i]);
             _animMesh.vertices = vs;
@@ -46,14 +50,16 @@ public class PreviewV4 : MonoBehaviour
             yield return wait;
         }
     }
-    // 按部件类型的合理预览尺寸: 小件不再被撑成大件
+    // 按部件类型的合理预览尺寸
     static float FitFor(string name)
     {
         string n = (name ?? "").ToLower();
-        if (n.Contains("sho") || n.Contains("glo")) return 1.0f;  // 长靴/手套
-        if (n.Contains("hea")) return 0.9f;                       // 头部
-        if (n.Contains("swd") || n.Contains("axe") || n.Contains("spe") || n.Contains("bow")) return 1.7f; // 武器
-        return 1.8f;                                              // 甲袍/外装等大件
+        if (n.Contains("sho") || n.Contains("glo")) return 1.0f;
+        if (n.Contains("hea")) return 0.9f;
+        if (n.Contains("swd") || n.Contains("axe") || n.Contains("spe") || n.Contains("bow")) return 1.7f;
+        if (RegexWeaponAct.IsMatch(n)) return 1.7f;               // 武器 act
+        if (n.Contains("chibang") || n.Contains("iwgong")) return 2.4f; // 翅膀
+        return 1.8f;
     }
 
     // ===== 运行状态 =====
@@ -64,25 +70,30 @@ public class PreviewV4 : MonoBehaviour
     static string CurJob { get { return Jobs[jobI]; } }
     static string CurSex { get { return Sexes[sexI]; } }
     static string curSki = "";
-    static int catI = 2;           // 默认甲袍(衣物, 验收最关键)
+    static int catI = 2;           // 默认甲胄
     static float rotY = 0f;
     static GameObject pivot, curModel;
     static string title = "", line2 = "", line3 = "";
     static readonly Dictionary<string, ActSkel> skelCache = new Dictionary<string, ActSkel>();
     static readonly Dictionary<string, Texture2D> texCache = new Dictionary<string, Texture2D>();
-    static List<string> actPool;   // role_*.act 全池
+    static List<string> actPool;   // role_*.act 骨架池
 
     static readonly string[] Cats = {
-        "武器·刀剑(槽1)", "武器·斧杵(槽2)", "甲袍·防具(3)", "头部(脸)",
+        "武器·刀剑(槽1)", "武器·斧钺(槽2)", "甲胄·防具(3)", "头部(脸)",
         "手套·防具(1)", "长靴·防具(2)", "外装", "其他部件", "怪物/坐骑" };
-    static List<string> catFiles = new List<string>();
+    // 左列显示顺序(按槽位): 甲胄→外装→头部→手套→长靴→刀剑→斧钺→其他→怪物
+    static readonly int[] CatOrder = { 2, 6, 3, 4, 5, 0, 1, 7, 8 };
+    static readonly Regex RegexWeaponAct = new Regex(
+        @"^\d+(dao|zhan|jian|feng|shu|gong|qiang|axe|sword|spear|bow|stick|gun)",
+        RegexOptions.Compiled);
+    static List<string> catFiles = new List<string>();   // 含扩展名的文件名
 
     // ================================================================
     [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
     static void Boot()
     {
         try { SetupCam(); KillOthers(); Scan(); RebuildCat(); ShowCurrent(); }
-        catch (Exception e) { line3 = "[v4.7] 启动失败: " + e.Message; }
+        catch (Exception e) { line3 = "[v4.8] 启动失败: " + e.Message; }
         var host = new GameObject("~PreviewV4");
         UnityEngine.Object.DontDestroyOnLoad(host);
         var pv = host.AddComponent<PreviewV4>();
@@ -106,7 +117,7 @@ public class PreviewV4 : MonoBehaviour
         pivot.transform.position = new Vector3(0.9f, 0f, 0f);
     }
 
-    // ===== 资源路径探测: APK内StreamingAssets(AssetManager同步直读)优先, 外部目录兜底 =====
+    // ===== 资源路径探测: APK内StreamingAssets优先, 外部目录兜底 =====
     static PreviewV4 hostPv;
     static Coroutine _loadCo;
     static bool useAsset = false;
@@ -124,7 +135,6 @@ public class PreviewV4 : MonoBehaviour
     {
         try { return AM().Call<string[]>("list", dir); } catch (Exception) { return new string[0]; }
     }
-    // 显式 JNI 数组拷出: 复用已验证的 open 链, read 数据经拷贝取回
     static byte[] ReadAsset(string rel)
     {
         AndroidJavaObject is2 = null;
@@ -206,16 +216,20 @@ public class PreviewV4 : MonoBehaviour
     }
     static void Scan()
     {
-        // 1) APK 内 StreamingAssets (AssetManager 直读, 不依赖文件系统)
+        // 1) APK 内 StreamingAssets
         var pool = new List<string>();
+        int nSki = 0;
         foreach (var n in ListAssets("creature/actor"))
+        {
             if (n.StartsWith("role_") && n.EndsWith(".act")) pool.Add(n);
-        if (pool.Count > 0)
+            else if (n.EndsWith(".ski")) nSki++;
+        }
+        if (pool.Count > 0 || nSki > 0)
         {
             pool.Sort();
             actPool = pool; useAsset = true;
             actorDir = "asset:creature/actor"; texDir = "asset:creature/texture";
-            title = string.Format("v4.7 整装拼合 · APK数据注入 ({0} 骨架, StreamingAssets)", pool.Count);
+            title = string.Format("v4.8 整装拼合 · APK注入 ({0} 骨架/{1} ski, StreamingAssets)", pool.Count, nSki);
             return;
         }
         // 2) 外部目录兜底
@@ -229,15 +243,18 @@ public class PreviewV4 : MonoBehaviour
         {
             if (!Directory.Exists(c)) continue;
             var acts = Directory.GetFiles(c, "role_*.act");
-            if (acts.Length == 0) continue;
+            var skis = Directory.GetFiles(c, "*.ski");
+            if (acts.Length == 0 && skis.Length == 0) continue;
             actorDir = c; useAsset = false;
-            actPool = new List<string>(acts); actPool.Sort();
+            actPool = new List<string>();
+            foreach (var a in acts) actPool.Add(a);
+            actPool.Sort();
             string t = Path.GetDirectoryName(c) + "/texture";
             texDir = Directory.Exists(t) ? t : c;
-            title = string.Format("v4.7 整装拼合 · act骨架池+LBS烘焙 ({0} 骨架, 外部目录)", actPool.Count);
+            title = string.Format("v4.8 整装拼合 · 外部目录 ({0} 骨架/{1} ski)", actPool.Count, skis.Length);
             return;
         }
-        throw new Exception("未找到资源 (APK内StreamingAssets与外部目录均无 role_*.act)");
+        throw new Exception("未找到资源 (APK内StreamingAssets与外部目录均无数据)");
     }
 
     // ===== 池 + 分类 =====
@@ -247,14 +264,24 @@ public class PreviewV4 : MonoBehaviour
     {
         if (actPool == null) { curSkiList.Clear(); curIdx = 0; return; }
         catFiles.Clear();
-        IEnumerable<string> all;
+        List<string> all = new List<string>();
         if (useAsset)
         {
-            var l = new List<string>();
-            foreach (var f in ListAssets("creature/actor")) if (f.EndsWith(".ski")) l.Add(f);
-            all = l;
+            foreach (var f in ListAssets("creature/actor"))
+                if (f.EndsWith(".ski") || f.EndsWith(".act")) all.Add(f);
         }
-        else all = Directory.GetFiles(actorDir, "*.ski");
+        else
+        {
+            try
+            {
+                foreach (var f in Directory.GetFiles(actorDir))
+                {
+                    string ext = Path.GetExtension(f).ToLower();
+                    if (ext == ".ski" || ext == ".act") all.Add(Path.GetFileName(f));
+                }
+            }
+            catch (Exception) { }
+        }
 
         // 池内家族统计 (跨职业, 定位注入缺口)
         var fam = new Dictionary<string, int>();
@@ -262,9 +289,10 @@ public class PreviewV4 : MonoBehaviour
         foreach (var f in all)
         {
             string n = Path.GetFileNameWithoutExtension(f);
+            if (n.StartsWith("role_")) continue;
             if (n.StartsWith("a_")) { var seg = n.Split('_'); AddCnt(fam, seg.Length >= 3 ? seg[0] + "_" + seg[1] + "_" + seg[2] : "a_?"); }
-            else if (n.StartsWith("w_")) nw++;
-            else nm++;
+            else if (CatOf(n) == 0 || CatOf(n) == 1) nw++;
+            else if (CatOf(n) == 8) nm++;
         }
         {
             var sb = new System.Text.StringBuilder();
@@ -274,30 +302,39 @@ public class PreviewV4 : MonoBehaviour
                 if (sb.Length > 0) sb.Append(' ');
                 sb.Append("a_").Append(j).Append('_').Append(sx).Append('×').Append(c);
             }
-            sb.Append(" 武器×").Append(nw).Append(" 怪×").Append(nm);
+            sb.Append(" 武器×").Append(nw).Append(" 怪翅×").Append(nm);
             poolStat = sb.ToString();
         }
 
         foreach (var f in all)
         {
             string n = Path.GetFileNameWithoutExtension(f);
+            if (n.StartsWith("role_")) continue;                       // 骨架不进浏览列表
             bool take = false;
-            if (n.StartsWith("a_" + CurJob + "_" + CurSex + "_")) take = true;          // 当前职业部件
-            else if (n.StartsWith("w_") && n.Contains("_" + CurJob)) take = true;      // 当前职业武器
-            else if (!n.StartsWith("a_") && !n.StartsWith("w_")) take = true;          // 怪物/坐骑/通用
-            if (take) catFiles.Add(n);
+            if (n.StartsWith("a_" + CurJob + "_" + CurSex + "_")) take = true;   // 当前职业部件
+            else if (n.StartsWith("w_") && n.Contains("_" + CurJob)) take = true; // 当前职业武器ski
+            else if (CatOf(n) == 0 || CatOf(n) == 1) take = true;      // 武器(全职业通用)
+            else if (CatOf(n) == 8) take = true;                       // 怪物/坐骑/翅膀
+            if (take) catFiles.Add(f);
         }
         catFiles.Sort();
         FilterCat();
     }
 
-    static int CatOf(string n)
+    static int CatOf(string n)   // n 不带扩展名; -1 = 不收录
     {
         if (n.StartsWith("w_"))
         {
             int u = n.IndexOf('_', 2);
             string seg = u > 2 ? n.Substring(2, u - 2) : n.Substring(2);
             if (seg.EndsWith("c")) return 1;
+            return 0;
+        }
+        if (RegexWeaponAct.IsMatch(n))
+        {
+            var m = RegexWeaponAct.Match(n);
+            string fword = m.Groups[1].Value;
+            if (fword == "feng" || fword == "shu" || fword == "axe" || fword == "stick") return 1;
             return 0;
         }
         if (n.StartsWith("a_"))
@@ -309,13 +346,18 @@ public class PreviewV4 : MonoBehaviour
             if (n.Contains("_wai_")) return 6;
             return 7;
         }
-        return 8;
+        if (n.Contains("chibang") || n.Contains("iwgong") || n.StartsWith("mon")
+            || n.StartsWith("boss") || n.Contains("ride") || n.Contains("zuoqi")
+            || n.Contains("horse") || n.StartsWith("pet") || n.StartsWith("gua"))
+            return 8;
+        return -1;   // epf/eph/s_/skill 等特效动画不进列表
     }
 
     static void FilterCat()
     {
         List<string> keep = new List<string>();
-        foreach (var n in catFiles) if (CatOf(n) == catI) keep.Add(n);
+        foreach (var f in catFiles)
+            if (CatOf(Path.GetFileNameWithoutExtension(f)) == catI) keep.Add(f);
         curSkiList = keep;
         curIdx = 0;
     }
@@ -323,7 +365,7 @@ public class PreviewV4 : MonoBehaviour
     static int curIdx = 0;
 
     // ================================================================
-    //                    act 骨架解析 (act_parse.py 等价)
+    //                    act 骨架解析 (act_parse.py 等价, 不变)
     // ================================================================
     class Bone
     {
@@ -348,7 +390,7 @@ public class PreviewV4 : MonoBehaviour
         int o = FindPattern(d, tl + 4, new byte[] { 0x00, 0x00, 0x80, 0x3f }); // 1.0f 结束骨架名
         if (o < 0) throw new Exception("act 无 1.0f 头");
         o += 4;
-        o += 2;                                              // ver_flag + flag2
+        o += 2;
         int cnt = U32(d, o); o += 4;
         var sk = new ActSkel(); sk.srcName = srcName;
         int F = d.Length;
@@ -362,7 +404,7 @@ public class PreviewV4 : MonoBehaviour
             var b = new Bone(); b.name = name; b.parent = parent; b.nf = nf;
             if (nf == 0)
             {
-                o = FindNextAnchor(d, o);                    // 静态节点跳填充
+                o = FindNextAnchor(d, o);
                 sk.bones.Add(b);
                 continue;
             }
@@ -379,7 +421,6 @@ public class PreviewV4 : MonoBehaviour
         return sk;
     }
 
-    // 双锚点扫描: u32 len(1..20)+printable × 2 (act_parse.find_next_anchor)
     static int FindNextAnchor(byte[] d, int o)
     {
         int F = d.Length;
@@ -396,8 +437,7 @@ public class PreviewV4 : MonoBehaviour
         return F;
     }
 
-    // 四元数(x,y,z,w) → 3x3 行主序 (act_parse.quat_to_mat)
-    static void QuatToMat(float[] q, float[] R) // R: 9 (行主序)
+    static void QuatToMat(float[] q, float[] R)
     {
         float x = q[0], y = q[1], z = q[2], w = q[3];
         float n = x * x + y * y + z * z + w * w;
@@ -410,8 +450,7 @@ public class PreviewV4 : MonoBehaviour
 
     class FramePose { public float[] R = new float[9]; public float tx, ty, tz; }
 
-    // v4.7: 层级复合世界矩阵 + 绑定相对调色板 (station帧=绑定姿态 → 恒等)
-    static FramePose MatMul(FramePose A, FramePose B)   // A∘B
+    static FramePose MatMul(FramePose A, FramePose B)
     {
         var M = new FramePose();
         float[] a = A.R, b = B.R;
@@ -446,14 +485,13 @@ public class PreviewV4 : MonoBehaviour
         var fp = new FramePose();
         if (b.nf > 0)
         {
-            int f = frame >= b.nf ? b.nf - 1 : frame; if (f < 0) f = 0;   // clamp 保护
+            int f = frame >= b.nf ? b.nf - 1 : frame; if (f < 0) f = 0;
             QuatToMat(new[] { b.quats[f * 4], b.quats[f * 4 + 1], b.quats[f * 4 + 2], b.quats[f * 4 + 3] }, fp.R);
             fp.tx = b.trans[f * 3]; fp.ty = b.trans[f * 3 + 1]; fp.tz = b.trans[f * 3 + 2];
         }
-        else { fp.R[0] = fp.R[4] = fp.R[8] = 1f; }               // 静态骨恒等
+        else { fp.R[0] = fp.R[4] = fp.R[8] = 1f; }
         return fp;
     }
-    // bind = 站姿世界矩阵; 返回 world(frame)×bind⁻¹; bind=null → 直接返回 world
     static List<FramePose> LoadSkeleton(ActSkel sk, int frame, List<FramePose> bind)
     {
         int nb = sk.bones.Count;
@@ -476,12 +514,12 @@ public class PreviewV4 : MonoBehaviour
     }
     static List<FramePose> LoadBind(ActSkel sk) { return LoadSkeleton(sk, FrameStand, null); }
 
-    // ===== 骨架匹配 (mass_produce: a_(职业)_(性别)_ → role_x_y_*.act, 否则静态) =====
+    // ===== 骨架匹配: 只认同族骨架, 无匹配 → 静态 (v4.8: 删除错配兜底) =====
     static ActSkel MatchSkel(string skiName, out string tag)
     {
-        tag = "STATIC";
+        tag = "STATIC·未配骨架";
         var m = Regex.Match(skiName, @"^a_([a-z]+)_([fm])_");
-        if (!m.Success) return null;                                 // 怪物/武器/宠物 → 静态
+        if (!m.Success) return null;                    // 怪物/武器/宠物 → 静态
         string want = "role_" + m.Groups[1].Value + "_" + m.Groups[2].Value + "_";
         string path = null;
         foreach (var p in actPool)
@@ -489,12 +527,8 @@ public class PreviewV4 : MonoBehaviour
             string fn = Path.GetFileName(p);
             if (fn.StartsWith(want)) { path = p; break; }
         }
-        if (path == null)
-        {
-            path = actPool[0];                                       // fallback 首个骨架
-            tag = "FALLBACK->" + Path.GetFileName(path);
-        }
-        else tag = "OK";
+        if (path == null) return null;                  // 无同族骨架 → 静态渲染, 不再错配
+        tag = "OK";
         ActSkel sk;
         if (!skelCache.TryGetValue(path, out sk))
         {
@@ -505,9 +539,9 @@ public class PreviewV4 : MonoBehaviour
     }
 
     // ================================================================
-    //                    ski 解析 (ski_core.py 等价)
+    //            ski 解析 v4.8 — ski_obj.py 实测格式移植 (297-OBJ 验证)
     // ================================================================
-    class Vtx { public byte[] bid; public float[] w; public Vector3[] pos; }
+    class Vtx { public byte[] bid; public float[] w; public Vector3[] pos; public Vector3 pos0; }
 
     class SkiData
     {
@@ -515,8 +549,7 @@ public class PreviewV4 : MonoBehaviour
         public List<Vector2> uv = new List<Vector2>();
         public List<int> tris = new List<int>();
         public List<string> anchors = new List<string>();
-        public string anchor = "", fmt = "";
-        public int rawN;
+        public string skelRef = "", fmt = "";
     }
 
     static int U32(byte[] d, int o) { return (int)(BitConverter.ToUInt32(d, o)); }
@@ -540,8 +573,6 @@ public class PreviewV4 : MonoBehaviour
         }
         return -1;
     }
-
-    // byte 模式搜索 (含 >127 字节, 不能走 ASCII 字符串)
     static int FindPattern(byte[] d, int from, byte[] p)
     {
         for (int i = Math.Max(0, from); i <= d.Length - p.Length; i++)
@@ -552,82 +583,151 @@ public class PreviewV4 : MonoBehaviour
         }
         return -1;
     }
-
-    // ================================================================
-    //  ski 解析 v4.7 — A/R/C 已验证模型 (ski_export.py 297/297 文件闭环)
-    //  顶点 = R 记录; C = 当前顶点附加绑定 (R2+C 权重和=1); A = 法线+UV (A_k 配 R_k);
-    //  面表 = BE-u16 顶点序号 三角形列表 (引擎 rtc_skin_subset: GetFaceNum=size/3);
-    //  绑定坐标 = 模型空间 (点云已验证) → 静止渲染 = Σ w×pos
-    // ================================================================
-    class SkiRec { public char t; public int n, vc; public byte bone; public float w;
-                   public Vector3 pos, nor; public Vector2 uv; }
-
-    static List<SkiRec> WalkVerts(byte[] d, int start)
+    static string ReadCStr(byte[] d, ref int o, int maxn)
     {
-        int F = d.Length, o = start; bool firstA = true;
-        var recs = new List<SkiRec>();
-        while (o < F - 3)
+        int nl = U32(d, o);
+        if (nl < 1 || nl > maxn || o + 4 + nl > d.Length) throw new Exception("字符串字段异常 len=" + nl);
+        string s = Str(d, o + 4, nl);
+        o += 4 + nl;
+        return s;
+    }
+    static bool IsW(byte c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'; }
+    static bool IsDigits(string s) { if (s.Length == 0) return false; foreach (var ch in s) if (ch < '0' || ch > '9') return false; return true; }
+
+    // 顶点记录自校验链长 (ski_final.py valid_rec 策略)
+    static int ChainVtx(byte[] d, int p, int F)
+    {
+        int o = p, n = 0;
+        while (o < F - 8)
         {
-            if (o + 4 > F) return null;
-            byte t0 = d[o], t1 = d[o + 1];
-            if (t0 == 1 && t1 == 1)
+            if (o + 4 > F) break;
+            int nbk = U32(d, o);
+            if (nbk < 1 || nbk > 4) break;
+            int q = o + 4;
+            float tw = 0;
+            for (int i = 0; i < nbk; i++)
             {
-                if (firstA)
-                {
-                    if (o + 26 > F) return null;
-                    var r = new SkiRec(); r.t = 'A'; r.vc = U32(d, o + 2);
-                    r.nor = new Vector3(F32(d, o + 6), F32(d, o + 10), F32(d, o + 14));
-                    r.uv = new Vector2(F32(d, o + 18), F32(d, o + 22));
-                    recs.Add(r); o += 26; firstA = false;
-                }
-                else
-                {
-                    if (o + 22 > F) return null;
-                    var r = new SkiRec(); r.t = 'A';
-                    r.nor = new Vector3(F32(d, o + 2), F32(d, o + 6), F32(d, o + 10));
-                    r.uv = new Vector2(F32(d, o + 14), F32(d, o + 18));
-                    recs.Add(r); o += 22;
-                }
+                if (q + 30 > F) return n;
+                if (d[q] > 64) return n;
+                float w = F32(d, q + 1);
+                if (w < -0.01f || w > 1.001f) return n;
+                tw += w;
+                q += 30;
             }
-            else if (t0 == 1 && t1 != 0)
+            if (nbk > 1 && (tw < 0.5f || tw > 1.6f)) return n;
+            if (q + 21 <= F)
             {
-                if (o + 30 > F) return null;
-                var r = new SkiRec(); r.t = 'C'; r.bone = t1; r.w = F32(d, o + 2);
-                r.pos = new Vector3(F32(d, o + 6), F32(d, o + 10), F32(d, o + 14));
-                r.nor = new Vector3(F32(d, o + 18), F32(d, o + 22), F32(d, o + 26));
-                recs.Add(r); o += 30;
+                float u = F32(d, q + 13), v = F32(d, q + 17);
+                if (u < -8f || u > 8f || v < -8f || v > 8f) return n;
+                o = q + 21;
             }
-            else if (t0 >= 1 && t0 <= 8 && t1 == 0 && d[o + 2] == 0 && d[o + 3] == 0)
-            {
-                if (o + 33 > F) return null;
-                var r = new SkiRec(); r.t = 'R'; r.n = t0; r.bone = d[o + 4]; r.w = F32(d, o + 5);
-                r.pos = new Vector3(F32(d, o + 9), F32(d, o + 13), F32(d, o + 17));
-                r.nor = new Vector3(F32(d, o + 21), F32(d, o + 25), F32(d, o + 29));
-                recs.Add(r); o += 33;
-            }
-            else return null;   // 未识别 → 起点错误
+            else if (q <= F) { o = q; }          // 尾顶点: 缺 tangent/uv
+            else return n;
+            n++;
+            if (n > 60000) break;
         }
-        return recs;
+        return n;
     }
 
-    static int FindVertStart(byte[] d, int mtl)
+    static SkiData ParseSki(byte[] d)
     {
-        int F = d.Length, best = -1, bestn = 0;
-        int lo = mtl > 0 ? mtl : 0;
-        int hi = Math.Min(lo + 0x400, F - 40);
-        for (int p = lo; p < hi; p++)
+        int F = d.Length;
+        if (F < 64 || d[0] != 0xFF || d[1] != 0xFF) throw new Exception("非CRT对象流");
+        var sd = new SkiData();
+
+        // ---- A. 头: 网格名 + 骨架引用 + 骨架父索引表 (act_dissect.dissect_ski 布局) ----
+        if (F < 16 || Str(d, 4, 12) != "CRT_SkelSkin") throw new Exception("缺CRT_SkelSkin头");
+        int o = 16;
+        ReadCStr(d, ref o, 64);                      // 网格名
+        if (o + 6 > F) throw new Exception("ski头截断");
+        o += 2;                                      // u16 固定
+        o += 4;                                      // u32 固定
+        string skelRef = ReadCStr(d, ref o, 64);     // 骨架名
+        ReadCStr(d, ref o, 64);                      // 名2
+        int nb = U32(d, o); o += 4;
+        if (nb < 0 || nb > 512 || o + nb * 2 > F) throw new Exception("骨架表异常 nb=" + nb);
+        int headerEnd = o + nb * 2;                  // 父索引表(u16×nb)之后
+        sd.skelRef = skelRef;
+
+        // ---- B. 顶点流定位: 最长自校验链者胜 ----
+        int best = -1, bestN = 0;
+        for (int p = headerEnd; p < F - 60; p++)
         {
-            if (d[p] != 1 || d[p + 1] != 1) continue;
-            var recs = WalkVerts(d, p);
-            if (recs == null) continue;
-            if (recs.Count > bestn) { best = p; bestn = recs.Count; }
-            if (recs.Count > 10 && d[F - 3] == 1 && d[F - 2] == 1 && d[F - 1] == 1)
-                return p;   // walk 恰好贯穿到 EOF-3 尾标 → 唯一真起点
+            int n = ChainVtx(d, p, F);
+            if (n > bestN) { bestN = n; best = p; }
+            if (bestN > 4000) break;
         }
-        return best;
+        if (bestN < 8) throw new Exception("顶点流未定位(最长链" + bestN + ")");
+        int p2 = best;
+        while (p2 < F - 8)
+        {
+            if (p2 + 4 > F) break;
+            int nbk = U32(d, p2);
+            if (nbk < 1 || nbk > 4) break;
+            int q = p2 + 4;
+            var v = new Vtx();
+            v.bid = new byte[nbk]; v.w = new float[nbk]; v.pos = new Vector3[nbk];
+            for (int i = 0; i < nbk; i++)
+            {
+                v.bid[i] = d[q];
+                v.w[i] = F32(d, q + 1);
+                v.pos[i] = new Vector3(F32(d, q + 5), F32(d, q + 9), F32(d, q + 13));
+                q += 30;
+            }
+            v.pos0 = v.pos[0];
+            if (q + 21 <= F)
+            {
+                sd.uv.Add(new Vector2(F32(d, q + 13), F32(d, q + 17)));
+                p2 = q + 21;
+            }
+            else { sd.uv.Add(Vector2.zero); p2 = q; }
+            // 权重归一
+            float sw = 0; for (int i = 0; i < v.w.Length; i++) sw += v.w[i];
+            if (sw > 1e-6f) for (int i = 0; i < v.w.Length; i++) v.w[i] /= sw;
+            sd.verts.Add(v);
+        }
+        int vcp = sd.verts.Count;
+        if (vcp < 3) throw new Exception("0 顶点");
+
+        // ---- C. 面表: 小端 u16 (v4.7 误用大端 = 碎片化根因) ----
+        int runStart = -1, runLen = 0; bool runHot = false;
+        for (int p3 = headerEnd & ~1; p3 + 2 <= best; p3 += 2)
+        {
+            int v0 = U16(d, p3);
+            if (v0 < vcp)
+            {
+                if (runLen == 0) { runStart = p3; runHot = false; }
+                runLen++;
+                if (v0 >= 4) runHot = true;          // 排除全零填充
+            }
+            else { FlushRun(sd, d, runStart, runLen, runHot, vcp); runLen = 0; runHot = false; }
+        }
+        FlushRun(sd, d, runStart, runLen, runHot, vcp);
+        if (sd.tris.Count == 0) throw new Exception("0 面表");
+
+        // ---- D. 材质锚名 ----
+        sd.anchors = ExtractAnchors(d);
+
+        sd.fmt = string.Format("v4.8 顶点{0} 面{1} 流@0x{2:x} skel={3}{4}",
+            vcp, sd.tris.Count / 3, best, skelRef,
+            sd.anchors.Count > 0 ? " 锚" + sd.anchors.Count : "");
+        return sd;
+    }
+    static void FlushRun(SkiData sd, byte[] d, int runStart, int runLen, bool runHot, int vcp)
+    {
+        if (runLen < 9 || !runHot) return;
+        for (int i = 0; i + 2 < runLen; i += 3)
+        {
+            int a = U16(d, runStart + 2 * i);
+            int b2 = U16(d, runStart + 2 * i + 2);
+            int c = U16(d, runStart + 2 * i + 4);
+            if (a >= vcp || b2 >= vcp || c >= vcp) continue;
+            if (a == b2 || b2 == c || a == c) continue;
+            sd.tris.Add(a); sd.tris.Add(b2); sd.tris.Add(c);
+        }
     }
 
-    // 所有 CRT_Mtl* 块后的候选锚名 (wai_01 第一块引用头部贴图、第二块才是本体 → 全收集按序尝试)
+    // 所有 CRT_Mtl* 块后的候选锚名 (wai_01 第一块引用头部贴图 → 全收集按序尝试)
     static List<string> ExtractAnchors(byte[] d)
     {
         var res = new List<string>();
@@ -654,163 +754,158 @@ public class PreviewV4 : MonoBehaviour
         return res;
     }
 
-    static void FlushVtx(List<Vtx> vtx, List<int> b, List<float> w, List<Vector3> p)
+    // ================================================================
+    //            CRT_Actor 内嵌网格 (act_dissect v0.12 布局移植) — 武器/怪物
+    // ================================================================
+    class ActMeshData
     {
-        float s = 0; foreach (var x in w) s += x;
-        var v = new Vtx();
-        v.bid = b.ToArray(); v.w = w.ToArray(); v.pos = p.ToArray();
-        if (s > 1e-6f) for (int i = 0; i < v.w.Length; i++) v.w[i] /= s;
-        vtx.Add(v);
+        public List<Vector3> pts = new List<Vector3>();
+        public int nodes, meshes;
+        public string fmt = "";
+        public List<string> anchors = new List<string>();
     }
 
-    static SkiData ParseSki(byte[] d)
+    static bool ActStr(byte[] d, int off, ref string s, ref int end, int maxn, int minn)
+    {
+        s = null; end = 0;
+        if (off < 0 || off + 4 > d.Length) return false;
+        int n = U32(d, off);
+        if (n < minn || n > maxn || off + 4 + n > d.Length) return false;
+        if (!Printable(d, off + 4, n)) return false;
+        s = Str(d, off + 4, n); end = off + 4 + n;
+        return true;
+    }
+    static float NiceRatio(byte[] d, int off, int nfloats)
+    {
+        int n = Math.Min(nfloats, 300); if (n <= 0) return 0f;
+        int step = Math.Max(1, nfloats / n); int ok = 0, tot = 0;
+        for (int i = 0; i < nfloats; i += step)
+        {
+            if (off + i * 4 + 4 > d.Length) break;
+            float v = F32(d, off + i * 4);
+            if (v == v && v > -1e7f && v < 1e7f) ok++;
+            tot++;
+        }
+        return tot > 0 ? (float)ok / tot : 0f;
+    }
+    static int FindChunkAfter(byte[] d, int from)
     {
         int F = d.Length;
-        if (F < 64 || d[0] != 0xFF || d[1] != 0xFF) throw new Exception("非CRT对象流");
-        var sd = new SkiData();
-
-        // ---- A. CRT_SkelSkin: 骨架引用 + 子网格面表(大端) ----
-        int o = 4 + "CRT_SkelSkin".Length;
-        int nl = U32(d, o); o += 4;
-        if (nl < 1 || nl > 64 || o + nl + 6 > F) throw new Exception("SkelSkin头坏");
-        string skelRef = Str(d, o, nl); o += nl + 2;
-        int nsub = U32(d, o); o += 4;
-        if (nsub < 1 || nsub > 16) throw new Exception("子网格数异常 " + nsub);
-        for (int s = 0; s < nsub; s++)
+        for (int i = Math.Max(13, from); i + 4 < F - 4; i++)
         {
-            int l1 = U32(d, o); o += 4; if (l1 < 1 || l1 > 64 || o + l1 + 8 > F) throw new Exception("子网格名1坏");
-            o += l1;
-            int l2 = U32(d, o); o += 4; if (l2 < 1 || l2 > 64 || o + l2 + 8 > F) throw new Exception("子网格名2坏");
-            o += l2;
-            int cnt = U32(d, o); o += 4;
-            if (cnt < 3 || cnt > 60000 || o + 1 + cnt * 2 > F) throw new Exception("面表数异常 " + cnt);
-            o += 1;                                          // flag
-            for (int i = 0; i + 2 < cnt; i += 3)
-            {
-                int a = (d[o + 2 * i] << 8) | d[o + 2 * i + 1];           // ★大端★
-                int b2 = (d[o + 2 * i + 2] << 8) | d[o + 2 * i + 3];
-                int c = (d[o + 2 * i + 4] << 8) | d[o + 2 * i + 5];
-                if (a == b2 || b2 == c || a == c) continue;               // 退化剔除
-                sd.tris.Add(a); sd.tris.Add(b2); sd.tris.Add(c);
-            }
-            o += cnt * 2;
+            if (d[i] != 0xFF || d[i + 1] != 0xFF) continue;
+            int nl = U16(d, i + 2);
+            if (nl < 4 || nl > 64 || i + 4 + nl > F) continue;
+            if (!Printable(d, i + 4, nl)) continue;
+            int c0 = d[i + 4];
+            if (!((c0 >= 'A' && c0 <= 'Z') || (c0 >= 'a' && c0 <= 'z'))) continue;
+            return i;
         }
-
-        // ---- B. 材质锚名候选 ----
-        sd.anchors = ExtractAnchors(d);
-        sd.anchor = sd.anchors.Count > 0 ? sd.anchors[0] : "";
-
-        // ---- C. 顶点流 ----
-        int mtl0 = IndexOf(d, "CRT_Mtl", 0);
-        int start = FindVertStart(d, mtl0);
-        if (start < 0) throw new Exception("顶点流未定位");
-        var recs = WalkVerts(d, start);
-        if (recs == null || recs.Count < 3) throw new Exception("顶点流walk失败");
-
-        var aList = new List<SkiRec>();
-        int nR = 0, cCount = 0, declared = -1;
-        foreach (var r in recs)
-        {
-            if (r.t == 'A') { aList.Add(r); if (declared < 0 && r.vc > 0) declared = r.vc; }
-            else if (r.t == 'R') nR++;
-            else if (r.t == 'C') cCount++;
-        }
-        if (nR == 0) throw new Exception("0 顶点记录");
-
-        // 装配: R 开新顶点(首绑定), C 并入当前顶点, 权重归一
-        var vtx = new List<Vtx>(nR);
-        var curB = new List<int>(); var curW = new List<float>(); var curP = new List<Vector3>();
-        bool open = false;
-        foreach (var r in recs)
-        {
-            if (r.t == 'R')
-            {
-                if (open) FlushVtx(vtx, curB, curW, curP);
-                curB.Clear(); curW.Clear(); curP.Clear();
-                curB.Add(r.bone); curW.Add(r.w); curP.Add(r.pos);
-                open = true;
-            }
-            else if (r.t == 'C' && open)
-            {
-                curB.Add(r.bone); curW.Add(r.w); curP.Add(r.pos);
-            }
-        }
-        if (open) FlushVtx(vtx, curB, curW, curP);
-        sd.verts = vtx;
-
-        // UV: A_k 配顶点 k
-        sd.uv.Clear();
-        for (int k = 0; k < vtx.Count; k++)
-            sd.uv.Add(k < aList.Count ? aList[k].uv : Vector2.zero);
-
-        // 面表越界过滤
-        int vcp = vtx.Count, kept = 0;
-        var tris2 = new List<int>(sd.tris.Count);
-        for (int i = 0; i + 2 < sd.tris.Count; i += 3)
-            if (sd.tris[i] < vcp && sd.tris[i + 1] < vcp && sd.tris[i + 2] < vcp)
-            { tris2.Add(sd.tris[i]); tris2.Add(sd.tris[i + 1]); tris2.Add(sd.tris[i + 2]); kept += 3; }
-        int dropped = sd.tris.Count - kept;
-        sd.tris = tris2;
-        sd.rawN = kept;
-
-        sd.fmt = string.Format("v4.7(list) R{0}/C{1}/A{2}{3}{4}", nR, cCount, aList.Count,
-            (declared >= 0 && declared != nR) ? " 声明" + declared + "!" : "",
-            dropped > 0 ? " 丢" + (dropped / 3) + "角" : "") + " skel=" + skelRef;
-        if (sd.verts.Count == 0) throw new Exception("0 顶点");
-        if (sd.tris.Count == 0) throw new Exception("0 三角");
-        return sd;
+        return F;
     }
-
-    static bool IsW(byte c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_'; }
-
-    // ---- v4.7 贴图解析: 多锚名 × {裸名, a_前缀} × {全名, 剥尾字符} × {dds,png}, 同族优先 ----
-    static bool IsDigits(string s) { if (s.Length == 0) return false; foreach (var ch in s) if (ch < '0' || ch > '9') return false; return true; }
-
-    static string ResolveTex(string skiName, List<string> anchors)
+    static int FindNextNodeOrChunk(byte[] d, int from)
     {
-        if (anchors == null || anchors.Count == 0) return null;
-        string ski = (skiName ?? "").ToLower();
-        for (int pass = 0; pass < 2; pass++)
+        int F = d.Length;
+        int hard = Math.Min(F, from + (F > 1048576 ? 65536 : 8192));
+        int chunk = FindChunkAfter(d, from);
+        if (chunk < hard) hard = chunk;
+        for (int p = Math.Max(13, from); p < hard - 8; p++)
         {
-            foreach (var a0 in anchors)
-            {
-                string a = a0.ToLower();
-                bool fam = ski.Contains(a) || a.Contains(ski);
-                if (pass == 0 && !fam) continue;
-                if (pass == 1 && fam) continue;
-                for (int v = 0; v < 2; v++)
-                {
-                    string b = (v == 0 ? "" : "a_") + a;
-                    for (int k = 0; k < 3; k++)
-                    {
-                        string c = k == 0 ? b : (k == 1 && b.Length > 1 ? b.Substring(0, b.Length - 1) : b.Replace("_", ""));
-                        if (k == 2 && b.IndexOf('_') < 0) continue;
-                        foreach (var e in new[] { ".dds", ".png" })
-                            if (TexExists(c + e)) return c + e;
-                    }
-                }
-            }
+            int x = U32(d, p);
+            if (x < 1 || x > 4096) continue;
+            string s1 = null, s2 = null; int e1 = 0, e2 = 0;
+            if (!ActStr(d, p + 4, ref s1, ref e1, 64, 2)) continue;
+            if (!ActStr(d, e1, ref s2, ref e2, 64, 2)) continue;
+            return p;
         }
-        // 兜底: 由 ski 文件名派生 (a_wt_m_wai_01 → wt_m_wai_01 / a_wt_m_wai_01 / wt_m_wai ...)
-        string b2 = ski.StartsWith("a_") ? ski.Substring(2) : ski;
-        while (b2.Length > 3)
-        {
-            foreach (var pre in new[] { "", "a_" })
-            {
-                string b = pre + b2;
-                foreach (var c in new[] { b, b.Replace("_", "") })
-                    foreach (var e in new[] { ".dds", ".png" })
-                        if (TexExists(c + e)) return c + e;
-            }
-            int k = b2.LastIndexOf('_');
-            if (k < 0) break;
-            if (!IsDigits(b2.Substring(k + 1))) break;
-            b2 = b2.Substring(0, k);
-        }
-        return null;
+        return chunk < F ? chunk : F;
     }
-
-
+    static List<string> ExtractAnchorsAct(byte[] d)
+    {
+        var res = new List<string>();
+        string[] marks = { "CRT_MaterialLib", "CRT_Mtl", "CRT_VaSkin" };
+        foreach (var mark in marks)
+        {
+            int from = 0;
+            while (true)
+            {
+                int m = IndexOf(d, mark, from);
+                if (m < 0) break;
+                int s = m + mark.Length, hi = Math.Min(s + 300, d.Length);
+                int i2 = s;
+                while (i2 < hi)
+                {
+                    int j = i2;
+                    while (j < hi && IsW(d[j])) j++;
+                    if (j - i2 >= 4 && j - i2 <= 40)
+                    {
+                        string cand = Encoding.ASCII.GetString(d, i2, j - i2);
+                        if (!cand.StartsWith("CRT") && !res.Contains(cand)) res.Add(cand);
+                    }
+                    i2 = (j > i2) ? j + 1 : i2 + 1;
+                }
+                from = m + mark.Length;
+            }
+        }
+        return res;
+    }
+    static ActMeshData ParseActMesh(byte[] d)
+    {
+        if (d == null || d.Length < 64 || d[0] != 0xFF || d[1] != 0xFF || d[2] != 0x09 || d[3] != 0x00)
+            throw new Exception("非CRT_Actor流");
+        var am = new ActMeshData();
+        int F = d.Length;
+        // 节点表锚: [u32 1..4096][名][父名], 优先 root/Bip01/父NULL (盲同步, 兼容变体头)
+        int nc = -1, ncFirst = -1;
+        int lim = Math.Min(F - 12, 26 + 65536);
+        int firstChunk = FindChunkAfter(d, 13);
+        if (firstChunk < lim) lim = firstChunk;
+        for (int p = 26; p < lim; p++)
+        {
+            int x = U32(d, p);
+            if (x < 1 || x > 4096) continue;
+            string s1 = null, s2 = null; int e1 = 0, e2 = 0;
+            if (!ActStr(d, p + 4, ref s1, ref e1, 64, 2)) continue;
+            if (!ActStr(d, e1, ref s2, ref e2, 64, 2)) continue;
+            if (ncFirst < 0) ncFirst = p;
+            string l1 = s1.ToLower(), l2 = s2.ToLower();
+            if (l1 == "root" || l1 == "bip01" || l2 == "null") { nc = p; break; }
+        }
+        if (nc < 0) nc = ncFirst;
+        if (nc < 0) throw new Exception("ACT节点表未定位");
+        int nodeCount = U32(d, nc);
+        if (nodeCount < 1 || nodeCount > 4096) throw new Exception("节点数异常 " + nodeCount);
+        int o = nc + 4;
+        for (int i = 0; i < nodeCount && o < F - 8; i++)
+        {
+            string nm = null, pn = null; int e1 = 0, e2 = 0;
+            if (!ActStr(d, o, ref nm, ref e1, 64, 2)) break;
+            if (!ActStr(d, e1, ref pn, ref e2, 64, 2)) break;
+            am.nodes++;
+            int o3 = e2;
+            int V = o3 + 4 <= F ? U32(d, o3) : 0;
+            bool mesh = V >= 3 && V <= 300000 && o3 + 4 + (long)V * 12 <= F && NiceRatio(d, o3 + 4, V * 3) >= 0.7f;
+            int next;
+            if (mesh)
+            {
+                am.meshes++;
+                int cap = Math.Min(V, 50000);
+                for (int k = 0; k < cap; k++)
+                    am.pts.Add(new Vector3(F32(d, o3 + 4 + k * 12), F32(d, o3 + 8 + k * 12), F32(d, o3 + 12 + k * 12)));
+                int p4 = o3 + 4 + V * 12;
+                if (p4 + (long)V * 16 <= F && NiceRatio(d, p4, V * 4) >= 0.6f) p4 += V * 16;
+                next = FindNextNodeOrChunk(d, p4);
+            }
+            else next = FindNextNodeOrChunk(d, o3);
+            if (next >= F - 8 || next <= o) break;
+            o = next;
+            if (am.pts.Count > 150000) break;
+        }
+        if (am.pts.Count == 0) throw new Exception("无网格节点(纯动画/特效)");
+        am.fmt = string.Format("v4.8 ACT点云 节点{0} 网格{1} 点{2}", am.nodes, am.meshes, am.pts.Count);
+        am.anchors = ExtractAnchorsAct(d);
+        return am;
+    }
 
     // ================================================================
     //                    LBS 烘焙 (mass_produce.bake_vertex 等价)
@@ -842,22 +937,23 @@ public class PreviewV4 : MonoBehaviour
         StartShow(curSki);
     }
 
-    static void StartShow(string name)
+    static void StartShow(string fileName)
     {
-        line2 = name + "  <" + Cats[catI] + ">  [" + CurJob + "_" + CurSex + "]";
+        string noExt = Path.GetFileNameWithoutExtension(fileName);
+        line2 = noExt + "  <" + Cats[catI] + ">  [" + CurJob + "_" + CurSex + "]";
         _animSk = null; _animMesh = null; _animSd = null;
         if (hostPv != null && _animCo != null) { hostPv.StopCoroutine(_animCo); _animCo = null; }
         if (hostPv == null) return;
         if (_loadCo != null) hostPv.StopCoroutine(_loadCo);
-        _loadCo = hostPv.StartCoroutine(LoadShowCo(name));
+        _loadCo = hostPv.StartCoroutine(LoadShowCo(fileName));
     }
 
-    static System.Collections.IEnumerator LoadShowCo(string name)
+    static System.Collections.IEnumerator LoadShowCo(string fileName)
     {
         byte[] d; string err = "";
         if (useAsset)
         {
-            using (var wr = UnityWebRequest.Get(Application.streamingAssetsPath + "/creature/actor/" + name + ".ski"))
+            using (var wr = UnityWebRequest.Get(Application.streamingAssetsPath + "/creature/actor/" + fileName))
             {
                 yield return wr.SendWebRequest();
                 if (wr.result != UnityWebRequest.Result.Success) { d = null; err = wr.error; }
@@ -866,10 +962,12 @@ public class PreviewV4 : MonoBehaviour
         }
         else
         {
-            try { d = File.ReadAllBytes(Path.Combine(actorDir, name + ".ski")); }
+            try { d = File.ReadAllBytes(Path.Combine(actorDir, fileName)); }
             catch (Exception e2) { d = null; err = e2.Message; }
         }
-        ShowSkiData(name, d, err);
+        string noExt = Path.GetFileNameWithoutExtension(fileName);
+        if (fileName.EndsWith(".act", StringComparison.OrdinalIgnoreCase)) ShowActData(noExt, d, err);
+        else ShowSkiData(noExt, d, err);
     }
 
     static void ShowSkiData(string name, byte[] d, string err)
@@ -881,12 +979,11 @@ public class PreviewV4 : MonoBehaviour
             string tag;
             ActSkel sk = MatchSkel(name, out tag);
             List<FramePose> bind = (sk != null) ? LoadBind(sk) : null;
-            // 站姿调色板 = world(stand)×world(stand)⁻¹ = 恒等 → 静止渲染 = Σ w×pos (模型空间原样呈现)
 
-            // 烘焙 → mesh
             int vc = sd.verts.Count;
             var vs = new Vector3[vc];
-            for (int i = 0; i < vc; i++) vs[i] = BakeVertex(bind, sd.verts[i]);
+            for (int i = 0; i < vc; i++)
+                vs[i] = (bind != null) ? BakeVertex(bind, sd.verts[i]) : sd.verts[i].pos0;
             var mesh = new Mesh();
             mesh.vertices = vs;
             mesh.uv = sd.uv.GetRange(0, Math.Min(sd.uv.Count, vc)).ToArray();
@@ -894,7 +991,6 @@ public class PreviewV4 : MonoBehaviour
             mesh.RecalculateNormals();
             mesh.RecalculateBounds();
 
-            // 包围盒归一化
             var b = mesh.bounds;
             float ext = Mathf.Max(b.extents.x, Mathf.Max(b.extents.y, b.extents.z));
             float s = ext > 1e-5f ? FitFor(name) * _zoom / ext : _zoom;
@@ -903,13 +999,12 @@ public class PreviewV4 : MonoBehaviour
             curModel = new GameObject(name);
             curModel.transform.SetParent(pivot.transform, false);
             curModel.transform.localScale = new Vector3(s, s, s);
-            var bc = mesh.bounds.center;   // 中心补偿: 部件中心对准显示点(z-up->y-up)
+            var bc = mesh.bounds.center;
             curModel.transform.localPosition = new Vector3(0f, 1.55f, 0f) - s * new Vector3(bc.x, bc.z, -bc.y);
             curModel.transform.localRotation = Quaternion.Euler(ModelRot);
             curModel.AddComponent<MeshFilter>().sharedMesh = mesh;
             var mr = curModel.AddComponent<MeshRenderer>();
 
-            // Shader 保底链 (Standard 可能被构建裁剪)
             Shader sh = Shader.Find("Standard");
             if (sh == null) sh = Shader.Find("Legacy Shaders/Diffuse");
             if (sh == null) sh = Shader.Find("Mobile/Diffuse");
@@ -919,54 +1014,223 @@ public class PreviewV4 : MonoBehaviour
             mat.color = new Color(0.72f, 0.72f, 0.76f);
             mr.sharedMaterial = mat;
 
-            line3 = string.Format("[v4.7] {0} {1} 顶点{2} 面{3} ski:{4}B | 骨架={5} | 贴图=...",
-                sd.fmt, tag == "STATIC" ? "静态" : tag + ":" + (sk != null ? sk.srcName : ""),
-                vc, sd.tris.Count / 3, d.Length,
-                sk != null ? sk.srcName : "无");
+            line3 = string.Format("[v4.8] {0} | 骨架={1} ski:{2}B | 贴图=...",
+                sd.fmt, sk != null ? tag + ":" + sk.srcName : tag, d.Length);
 
-            // 骨骼动画播放 (act自带逐帧trans/quat, 层级复合+绑定相对)
             int anf = sk != null && sk.bones.Count > 0 ? sk.bones[0].nf : 0;
             if (sk != null && anf > 1)
             {
                 _animSk = sk; _animSd = sd; _animMesh = mesh; _animBind = bind;
                 _animCo = hostPv.StartCoroutine(PlayAnimCo());
-                line3 += string.Format(" \u25b6动画{0}帧", anf);
+                line3 += string.Format(" ▶动画{0}帧", anf);
             }
-            _skipGuard = 0;
 
-            // 贴图异步加载 (多锚名依次解析, 加载完成自动贴上)
-            if (sd.anchors != null && sd.anchors.Count > 0 && hostPv != null)
+            if (sd.anchors != null && sd.anchors.Count >= 0 && hostPv != null)
                 hostPv.StartCoroutine(LoadTexCo(name, sd.anchors, mat));
         }
         catch (Exception e)
         {
-            line3 = "[v4.7] " + name + " 解析失败: " + e.Message;
+            line3 = "[v4.8] " + name + " 解析失败: " + e.Message + " (◀▶手动翻页)";
             if (curModel != null) { UnityEngine.Object.Destroy(curModel); curModel = null; }
-            // 不完整部件自动跳过 (整圈全失败才停)
-            if (hostPv != null && curSkiList.Count > 1 && _skipGuard < curSkiList.Count)
-            {
-                _skipGuard++;
-                curIdx = (curIdx + 1) % curSkiList.Count;
-                StartShow(curSkiList[curIdx]);
-            }
         }
     }
 
+    static void ShowActData(string name, byte[] d, string err)
+    {
+        try
+        {
+            if (d == null) throw new Exception("act 读取失败: " + err);
+            var am = ParseActMesh(d);
+            Mesh mesh = BuildPointMesh(am.pts);
+            var b = mesh.bounds;
+            float ext = Mathf.Max(b.extents.x, Mathf.Max(b.extents.y, b.extents.z));
+            float s = ext > 1e-5f ? FitFor(name) * _zoom / ext : _zoom;
+
+            if (curModel != null) UnityEngine.Object.Destroy(curModel);
+            curModel = new GameObject(name);
+            curModel.transform.SetParent(pivot.transform, false);
+            curModel.transform.localScale = new Vector3(s, s, s);
+            var bc = mesh.bounds.center;
+            curModel.transform.localPosition = new Vector3(0f, 1.55f, 0f) - s * new Vector3(bc.x, bc.z, -bc.y);
+            curModel.transform.localRotation = Quaternion.Euler(ModelRot);
+            curModel.AddComponent<MeshFilter>().sharedMesh = mesh;
+            var mr = curModel.AddComponent<MeshRenderer>();
+
+            Shader sh = Shader.Find("Unlit/Color");
+            if (sh == null) sh = Shader.Find("Legacy Shaders/VertexLit");
+            if (sh == null) sh = Shader.Find("Mobile/VertexLit");
+            if (sh == null) sh = Shader.Find("Legacy Shaders/Diffuse");
+            if (sh == null) throw new Exception("无可用Shader(构建裁剪)");
+            var mat = new Material(sh);
+            mat.color = new Color(0.62f, 0.70f, 0.82f);
+            mr.sharedMaterial = mat;
+
+            line3 = "[v4.8] " + am.fmt + " | 贴图=...";
+            if (hostPv != null)
+                hostPv.StartCoroutine(LoadTexCoAct(name, am.anchors, mat));
+        }
+        catch (Exception e)
+        {
+            line3 = "[v4.8] " + name + " 点云失败: " + e.Message + " (◀▶手动翻页)";
+            if (curModel != null) { UnityEngine.Object.Destroy(curModel); curModel = null; }
+        }
+    }
+
+    // 点云 → 每点一个小面向相机的双三角片
+    static Mesh BuildPointMesh(List<Vector3> pts)
+    {
+        int N = Math.Min(pts.Count, 60000);
+        var bmin = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
+        var bmax = new Vector3(float.MinValue, float.MinValue, float.MinValue);
+        for (int i = 0; i < pts.Count; i++)
+        {
+            bmin = Vector3.Min(bmin, pts[i]);
+            bmax = Vector3.Max(bmax, pts[i]);
+        }
+        float ext = Mathf.Max(bmax.x - bmin.x, Mathf.Max(bmax.y - bmin.y, bmax.z - bmin.z));
+        float s = Mathf.Max(ext * 0.006f, 0.02f);
+        var vs = new Vector3[N * 4];
+        var tris = new int[N * 6];
+        for (int i = 0; i < N; i++)
+        {
+            var p = pts[i];
+            int b = i * 4;
+            vs[b]     = p + new Vector3(-s, -s, 0);
+            vs[b + 1] = p + new Vector3( s, -s, 0);
+            vs[b + 2] = p + new Vector3( s,  s, 0);
+            vs[b + 3] = p + new Vector3(-s,  s, 0);
+            int t = i * 6;
+            tris[t] = b; tris[t + 1] = b + 1; tris[t + 2] = b + 2;
+            tris[t + 3] = b; tris[t + 4] = b + 2; tris[t + 5] = b + 3;
+        }
+        var mesh = new Mesh();
+        mesh.vertices = vs;
+        mesh.triangles = tris;
+        mesh.RecalculateBounds();
+        mesh.RecalculateNormals();
+        return mesh;
+    }
+
+    // ================================================================
+    //                    贴图解析 v4.8
+    // ================================================================
     static readonly Dictionary<string, string> texResCache = new Dictionary<string, string>();
 
-    static string ResolveTexCached(string skiName, List<string> anchors)
+    static string TryTex(string c)
     {
-        string key = skiName + "|" + (anchors != null && anchors.Count > 0 ? anchors[0] : "");
+        if (string.IsNullOrEmpty(c)) return null;
+        if (TexExists(c + ".dds")) return c + ".dds";
+        if (TexExists(c + ".png")) return c + ".png";
+        return null;
+    }
+    static string StripDigitsTail(string s)
+    {
+        while (true)
+        {
+            int k = s.LastIndexOf('_');
+            if (k < 0) return s;
+            if (!IsDigits(s.Substring(k + 1))) return s;
+            s = s.Substring(0, k);
+        }
+    }
+    static string CleanAnchor(string a0)
+    {
+        var sb = new System.Text.StringBuilder();
+        foreach (var ch in a0.ToLower())
+            if (ch < 128 && IsW((byte)ch)) sb.Append(ch);
+        string a = sb.ToString();
+        if (a.Length < 4 || a.StartsWith("crt") || a == "standard" || a == "mu") return null;
+        return a;
+    }
+    // ski 贴图: 池内同名优先(1:1) → 数字尾剥离 → 锚名清洗 → 家族兜底
+    static string ResolveTex(string skiName, List<string> anchors)
+    {
+        string ski = (skiName ?? "").ToLower();
+        if (ski.EndsWith(".ski")) ski = ski.Substring(0, ski.Length - 4);
+        if (ski.EndsWith(".act")) ski = ski.Substring(0, ski.Length - 4);
+        string p = TryTex(ski); if (p != null) return p;
+        string b0 = ski.StartsWith("a_") ? ski.Substring(2) : ski;
+        p = TryTex(b0); if (p != null) return p;
+        string b2 = ski;
+        while (true)
+        {
+            int k = b2.LastIndexOf('_');
+            if (k < 0 || !IsDigits(b2.Substring(k + 1))) break;
+            b2 = b2.Substring(0, k);
+            p = TryTex(b2); if (p != null) return p;
+            p = TryTex(b2.StartsWith("a_") ? b2.Substring(2) : "a_" + b2); if (p != null) return p;
+        }
+        if (anchors != null)
+            foreach (var a0 in anchors)
+            {
+                string a = CleanAnchor(a0);
+                if (a == null) continue;
+                string cand = a;
+                for (int guard = 0; guard < 3; guard++)
+                {
+                    p = TryTex(cand); if (p != null) return p;
+                    p = TryTex(cand.StartsWith("a_") ? cand.Substring(2) : "a_" + cand); if (p != null) return p;
+                    int k2 = cand.LastIndexOf('_');
+                    if (k2 < 0) break;
+                    cand = cand.Substring(0, k2);
+                }
+            }
+        return null;
+    }
+    // act(武器/怪物) 贴图: 同名 → 锚名 → 层级+词根启发(5dao01→a5sword)
+    static string ResolveTexAct(string name, List<string> anchors)
+    {
+        string p = TryTex(name); if (p != null) return p;
+        if (anchors != null)
+            foreach (var a0 in anchors)
+            {
+                string a = CleanAnchor(a0);
+                if (a == null) continue;
+                string cand = a;
+                for (int guard = 0; guard < 3; guard++)
+                {
+                    p = TryTex(cand); if (p != null) return p;
+                    p = TryTex(cand.StartsWith("a_") ? cand.Substring(2) : "a_" + cand); if (p != null) return p;
+                    int k2 = cand.LastIndexOf('_');
+                    if (k2 < 0) break;
+                    cand = cand.Substring(0, k2);
+                }
+            }
+        var m = Regex.Match(name, @"^(\d)(\d?)(dao|zhan|jian|feng|shu|gong|qiang)");
+        if (m.Success)
+        {
+            string tier = m.Groups[1].Value;
+            string fam = m.Groups[3].Value;
+            string word = fam == "feng" ? "axe" : fam == "shu" ? "stick"
+                        : fam == "gong" ? "bow" : fam == "qiang" ? "spear" : "sword";
+            string[] cands = { "a" + tier + word, "a" + tier + word + "01", tier + word, tier + word + "01" };
+            foreach (var c in cands) { p = TryTex(c); if (p != null) return p; }
+        }
+        return null;
+    }
+
+    static string ResolveTexCached(string skiName, List<string> anchors, bool isAct)
+    {
+        string key = (isAct ? "A|" : "S|") + skiName + "|" + (anchors != null && anchors.Count > 0 ? anchors[0] : "");
         string p;
         if (texResCache.TryGetValue(key, out p)) return p;
-        p = ResolveTex(skiName, anchors);
+        p = isAct ? ResolveTexAct(skiName, anchors) : ResolveTex(skiName, anchors);
         texResCache[key] = p;
         return p;
     }
 
     static System.Collections.IEnumerator LoadTexCo(string skiName, List<string> anchors, Material mat)
     {
-        string p = ResolveTexCached(skiName, anchors);
+        string p = ResolveTexCached(skiName, anchors, false);
+        yield return LoadTexCommon(p, mat, skiName);
+    }
+    static System.Collections.IEnumerator LoadTexCoAct(string skiName, List<string> anchors, Material mat)
+    {
+        string p = ResolveTexCached(skiName, anchors, true);
+        yield return LoadTexCommon(p, mat, skiName);
+    }
+    static System.Collections.IEnumerator LoadTexCommon(string p, Material mat, string skiName)
+    {
         if (p == null)
         {
             if (_texSample == null)
@@ -976,9 +1240,7 @@ public class PreviewV4 : MonoBehaviour
                 for (int i = 0; i < ls.Length && i < 6; i++) { if (i > 0) tsb.Append(','); tsb.Append(ls[i]); }
                 _texSample = ls.Length == 0 ? "(目录空)" : tsb.ToString();
             }
-            string baseN = skiName.ToLower(); if (baseN.StartsWith("a_")) baseN = baseN.Substring(2);
-            bool famTex = TexExists(baseN + ".dds") || TexExists("a_" + baseN + ".dds");
-            line3 += " ✗未找到[" + (famTex ? "池有同名贴图但锚名未命中" : "池无此贴图→需注入") + "] 样本[" + _texSample + "]";
+            line3 += " ✗未命中(池样本[" + _texSample + "])";
             yield break;
         }
         if (texCache.TryGetValue(p, out var tc) && tc != null)
@@ -998,7 +1260,7 @@ public class PreviewV4 : MonoBehaviour
         }
         else
         {
-            try { raw = File.ReadAllBytes(Path.Combine(texDir, p)); } catch (Exception) { raw = null; }
+            try { raw = ReadTexFile(p); } catch (Exception) { raw = null; }
         }
         Texture2D t = null;
         if (raw != null)
@@ -1016,16 +1278,18 @@ public class PreviewV4 : MonoBehaviour
     }
 
     // ================================================================
-    //                    UI (OnGUI, 1080 设计宽缩放)
+    //                    UI (OnGUI, 1080 设计宽缩放; v4.8 紧凑化)
     // ================================================================
-    static GUIStyle box, label, btn, small;
+    static GUIStyle box, label, small, btn, btnS, smallS;
     static void InitStyle()
     {
         if (box != null) return;
-        box = new GUIStyle(GUI.skin.box); box.fontSize = 22; box.alignment = TextAnchor.MiddleLeft;
-        label = new GUIStyle(GUI.skin.label); label.fontSize = 22;
-        small = new GUIStyle(GUI.skin.label); small.fontSize = 16; small.wordWrap = true;
-        btn = new GUIStyle(GUI.skin.button); btn.fontSize = 20; btn.alignment = TextAnchor.MiddleLeft;
+        box = new GUIStyle(GUI.skin.box);
+        label = new GUIStyle(GUI.skin.label); label.fontSize = 15;
+        small = new GUIStyle(GUI.skin.label); small.fontSize = 12; small.wordWrap = true;
+        btn = new GUIStyle(GUI.skin.button); btn.fontSize = 14; btn.alignment = TextAnchor.MiddleLeft;
+        btnS = new GUIStyle(GUI.skin.button); btnS.fontSize = 11; btnS.alignment = TextAnchor.MiddleLeft;
+        smallS = new GUIStyle(GUI.skin.label); smallS.fontSize = 11; smallS.alignment = TextAnchor.MiddleLeft;
     }
 
     void OnGUI() { DrawUI(); }
@@ -1036,26 +1300,28 @@ public class PreviewV4 : MonoBehaviour
         GUI.matrix = Matrix4x4.TRS(Vector3.zero, Quaternion.identity, new Vector3(sc, sc, 1f));
         float H = Screen.height / sc;   // 横屏约 508
 
-        // 顶栏 (紧凑, 状态右置)
-        GUI.Box(new Rect(0, 0, 1080, 86), GUIContent.none, box);
-        GUI.Label(new Rect(12, 4, 700, 40), title, label);
-        GUI.Label(new Rect(12, 42, 700, 40), line2, label);
-        GUI.Label(new Rect(716, 8, 356, 74), line3, small);
+        // 顶栏 (紧凑: 58px)
+        GUI.Box(new Rect(0, 0, 1080, 58), GUIContent.none, box);
+        GUI.Label(new Rect(10, 3, 760, 26), title, label);
+        GUI.Label(new Rect(10, 29, 760, 26), line2, small);
+        GUI.Label(new Rect(772, 3, 300, 52), line3, small);
 
-        // 分类: 一竖排 (左侧)
-        float cw = 300f, ch = 40f;
-        GUI.Box(new Rect(0, 88, cw + 16, Cats.Length * (ch + 3) + 10), GUIContent.none, box);
-        for (int i = 0; i < Cats.Length; i++)
+        // 分类: 一竖排 (左列, 按槽位排序, 186×26)
+        float cw = 186f, ch = 26f;
+        GUI.Box(new Rect(0, 60, cw + 12, CatOrder.Length * (ch + 2) + 8), GUIContent.none, box);
+        for (int di = 0; di < CatOrder.Length; di++)
         {
+            int id = CatOrder[di];
+            bool sel = id == catI;
             var old = GUI.backgroundColor;
-            if (i == catI) GUI.backgroundColor = new Color(0.30f, 0.65f, 0.95f);
-            if (GUI.Button(new Rect(8, 92 + i * (ch + 3), cw, ch), (i == catI ? "\u25b6 " : "") + Cats[i], i == catI ? btn : small))
-            { catI = i; FilterCat(); ShowCurrent(); }
+            if (sel) GUI.backgroundColor = new Color(0.30f, 0.65f, 0.95f);
+            if (GUI.Button(new Rect(6, 64 + di * (ch + 2), cw, ch), (sel ? "▶ " : "") + Cats[id], sel ? btnS : smallS))
+            { catI = id; FilterCat(); ShowCurrent(); }
             GUI.backgroundColor = old;
         }
 
-        // 职业按钮 (右上)
-        if (GUI.Button(new Rect(1080 - 300, 94, 292, 52), "职业 " + CurJob + "_" + CurSex + " \u25b6", btn))
+        // 职业按钮 (右上, 紧凑)
+        if (GUI.Button(new Rect(1080 - 192, 64, 186, 34), "职业 " + CurJob + "_" + CurSex + " ▶", btn))
         {
             sexI++;
             if (sexI >= Sexes.Length) { sexI = 0; jobI = (jobI + 1) % Jobs.Length; }
@@ -1064,17 +1330,17 @@ public class PreviewV4 : MonoBehaviour
         }
 
         // 底部翻页条
-        float yb = H - 62;
-        GUI.Box(new Rect(0, yb - 6, 1080, 68), GUIContent.none, box);
-        if (GUI.Button(new Rect(10, yb, 90, 54), "\u25c0", btn))
+        float yb = H - 56;
+        GUI.Box(new Rect(0, yb - 6, 1080, 62), GUIContent.none, box);
+        if (GUI.Button(new Rect(10, yb, 84, 48), "◀", btn))
         { curIdx = (curIdx - 1 + curSkiList.Count) % Math.Max(1, curSkiList.Count); ShowCurrent(); }
-        if (GUI.Button(new Rect(108, yb, 90, 54), "\u25b6", btn))
+        if (GUI.Button(new Rect(102, yb, 84, 48), "▶", btn))
         { curIdx = (curIdx + 1) % Math.Max(1, curSkiList.Count); ShowCurrent(); }
-        GUI.Label(new Rect(210, yb, 700, 54), curSkiList.Count == 0
+        GUI.Label(new Rect(196, yb, 700, 48), curSkiList.Count == 0
             ? "(本职业无此部件) 点右上「职业」换人 / 点左侧其他分类"
-            : string.Format("{0}/{1}  {2}", curIdx + 1, curSkiList.Count, curSki), label);
-        if (GUI.Button(new Rect(922, yb, 64, 54), "\uff0b", btn)) { _zoom = Mathf.Clamp(_zoom * 1.2f, 0.2f, 8f); ShowCurrent(); }
-        if (GUI.Button(new Rect(992, yb, 64, 54), "\uff0d", btn)) { _zoom = Mathf.Clamp(_zoom / 1.2f, 0.2f, 8f); ShowCurrent(); }
+            : string.Format("{0}/{1}  {2}", curIdx + 1, curSkiList.Count, Path.GetFileNameWithoutExtension(curSki)), small);
+        if (GUI.Button(new Rect(916, yb, 60, 48), "＋", btn)) { _zoom = Mathf.Clamp(_zoom * 1.2f, 0.2f, 8f); ShowCurrent(); }
+        if (GUI.Button(new Rect(982, yb, 60, 48), "－", btn)) { _zoom = Mathf.Clamp(_zoom / 1.2f, 0.2f, 8f); ShowCurrent(); }
 
         // 拖动旋转
         var e = Event.current;
@@ -1088,7 +1354,7 @@ public class PreviewV4 : MonoBehaviour
 }
 
 // ================================================================
-//  DdsV4 — DDS 解码 (DdsLoader.cs 内容内嵌改名, 避免与工程旧类冲突)
+//  DdsV4 — DDS 解码 (不变)
 //  支持: DXT1/DXT3/DXT5 + 未压缩 + 2004 非标准头自动修补
 // ================================================================
 public static class DdsV4
