@@ -5,6 +5,11 @@
 # v6 改用账号密码直连激活（和「① 获取 Unity 许可证」同一套原理，
 # 运行 #4 已实测成功：ASSIGN_SEAT 200），用的是仓库里已有的
 # UNITY_EMAIL / UNITY_PASSWORD 两个 Secret，不需要 UNITY_LICENSE。
+#
+# 签名固化：此前 APK 用构建机临时生成的 debug 签名，每次构建签名都不同，
+# 导致无法覆盖安装（「更新包与已安装应用的签名不一致」）。现从 Secret
+# 注入固定 keystore：ANDROID_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASS /
+# ANDROID_KEY_ALIAS_PASS（alias 固定为 mygame）。
 name: ② 打包 Android APK
 
 on:
@@ -30,6 +35,11 @@ jobs:
         with:
           targetPlatform: Android
           buildName: MyGame
+          androidKeystoreBase64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          androidKeystoreName: mygame-release.keystore
+          androidKeystorePass: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+          androidKeyaliasName: mygame
+          androidKeyaliasPass: ${{ secrets.ANDROID_KEY_ALIAS_PASS }}
 
       - name: 上传 APK
         uses: actions/upload-artifact@v4
