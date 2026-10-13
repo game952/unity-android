@@ -1,6 +1,12 @@
-// PreviewV4.cs — v4.8 整装拼合预览台 (2026-10-13)
+// PreviewV4.cs — v4.8.1 整装拼合预览台 (2026-10-13 晚热修)
 // ============================================================
-// v4.8 修复清单（对应 MEMO 待修清单，全部落地）:
+// v4.8.1 热修（装机报错定位后当天修复）:
+//  ① "骨架表异常 nb=1050/2622" → ski 头不再解码骨架表 (role ski 头布局与 bpf10 样本不符,
+//     dissect_ski 式解码把面数当骨数); 顶点流改为自 offset 16 全长扫描, 最长自校验链者胜
+//  ② 面表段收集改为"≥最长段50%"多段收集, 排除骨架父索引表等短段污染
+//  ③ ACT 点云: 节点表锚点多候选重试(≤10个, root/Bip01/父NULL优先);
+//     动画变体(_01/_02)无网格时报"无网格节点(纯动画/特效)"属正常, 不是错误
+// v4.8.1 修复清单（对应 MEMO 待修清单，全部落地）:
 //  ① P0 网格炸裂/碎片: ski 解析整个重写 = ski_obj.py(297-OBJ 验证版)逐行移植:
 //     顶点 = [u32 nbk][nbk×30B 绑定块(u8骨id, f32权重, f32×3 pos, f32×3法线, 1B垫)][u8 05][f32×3 tangent][f32×2 uv]
 //     面表 = 小端 u16 序列 (v4.7 误用大端 + 误把骨架父索引表当面表 + 自创 R/C/A 记录机 → 碎片/全灭)
@@ -93,7 +99,7 @@ public class PreviewV4 : MonoBehaviour
     static void Boot()
     {
         try { SetupCam(); KillOthers(); Scan(); RebuildCat(); ShowCurrent(); }
-        catch (Exception e) { line3 = "[v4.8] 启动失败: " + e.Message; }
+        catch (Exception e) { line3 = "[v4.8.1] 启动失败: " + e.Message; }
         var host = new GameObject("~PreviewV4");
         UnityEngine.Object.DontDestroyOnLoad(host);
         var pv = host.AddComponent<PreviewV4>();
@@ -229,7 +235,7 @@ public class PreviewV4 : MonoBehaviour
             pool.Sort();
             actPool = pool; useAsset = true;
             actorDir = "asset:creature/actor"; texDir = "asset:creature/texture";
-            title = string.Format("v4.8 整装拼合 · APK注入 ({0} 骨架/{1} ski, StreamingAssets)", pool.Count, nSki);
+            title = string.Format("v4.8.1 整装拼合 · APK注入 ({0} 骨架/{1} ski, StreamingAssets)", pool.Count, nSki);
             return;
         }
         // 2) 外部目录兜底
@@ -251,7 +257,7 @@ public class PreviewV4 : MonoBehaviour
             actPool.Sort();
             string t = Path.GetDirectoryName(c) + "/texture";
             texDir = Directory.Exists(t) ? t : c;
-            title = string.Format("v4.8 整装拼合 · 外部目录 ({0} 骨架/{1} ski)", actPool.Count, skis.Length);
+            title = string.Format("v4.8.1 整装拼合 · 外部目录 ({0} 骨架/{1} ski)", actPool.Count, skis.Length);
             return;
         }
         throw new Exception("未找到资源 (APK内StreamingAssets与外部目录均无数据)");
@@ -514,7 +520,7 @@ public class PreviewV4 : MonoBehaviour
     }
     static List<FramePose> LoadBind(ActSkel sk) { return LoadSkeleton(sk, FrameStand, null); }
 
-    // ===== 骨架匹配: 只认同族骨架, 无匹配 → 静态 (v4.8: 删除错配兜底) =====
+    // ===== 骨架匹配: 只认同族骨架, 无匹配 → 静态 (v4.8.1: 删除错配兜底) =====
     static ActSkel MatchSkel(string skiName, out string tag)
     {
         tag = "STATIC·未配骨架";
@@ -539,7 +545,7 @@ public class PreviewV4 : MonoBehaviour
     }
 
     // ================================================================
-    //            ski 解析 v4.8 — ski_obj.py 实测格式移植 (297-OBJ 验证)
+    //            ski 解析 v4.8.1 — ski_obj.py 实测格式移植 (297-OBJ 验证)
     // ================================================================
     class Vtx { public byte[] bid; public float[] w; public Vector3[] pos; public Vector3 pos0; }
 
@@ -635,23 +641,17 @@ public class PreviewV4 : MonoBehaviour
         if (F < 64 || d[0] != 0xFF || d[1] != 0xFF) throw new Exception("非CRT对象流");
         var sd = new SkiData();
 
-        // ---- A. 头: 网格名 + 骨架引用 + 骨架父索引表 (act_dissect.dissect_ski 布局) ----
+        // ---- A. 头只验证 CRT_SkelSkin; 不再解码骨架表 ----
+        // v4.8.1 热修: role ski 头布局与 bpf10 样本不符, v4.8.1 的 dissect_ski 式解码把
+        // 面数当骨数 → "骨架表异常 nb=1050/2622"。骨架引用仅作展示(尽力读取)。
         if (F < 16 || Str(d, 4, 12) != "CRT_SkelSkin") throw new Exception("缺CRT_SkelSkin头");
-        int o = 16;
-        ReadCStr(d, ref o, 64);                      // 网格名
-        if (o + 6 > F) throw new Exception("ski头截断");
-        o += 2;                                      // u16 固定
-        o += 4;                                      // u32 固定
-        string skelRef = ReadCStr(d, ref o, 64);     // 骨架名
-        ReadCStr(d, ref o, 64);                      // 名2
-        int nb = U32(d, o); o += 4;
-        if (nb < 0 || nb > 512 || o + nb * 2 > F) throw new Exception("骨架表异常 nb=" + nb);
-        int headerEnd = o + nb * 2;                  // 父索引表(u16×nb)之后
+        string skelRef = "";
+        try { int t = 16; skelRef = ReadCStr(d, ref t, 64); } catch { }
         sd.skelRef = skelRef;
 
-        // ---- B. 顶点流定位: 最长自校验链者胜 ----
+        // ---- B. 顶点流定位: 自16起全长扫描, 最长自校验链者胜 (ski_obj.py 实测格式) ----
         int best = -1, bestN = 0;
-        for (int p = headerEnd; p < F - 60; p++)
+        for (int p = 16; p < F - 60; p++)
         {
             int n = ChainVtx(d, p, F);
             if (n > bestN) { bestN = n; best = p; }
@@ -690,8 +690,10 @@ public class PreviewV4 : MonoBehaviour
         if (vcp < 3) throw new Exception("0 顶点");
 
         // ---- C. 面表: 小端 u16 (v4.7 误用大端 = 碎片化根因) ----
+        // v4.8.1: 收集全部候选段, 只收 ≥ 最长段50% 的段 —— 排除骨架父索引表等短段污染
+        var runs = new List<int[]>();                // [start, len]
         int runStart = -1, runLen = 0; bool runHot = false;
-        for (int p3 = headerEnd & ~1; p3 + 2 <= best; p3 += 2)
+        for (int p3 = 16; p3 + 2 <= best; p3 += 2)
         {
             int v0 = U16(d, p3);
             if (v0 < vcp)
@@ -700,16 +702,23 @@ public class PreviewV4 : MonoBehaviour
                 runLen++;
                 if (v0 >= 4) runHot = true;          // 排除全零填充
             }
-            else { FlushRun(sd, d, runStart, runLen, runHot, vcp); runLen = 0; runHot = false; }
+            else
+            {
+                if (runLen >= 9 && runHot) runs.Add(new[] { runStart, runLen });
+                runLen = 0; runHot = false;
+            }
         }
-        FlushRun(sd, d, runStart, runLen, runHot, vcp);
+        if (runLen >= 9 && runHot) runs.Add(new[] { runStart, runLen });
+        int maxLen = 0;
+        foreach (var r in runs) if (r[1] > maxLen) maxLen = r[1];
+        foreach (var r in runs) if (r[1] >= maxLen / 2) FlushRun(sd, d, r[0], r[1], true, vcp);
         if (sd.tris.Count == 0) throw new Exception("0 面表");
 
         // ---- D. 材质锚名 ----
         sd.anchors = ExtractAnchors(d);
 
-        sd.fmt = string.Format("v4.8 顶点{0} 面{1} 流@0x{2:x} skel={3}{4}",
-            vcp, sd.tris.Count / 3, best, skelRef,
+        sd.fmt = string.Format("v4.8.1 顶点{0} 面{1} 流@0x{2:x}{3}",
+            vcp, sd.tris.Count / 3, best,
             sd.anchors.Count > 0 ? " 锚" + sd.anchors.Count : "");
         return sd;
     }
@@ -855,8 +864,9 @@ public class PreviewV4 : MonoBehaviour
             throw new Exception("非CRT_Actor流");
         var am = new ActMeshData();
         int F = d.Length;
-        // 节点表锚: [u32 1..4096][名][父名], 优先 root/Bip01/父NULL (盲同步, 兼容变体头)
-        int nc = -1, ncFirst = -1;
+        // 节点表锚: [u32 1..4096][名][父名] (盲同步, 兼容变体头)
+        // v4.8.1 热修: 多候选重试(最多10个, root/Bip01/父NULL优先) —— 单锚猜错会误报"无网格节点"
+        var cands = new List<int>();
         int lim = Math.Min(F - 12, 26 + 65536);
         int firstChunk = FindChunkAfter(d, 13);
         if (firstChunk < lim) lim = firstChunk;
@@ -867,15 +877,31 @@ public class PreviewV4 : MonoBehaviour
             string s1 = null, s2 = null; int e1 = 0, e2 = 0;
             if (!ActStr(d, p + 4, ref s1, ref e1, 64, 2)) continue;
             if (!ActStr(d, e1, ref s2, ref e2, 64, 2)) continue;
-            if (ncFirst < 0) ncFirst = p;
             string l1 = s1.ToLower(), l2 = s2.ToLower();
-            if (l1 == "root" || l1 == "bip01" || l2 == "null") { nc = p; break; }
+            if (l1 == "root" || l1 == "bip01" || l2 == "null") cands.Insert(0, p);
+            else cands.Add(p);
+            if (cands.Count >= 10) break;
         }
-        if (nc < 0) nc = ncFirst;
-        if (nc < 0) throw new Exception("ACT节点表未定位");
-        int nodeCount = U32(d, nc);
-        if (nodeCount < 1 || nodeCount > 4096) throw new Exception("节点数异常 " + nodeCount);
-        int o = nc + 4;
+        if (cands.Count == 0) throw new Exception("ACT节点表未定位");
+        foreach (int nc in cands)
+        {
+            int nodeCount = U32(d, nc);
+            if (nodeCount < 1 || nodeCount > 4096) continue;
+            var tmp = new ActMeshData();
+            WalkActNodes(d, nc + 4, nodeCount, F, tmp);
+            if (tmp.pts.Count > 0)
+            {
+                am.nodes = tmp.nodes; am.meshes = tmp.meshes; am.pts = tmp.pts;
+                break;
+            }
+        }
+        if (am.pts.Count == 0) throw new Exception("无网格节点(纯动画/特效)");
+        am.fmt = string.Format("v4.8.1 ACT点云 节点{0} 网格{1} 点{2}", am.nodes, am.meshes, am.pts.Count);
+        am.anchors = ExtractAnchorsAct(d);
+        return am;
+    }
+    static void WalkActNodes(byte[] d, int o, int nodeCount, int F, ActMeshData am)
+    {
         for (int i = 0; i < nodeCount && o < F - 8; i++)
         {
             string nm = null, pn = null; int e1 = 0, e2 = 0;
@@ -901,10 +927,6 @@ public class PreviewV4 : MonoBehaviour
             o = next;
             if (am.pts.Count > 150000) break;
         }
-        if (am.pts.Count == 0) throw new Exception("无网格节点(纯动画/特效)");
-        am.fmt = string.Format("v4.8 ACT点云 节点{0} 网格{1} 点{2}", am.nodes, am.meshes, am.pts.Count);
-        am.anchors = ExtractAnchorsAct(d);
-        return am;
     }
 
     // ================================================================
@@ -1014,7 +1036,7 @@ public class PreviewV4 : MonoBehaviour
             mat.color = new Color(0.72f, 0.72f, 0.76f);
             mr.sharedMaterial = mat;
 
-            line3 = string.Format("[v4.8] {0} | 骨架={1} ski:{2}B | 贴图=...",
+            line3 = string.Format("[v4.8.1] {0} | 骨架={1} ski:{2}B | 贴图=...",
                 sd.fmt, sk != null ? tag + ":" + sk.srcName : tag, d.Length);
 
             int anf = sk != null && sk.bones.Count > 0 ? sk.bones[0].nf : 0;
@@ -1030,7 +1052,7 @@ public class PreviewV4 : MonoBehaviour
         }
         catch (Exception e)
         {
-            line3 = "[v4.8] " + name + " 解析失败: " + e.Message + " (◀▶手动翻页)";
+            line3 = "[v4.8.1] " + name + " 解析失败: " + e.Message + " (◀▶手动翻页)";
             if (curModel != null) { UnityEngine.Object.Destroy(curModel); curModel = null; }
         }
     }
@@ -1065,13 +1087,13 @@ public class PreviewV4 : MonoBehaviour
             mat.color = new Color(0.62f, 0.70f, 0.82f);
             mr.sharedMaterial = mat;
 
-            line3 = "[v4.8] " + am.fmt + " | 贴图=...";
+            line3 = "[v4.8.1] " + am.fmt + " | 贴图=...";
             if (hostPv != null)
                 hostPv.StartCoroutine(LoadTexCoAct(name, am.anchors, mat));
         }
         catch (Exception e)
         {
-            line3 = "[v4.8] " + name + " 点云失败: " + e.Message + " (◀▶手动翻页)";
+            line3 = "[v4.8.1] " + name + " 点云失败: " + e.Message + " (◀▶手动翻页)";
             if (curModel != null) { UnityEngine.Object.Destroy(curModel); curModel = null; }
         }
     }
@@ -1112,7 +1134,7 @@ public class PreviewV4 : MonoBehaviour
     }
 
     // ================================================================
-    //                    贴图解析 v4.8
+    //                    贴图解析 v4.8.1
     // ================================================================
     static readonly Dictionary<string, string> texResCache = new Dictionary<string, string>();
 
@@ -1278,7 +1300,7 @@ public class PreviewV4 : MonoBehaviour
     }
 
     // ================================================================
-    //                    UI (OnGUI, 1080 设计宽缩放; v4.8 紧凑化)
+    //                    UI (OnGUI, 1080 设计宽缩放; v4.8.1 紧凑化)
     // ================================================================
     static GUIStyle box, label, small, btn, btnS, smallS;
     static void InitStyle()
