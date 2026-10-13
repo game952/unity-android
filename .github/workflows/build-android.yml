@@ -20,12 +20,19 @@ on:
 jobs:
   build:
     name: 云端构建
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
         with:
           lfs: true
+
+      - name: 清理磁盘空间
+        run: |
+          echo '清理前可用空间:' && df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/local/share/boost /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune -af || true
+          echo '清理后可用空间:' && df -h / | tail -1
 
       - name: Unity 构建
         uses: game-ci/unity-builder@v6
