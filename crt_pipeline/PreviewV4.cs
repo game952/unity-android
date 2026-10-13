@@ -725,14 +725,24 @@ public class PreviewV4 : MonoBehaviour
     static void FlushRun(SkiData sd, byte[] d, int runStart, int runLen, bool runHot, int vcp)
     {
         if (runLen < 9 || !runHot) return;
-        for (int i = 0; i + 2 < runLen; i += 3)
+        // 对齐搜索 (自检发现): 段头零填充/杂字节长度非3倍数时整表错位 → 全部三角形顶点错连(细碎片)。
+        // 0/1/2 三种对齐各数一遍有效三角形, 取最多者。
+        int bestShift = 0, bestCnt = -1;
+        for (int sh = 0; sh < 3; sh++)
         {
-            int a = U16(d, runStart + 2 * i);
-            int b2 = U16(d, runStart + 2 * i + 2);
-            int c = U16(d, runStart + 2 * i + 4);
-            if (a >= vcp || b2 >= vcp || c >= vcp) continue;
-            if (a == b2 || b2 == c || a == c) continue;
-            sd.tris.Add(a); sd.tris.Add(b2); sd.tris.Add(c);
+            int cnt = 0;
+            for (int i = sh; i + 2 < runLen; i += 3)
+            {
+                int a = U16(d, runStart + 2 * i), b2 = U16(d, runStart + 2 * i + 2), c = U16(d, runStart + 2 * i + 4);
+                if (a < vcp && b2 < vcp && c < vcp && a != b2 && b2 != c && a != c) cnt++;
+            }
+            if (cnt > bestCnt) { bestCnt = cnt; bestShift = sh; }
+        }
+        for (int i = bestShift; i + 2 < runLen; i += 3)
+        {
+            int a = U16(d, runStart + 2 * i), b2 = U16(d, runStart + 2 * i + 2), c = U16(d, runStart + 2 * i + 4);
+            if (a < vcp && b2 < vcp && c < vcp && a != b2 && b2 != c && a != c)
+            { sd.tris.Add(a); sd.tris.Add(b2); sd.tris.Add(c); }
         }
     }
 
