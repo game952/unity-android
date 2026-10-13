@@ -654,7 +654,7 @@ public class PreviewV4 : MonoBehaviour
         return res;
     }
 
-    static void FlushVtx(List<Vtx> vtx, List<int> b, List<float> w, List<Vector3> p)
+    static void FlushVtx(List<Vtx> vtx, List<byte> b, List<float> w, List<Vector3> p)
     {
         float s = 0; foreach (var x in w) s += x;
         var v = new Vtx();
@@ -719,7 +719,7 @@ public class PreviewV4 : MonoBehaviour
 
         // 装配: R 开新顶点(首绑定), C 并入当前顶点, 权重归一
         var vtx = new List<Vtx>(nR);
-        var curB = new List<int>(); var curW = new List<float>(); var curP = new List<Vector3>();
+        var curB = new List<byte>(); var curW = new List<float>(); var curP = new List<Vector3>();
         bool open = false;
         foreach (var r in recs)
         {
