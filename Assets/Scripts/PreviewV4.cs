@@ -919,16 +919,16 @@ public class PreviewV4 : MonoBehaviour
         int lim = Math.Min(F - 12, 26 + 65536);
         int firstChunk = FindChunkAfter(d, 13);
         if (firstChunk < lim) lim = firstChunk;
-        for (int p = 26; p < lim; p++)
+        for (int np = 26; np < lim; np++)
         {
-            int x = U32(d, p);
+            int x = U32(d, np);
             if (x < 1 || x > 4096) continue;
             string s1 = null, s2 = null; int e1 = 0, e2 = 0;
-            if (!ActStr(d, p + 4, ref s1, ref e1, 64, 2)) continue;
+            if (!ActStr(d, np + 4, ref s1, ref e1, 64, 2)) continue;
             if (!ActStr(d, e1, ref s2, ref e2, 64, 2)) continue;
             string l1 = s1.ToLower(), l2 = s2.ToLower();
-            if (l1 == "root" || l1 == "bip01" || l2 == "null") cands.Insert(0, p);
-            else cands.Add(p);
+            if (l1 == "root" || l1 == "bip01" || l2 == "null") cands.Insert(0, np);
+            else cands.Add(np);
             if (cands.Count >= 10) break;
         }
         if (cands.Count == 0) throw new Exception("ACT节点表未定位");
