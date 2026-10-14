@@ -31,10 +31,10 @@ using UnityEngine.Networking;
 public class PreviewV4 : MonoBehaviour
 {
     // ===== 真机校准常量 =====
-    static Vector3 ModelRot = new Vector3(-90f, 0f, 0f); // v4.8.2d: 源数据=Z-up(真机甲胄/头/靴/手套整体横躺实证), -90°X立起; 可用"转"按钮校准
+    static Vector3 ModelRot = new Vector3(-90f, 0f, 0f); // v4.8.3: 源数据=Z-up(真机甲胄/头/靴/手套整体横躺实证), -90°X立起; 可用"转"按钮校准
     static int _rotIdx;
     static readonly float[] _rotAng = { -90f, 0f, 90f, 180f };
-    const int FrameStand = 477; // v4.8.2d: frame_scan 全帧联合自洽最优站立帧(score 565)
+    const int FrameStand = 477; // v4.8.3: frame_scan 全帧联合自洽最优站立帧(score 565)
     const float FitSize = 3.4f;
     static float _zoom = 1f;
     static string _texSample = null;
@@ -80,7 +80,37 @@ public class PreviewV4 : MonoBehaviour
     static string curSki = "";
     static int catI = 2;           // 默认甲胄
     static float rotY = 0f;
-    static GameObject pivot, curModel;
+    static GameObject pivot, curModel;              // v4.8.3: 声明保留(原位)
+    static float _curS0 = 1f;                       // v4.8.3: 基准尺度(不含zoom)
+    static Vector3 _curBC = Vector3.zero;           // v4.8.3: 稳健中心
+    static Vector2 _pan = Vector2.zero;             // v4.8.3: 双指平移
+    static float _pinchD = 0f; static Vector2 _pinchC = Vector2.zero;
+
+    static void ApplyFrame()                        // v4.8.3: 缩放/平移即时生效, 不重载文件
+    {
+        if (curModel == null) return;
+        float s = _curS0 * _zoom;
+        curModel.transform.localScale = new Vector3(s, s, s);
+        curModel.transform.localPosition = new Vector3(0f, 1.55f, 0f) - s * _curBC + new Vector3(_pan.x, _pan.y, 0f);
+    }
+    void Update()                                   // v4.8.3: 双指捏合缩放 + 双指平移
+    {
+        if (Input.touchCount == 2)
+        {
+            var t0 = Input.GetTouch(0); var t1 = Input.GetTouch(1);
+            var c = (t0.position + t1.position) * 0.5f;
+            float nd = (t0.position - t1.position).magnitude;
+            if (_pinchD > 1f)
+            {
+                _zoom = Mathf.Clamp(_zoom * nd / _pinchD, 0.2f, 12f);
+                var dc = (c - _pinchC) * (6f / Mathf.Max(1, Screen.height));
+                _pan = new Vector2(Mathf.Clamp(_pan.x + dc.x, -3f, 3f), Mathf.Clamp(_pan.y + dc.y, -3f, 3f));
+            }
+            _pinchD = nd; _pinchC = c;
+        }
+        else _pinchD = 0f;
+        ApplyFrame();
+    }
     static string title = "", line2 = "", line3 = "";
     static readonly Dictionary<string, ActSkel> skelCache = new Dictionary<string, ActSkel>();
     static readonly Dictionary<string, Texture2D> texCache = new Dictionary<string, Texture2D>();
@@ -88,9 +118,9 @@ public class PreviewV4 : MonoBehaviour
 
     static readonly string[] Cats = {
         "武器·刀剑(槽1)", "武器·斧钺(槽2)", "甲胄·防具(3)", "头部(脸)",
-        "手套·防具(1)", "长靴·防具(2)", "外装", "其他部件", "怪物/坐骑" };
+        "手套·防具(1)", "长靴·防具(2)", "外装", "其他部件", "怪物/坐骑", "翅膀·外观" };   // v4.8.3: 翅膀独立分类
     // 左列显示顺序(按槽位): 甲胄→外装→头部→手套→长靴→刀剑→斧钺→其他→怪物
-    static readonly int[] CatOrder = { 2, 6, 3, 4, 5, 0, 1, 7, 8 };
+    static readonly int[] CatOrder = { 2, 6, 3, 4, 5, 0, 1, 7, 8, 9 };   // v4.8.3: +翅膀
     static readonly Regex RegexWeaponAct = new Regex(
         @"^\d+(dao|zhan|jian|feng|shu|gong|qiang|axe|sword|spear|bow|stick|gun)",
         RegexOptions.Compiled);
@@ -101,7 +131,7 @@ public class PreviewV4 : MonoBehaviour
     static void Boot()
     {
         try { SetupCam(); KillOthers(); Scan(); RebuildCat(); ShowCurrent(); }
-        catch (Exception e) { line3 = "[v4.8.2d] 启动失败: " + e.Message; }
+        catch (Exception e) { line3 = "[v4.8.3] 启动失败: " + e.Message; }
         var host = new GameObject("~PreviewV4");
         UnityEngine.Object.DontDestroyOnLoad(host);
         var pv = host.AddComponent<PreviewV4>();
@@ -237,7 +267,7 @@ public class PreviewV4 : MonoBehaviour
             pool.Sort();
             actPool = pool; useAsset = true;
             actorDir = "asset:creature/actor"; texDir = "asset:creature/texture";
-            title = string.Format("v4.8.2d 整装拼合 · APK注入 ({0} 骨架/{1} ski, StreamingAssets)", pool.Count, nSki);
+            title = string.Format("v4.8.3 整装拼合 · APK注入 ({0} 骨架/{1} ski, StreamingAssets)", pool.Count, nSki);
             return;
         }
         // 2) 外部目录兜底
@@ -259,7 +289,7 @@ public class PreviewV4 : MonoBehaviour
             actPool.Sort();
             string t = Path.GetDirectoryName(c) + "/texture";
             texDir = Directory.Exists(t) ? t : c;
-            title = string.Format("v4.8.2d 整装拼合 · 外部目录 ({0} 骨架/{1} ski)", actPool.Count, skis.Length);
+            title = string.Format("v4.8.3 整装拼合 · 外部目录 ({0} 骨架/{1} ski)", actPool.Count, skis.Length);
             return;
         }
         throw new Exception("未找到资源 (APK内StreamingAssets与外部目录均无数据)");
@@ -322,8 +352,8 @@ public class PreviewV4 : MonoBehaviour
             if (n.StartsWith("a_" + CurJob + "_" + CurSex + "_")) take = true;   // 当前职业部件
             else if (n.StartsWith("w_") && n.Contains("_" + CurJob)) take = true; // 当前职业武器ski
             else if (CatOf(n) == 0 || CatOf(n) == 1) take = true;      // 武器(全职业通用)
-            else if (CatOf(n) == 8) take = true;                       // 怪物/坐骑/翅膀
-            if (take) catFiles.Add(f);
+            else if (CatOf(n) >= 8) take = true;                       // 怪物/坐骑/翅膀(v4.8.3含翅膀分类)
+            if (take && !n.EndsWith("_atk")) catFiles.Add(f);      // v4.8.3: _atk 过滤(与CatOf双保险)
         }
         catFiles.Sort();
         FilterCat();
@@ -333,10 +363,12 @@ public class PreviewV4 : MonoBehaviour
     {
         if (n.StartsWith("w_"))
         {
+            if (n.EndsWith("_atk")) return -1;                     // v4.8.3: 攻击态同模不进列表
             int u = n.IndexOf('_', 2);
             string seg = u > 2 ? n.Substring(2, u - 2) : n.Substring(2);
-            if (seg.EndsWith("c")) return 1;
-            return 0;
+            char wl = seg.Length > 0 ? seg[seg.Length - 1] : '?';
+            if (wl == 'c' || wl == 'q' || wl == 'z' || wl == 'g' || wl == 'h') return 1;  // c/q/z/g/h型→斧钺槽
+            return 0;                                              // j/l/数字型→刀剑槽
         }
         if (RegexWeaponAct.IsMatch(n))
         {
@@ -354,11 +386,15 @@ public class PreviewV4 : MonoBehaviour
             if (n.Contains("_wai_")) return 6;
             return 7;
         }
-        if (n.Contains("chibang") || n.Contains("iwgong") || n.StartsWith("mon")
+        if (n.Contains("chibang")) return 9;           // v4.8.3: 翅膀从怪物/坐骑独立出来
+        if (n.Contains("iwgong") || n.StartsWith("mon") || n.StartsWith("s_mon")
+            || n.StartsWith("sn") || n.StartsWith("iw") || n.StartsWith("s_iw")
+            || n.StartsWith("wi") || n.StartsWith("wheel")
+            || (n.StartsWith("z") && n.Length > 1 && char.IsLetter(n[1]))
             || n.StartsWith("boss") || n.Contains("ride") || n.Contains("zuoqi")
             || n.Contains("horse") || n.StartsWith("pet") || n.StartsWith("gua"))
-            return 8;
-        return -1;   // epf/eph/s_/skill 等特效动画不进列表
+            return 8;   // v4.8.3: +sn/iw/s_iw/wi/wheel/z* 怪物坐骑召唤兽族
+        return -1;   // epf/eph/ept/epn_skill/ewar/wq* 等特效动画不进列表
     }
 
     static void FilterCat()
@@ -371,6 +407,24 @@ public class PreviewV4 : MonoBehaviour
     }
     static List<string> curSkiList = new List<string>();
     static int curIdx = 0;
+
+    // v4.8.3: 武器族前缀 (w_mjq_f_01_03 → w_mjq_f); 非武器原样返回
+    static string FamPrefix(string noExt)
+    {
+        if (!noExt.StartsWith("w_")) return noExt;
+        var p = noExt.Split('_');
+        return (p.Length >= 4 && p[3].Length > 0 && char.IsDigit(p[3][0]))
+            ? p[0] + "_" + p[1] + "_" + p[2] : noExt;
+    }
+    static void JumpNextFam()   // 名字条点击 → 跳到下一族首件
+    {
+        if (curSkiList.Count == 0) return;
+        string cur = FamPrefix(Path.GetFileNameWithoutExtension(curSkiList[curIdx]));
+        int i = curIdx;
+        while (i < curSkiList.Count && FamPrefix(Path.GetFileNameWithoutExtension(curSkiList[i])) == cur) i++;
+        curIdx = (i >= curSkiList.Count) ? 0 : i;
+        ShowCurrent();
+    }
 
     // ================================================================
     //                    act 骨架解析 (act_parse.py 等价, 不变)
@@ -502,7 +556,7 @@ public class PreviewV4 : MonoBehaviour
     }
     static List<FramePose> LoadSkeleton(ActSkel sk, int frame, List<FramePose> bind)
     {
-        // v4.8.2d 定案: act 每骨 quat/trans 即蒙皮空间变换, 绑定块 pos=骨局部坐标 → 纯直接用
+        // v4.8.3 定案: act 每骨 quat/trans 即蒙皮空间变换, 绑定块 pos=骨局部坐标 → 纯直接用
         // (全件全帧形状比 0.7~1.27x 刚体稳定; 父链组合/混合式/bind逆均炸形, 本地五组实验定案)
         // bind 参数保留兼容旧调用点, 本配方下不再使用
         var W = new List<FramePose>(sk.bones.Count);
@@ -720,7 +774,7 @@ public class PreviewV4 : MonoBehaviour
         // ---- D. 材质锚名 ----
         sd.anchors = ExtractAnchors(d);
 
-        sd.fmt = string.Format("v4.8.2d 顶点{0} 面{1} 流@0x{2:x}{3}{4}{5}",
+        sd.fmt = string.Format("v4.8.3 顶点{0} 面{1} 流@0x{2:x}{3}{4}{5}",
             vcp, sd.tris.Count / 3, best,
             sd.anchors.Count > 0 ? " 锚" + sd.anchors.Count : "",
             beUsed ? " 面[大端]" : "", faceAfter ? " 面在流后" : "");
@@ -938,7 +992,7 @@ public class PreviewV4 : MonoBehaviour
                 for (int k = 0; k < cap; k++)
                 {
                     var v = new Vector3(F32(d, p + 4 + k * 12), F32(d, p + 8 + k * 12), F32(d, p + 12 + k * 12));
-                    if (v.x > -1e6f && v.x < 1e6f && v.y > -1e6f && v.y < 1e6f && v.z > -1e6f && v.z < 1e6f) am.pts.Add(v);  // v4.8.2d: 滤垃圾浮点(NaN比较为false自动滤), 否则包围盒中心=NaN→视锥剔除全隐
+                    if (v.x > -1e6f && v.x < 1e6f && v.y > -1e6f && v.y < 1e6f && v.z > -1e6f && v.z < 1e6f) am.pts.Add(v);  // v4.8.3: 滤垃圾浮点(NaN比较为false自动滤), 否则包围盒中心=NaN→视锥剔除全隐
                 }
                 p += 4 + V * 12;
                 if (p + (long)V * 16 <= F2 && NiceRatio(d, p, V * 4) >= 0.6f) p += V * 16;  // 跳过uv/权重块
@@ -946,7 +1000,7 @@ public class PreviewV4 : MonoBehaviour
             else p++;
         }
         if (am.meshes == 0) throw new Exception("无网格节点(纯动画/特效)");
-        // v4.8.2d 救援: 签名扫描仅抓到1个块(疑似误报)时, 用节点表走查再试, 取网格数多者
+        // v4.8.3 救援: 签名扫描仅抓到1个块(疑似误报)时, 用节点表走查再试, 取网格数多者
         if (am.meshes <= 1)
         {
             var am2 = new ActMeshData();
@@ -954,7 +1008,7 @@ public class PreviewV4 : MonoBehaviour
             if (am2.meshes > am.meshes) { am.meshes = am2.meshes; am.pts = am2.pts; }
         }
         am.nodes = nodeCount0;
-        am.fmt = string.Format("v4.8.2d ACT点云 节点表{0} 网格{1} 点{2}", nodeCount0, am.meshes, am.pts.Count);
+        am.fmt = string.Format("v4.8.3 ACT点云 节点表{0} 网格{1} 点{2}", nodeCount0, am.meshes, am.pts.Count);
         am.anchors = ExtractAnchorsAct(d);
         return am;
     }
@@ -977,7 +1031,7 @@ public class PreviewV4 : MonoBehaviour
                 for (int k = 0; k < cap; k++)
                 {
                     var v = new Vector3(F32(d, o3 + 4 + k * 12), F32(d, o3 + 8 + k * 12), F32(d, o3 + 12 + k * 12));
-                    if (v.x > -1e6f && v.x < 1e6f && v.y > -1e6f && v.y < 1e6f && v.z > -1e6f && v.z < 1e6f) am.pts.Add(v);  // v4.8.2d: 同上滤垃圾
+                    if (v.x > -1e6f && v.x < 1e6f && v.y > -1e6f && v.y < 1e6f && v.z > -1e6f && v.z < 1e6f) am.pts.Add(v);  // v4.8.3: 同上滤垃圾
                 }
                 int p4 = o3 + 4 + V * 12;
                 if (p4 + (long)V * 16 <= F && NiceRatio(d, p4, V * 4) >= 0.6f) p4 += V * 16;
@@ -1023,12 +1077,31 @@ public class PreviewV4 : MonoBehaviour
     static void StartShow(string fileName)
     {
         string noExt = Path.GetFileNameWithoutExtension(fileName);
+        _pan = Vector2.zero;                           // v4.8.3: 换模型复位平移
         line2 = noExt + "  <" + Cats[catI] + ">  [" + CurJob + "_" + CurSex + "]";
         _animSk = null; _animMesh = null; _animSd = null;
         if (hostPv != null && _animCo != null) { hostPv.StopCoroutine(_animCo); _animCo = null; }
         if (hostPv == null) return;
         if (_loadCo != null) hostPv.StopCoroutine(_loadCo);
         _loadCo = hostPv.StartCoroutine(LoadShowCo(fileName));
+    }
+
+    // v4.8.3: 稳健取景 — 逐轴中位数为中心, 到中心距离90百分位×2.2为跨度
+    // 目的: 光效面片/离群特效点不再劫持包围盒中心与缩放(修"模型又小又偏")
+    static void RobustFrame(Vector3[] vs, ref Vector3 bc, ref float ext)
+    {
+        int n = vs.Length;
+        if (n == 0) { bc = Vector3.zero; ext = 1f; return; }
+        var xs = new float[n]; var ys = new float[n]; var zs = new float[n];
+        for (int i = 0; i < n; i++) { xs[i] = vs[i].x; ys[i] = vs[i].y; zs[i] = vs[i].z; }
+        System.Array.Sort(xs); System.Array.Sort(ys); System.Array.Sort(zs);
+        var med = new Vector3(xs[n / 2], ys[n / 2], zs[n / 2]);
+        var ds = new float[n];
+        for (int i = 0; i < n; i++) ds[i] = (vs[i] - med).magnitude;
+        System.Array.Sort(ds);
+        float r90 = ds[Mathf.Min(n - 1, n * 9 / 10)];
+        bc = med;
+        ext = Mathf.Max(r90 * 2.2f, 1e-3f);
     }
 
     static System.Collections.IEnumerator LoadShowCo(string fileName)
@@ -1074,17 +1147,16 @@ public class PreviewV4 : MonoBehaviour
             mesh.RecalculateNormals();
             mesh.RecalculateBounds();
 
-            var b = mesh.bounds;
-            float ext = Mathf.Max(b.extents.x, Mathf.Max(b.extents.y, b.extents.z));
-            float s = ext > 1e-5f ? FitFor(name) * _zoom / ext : _zoom;
+            Vector3 bc = Vector3.zero; float ext = 1f;
+            RobustFrame(vs, ref bc, ref ext);              // v4.8.3: 稳健取景(中位数中心+百分位跨度)
+            _curS0 = ext > 1e-5f ? FitFor(name) / ext : 1f;
+            _curBC = bc;
 
             if (curModel != null) UnityEngine.Object.Destroy(curModel);
             curModel = new GameObject(name);
             curModel.transform.SetParent(pivot.transform, false);
-            curModel.transform.localScale = new Vector3(s, s, s);
-            var bc = mesh.bounds.center;
-            curModel.transform.localPosition = new Vector3(0f, 1.55f, 0f) - s * bc;
             curModel.transform.localRotation = Quaternion.Euler(ModelRot);
+            ApplyFrame();
             curModel.AddComponent<MeshFilter>().sharedMesh = mesh;
             var mr = curModel.AddComponent<MeshRenderer>();
 
@@ -1125,20 +1197,19 @@ public class PreviewV4 : MonoBehaviour
             if (d == null) throw new Exception("act 读取失败: " + err);
             var am = ParseActMesh(d);
             Mesh mesh = BuildPointMesh(am.pts);
-            var b = mesh.bounds;
-            float ext = Mathf.Max(b.extents.x, Mathf.Max(b.extents.y, b.extents.z));
-            float extRaw = ext;  // v4.8.2d 诊断: 原始包围盒尺寸进日志
-            if (float.IsNaN(ext) || float.IsInfinity(ext) || ext > 1e5f || ext < 1e-4f)
-                ext = 2.0f;  // 包围盒异常(伪网格/垃圾坐标): 标定尺度兜底, 至少不让缩放归零
-            float s = ext > 1e-5f ? FitFor(name) * _zoom / ext : _zoom;
+            float extRaw = 0f;                             // v4.8.3: 原始最大坐标(诊断用)
+            foreach (var pv in am.pts) extRaw = Mathf.Max(extRaw, Mathf.Max(Mathf.Abs(pv.x), Mathf.Max(Mathf.Abs(pv.y), Mathf.Abs(pv.z))));
+            Vector3 bc = Vector3.zero; float ext = 2f;
+            var vsA = am.pts.ToArray();
+            RobustFrame(vsA, ref bc, ref ext);             // v4.8.3: 稳健取景, 光效面片不再劫持中心/缩放
+            _curS0 = ext > 1e-5f ? FitFor(name) / ext : 1f;
+            _curBC = bc;
 
             if (curModel != null) UnityEngine.Object.Destroy(curModel);
             curModel = new GameObject(name);
             curModel.transform.SetParent(pivot.transform, false);
-            curModel.transform.localScale = new Vector3(s, s, s);
-            var bc = mesh.bounds.center;
-            curModel.transform.localPosition = new Vector3(0f, 1.55f, 0f) - s * bc;
             curModel.transform.localRotation = Quaternion.Euler(ModelRot);
+            ApplyFrame();
             curModel.AddComponent<MeshFilter>().sharedMesh = mesh;
             var mr = curModel.AddComponent<MeshRenderer>();
 
@@ -1165,7 +1236,7 @@ public class PreviewV4 : MonoBehaviour
     // 点云 → 每点一个小面向相机的双三角片
     static Mesh BuildPointMesh(List<Vector3> pts)
     {
-        // v4.8.2d: 封顶16383点 → 65532顶点, 硬性低于16位索引65535上限(只用真机已验证的老API)
+        // v4.8.3: 封顶16383点 → 65532顶点, 硬性低于16位索引65535上限(只用真机已验证的老API)
         int N = Math.Min(pts.Count, 16383);
         var bmin = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
         var bmax = new Vector3(float.MinValue, float.MinValue, float.MinValue);
@@ -1292,6 +1363,11 @@ public class PreviewV4 : MonoBehaviour
                         : fam == "gong" ? "bow" : fam == "qiang" ? "spear" : "sword";
             string[] cands = { "a" + tier + word, "a" + tier + word + "01", tier + word, tier + word + "01" };
             foreach (var c in cands) { p = TryTex(c); if (p != null) return p; }
+        }
+        if (name.Contains("chibang"))                  // v4.8.3: 翅膀贴图兜底(0_chibang05→a_6_chibang)
+        {
+            string[] wch = { "a_6_chibang", "a6_chibang", "a_1_chibang", "a1_chibang", "chibang", "a_6_chibang01" };
+            foreach (var wc in wch) { p = TryTex(wc); if (p != null) return p; }
         }
         return null;
     }
@@ -1423,16 +1499,23 @@ public class PreviewV4 : MonoBehaviour
         { curIdx = (curIdx - 1 + curSkiList.Count) % Math.Max(1, curSkiList.Count); ShowCurrent(); }
         if (GUI.Button(new Rect(102, yb, 84, 48), "▶", btn))
         { curIdx = (curIdx + 1) % Math.Max(1, curSkiList.Count); ShowCurrent(); }
-        GUI.Label(new Rect(196, yb, 648, 48), curSkiList.Count == 0
+        Rect rName = new Rect(196, yb, 648, 48);
+        if (catI == 0 || catI == 1)   // v4.8.3: 武器分类名字条=跳族按钮
+        {
+            if (GUI.Button(rName, curSkiList.Count == 0 ? "(本职业无此部件)"
+                : string.Format("{0}/{1}  {2}  ▶下族", curIdx + 1, curSkiList.Count, Path.GetFileNameWithoutExtension(curSki)), small))
+                JumpNextFam();
+        }
+        else GUI.Label(rName, curSkiList.Count == 0
             ? "(本职业无此部件) 点右上「职业」换人 / 点左侧其他分类"
             : string.Format("{0}/{1}  {2}", curIdx + 1, curSkiList.Count, Path.GetFileNameWithoutExtension(curSki)), small);
-        if (GUI.Button(new Rect(850, yb, 60, 48), "转", btn)) { _rotIdx = (_rotIdx + 1) & 3; ModelRot = new Vector3(_rotAng[_rotIdx], 0f, 0f); ShowCurrent(); }  // v4.8.2d: 朝向校准
-        if (GUI.Button(new Rect(916, yb, 60, 48), "＋", btn)) { _zoom = Mathf.Clamp(_zoom * 1.2f, 0.2f, 8f); ShowCurrent(); }
-        if (GUI.Button(new Rect(982, yb, 60, 48), "－", btn)) { _zoom = Mathf.Clamp(_zoom / 1.2f, 0.2f, 8f); ShowCurrent(); }
+        if (GUI.Button(new Rect(850, yb, 60, 48), "转", btn)) { _rotIdx = (_rotIdx + 1) & 3; ModelRot = new Vector3(_rotAng[_rotIdx], 0f, 0f); ShowCurrent(); }  // v4.8.3: 朝向校准
+        if (GUI.Button(new Rect(916, yb, 60, 48), "＋", btn)) _zoom = Mathf.Clamp(_zoom * 1.2f, 0.2f, 12f);   // v4.8.3: 即时缩放不重载
+        if (GUI.Button(new Rect(982, yb, 60, 48), "－", btn)) _zoom = Mathf.Clamp(_zoom / 1.2f, 0.2f, 12f);
 
         // 拖动旋转
         var e = Event.current;
-        if (e.type == EventType.MouseDrag && e.button == 0) { rotY += e.delta.x * 0.45f; ApplyRot(); e.Use(); }
+        if (e.type == EventType.MouseDrag && e.button == 0 && Input.touchCount < 2) { rotY += e.delta.x * 0.45f; ApplyRot(); e.Use(); }   // v4.8.3: 双指时让位缩放/平移
     }
 
     static void ApplyRot()
