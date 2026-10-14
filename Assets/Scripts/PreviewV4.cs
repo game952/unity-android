@@ -31,8 +31,8 @@ using UnityEngine.Networking;
 public class PreviewV4 : MonoBehaviour
 {
     // ===== 真机校准常量 =====
-    static readonly Vector3 ModelRot = new Vector3(-90f, 0f, 0f); // 源数据 z-up → Unity y-up
-    const int FrameStand = 3736;
+    static readonly Vector3 ModelRot = new Vector3(0f, 0f, 0f); // v4.8.2a: 源数据=Y-up(真机横躺+发辫下垂+双靴直立三重实证), 撤销双重旋转
+    const int FrameStand = 477; // v4.8.2a: frame_scan 全帧联合自洽最优站立帧(score 565)
     const float FitSize = 3.4f;
     static float _zoom = 1f;
     static string _texSample = null;
@@ -99,7 +99,7 @@ public class PreviewV4 : MonoBehaviour
     static void Boot()
     {
         try { SetupCam(); KillOthers(); Scan(); RebuildCat(); ShowCurrent(); }
-        catch (Exception e) { line3 = "[v4.8.1d] 启动失败: " + e.Message; }
+        catch (Exception e) { line3 = "[v4.8.2a] 启动失败: " + e.Message; }
         var host = new GameObject("~PreviewV4");
         UnityEngine.Object.DontDestroyOnLoad(host);
         var pv = host.AddComponent<PreviewV4>();
@@ -235,7 +235,7 @@ public class PreviewV4 : MonoBehaviour
             pool.Sort();
             actPool = pool; useAsset = true;
             actorDir = "asset:creature/actor"; texDir = "asset:creature/texture";
-            title = string.Format("v4.8.1d 整装拼合 · APK注入 ({0} 骨架/{1} ski, StreamingAssets)", pool.Count, nSki);
+            title = string.Format("v4.8.2a 整装拼合 · APK注入 ({0} 骨架/{1} ski, StreamingAssets)", pool.Count, nSki);
             return;
         }
         // 2) 外部目录兜底
@@ -257,7 +257,7 @@ public class PreviewV4 : MonoBehaviour
             actPool.Sort();
             string t = Path.GetDirectoryName(c) + "/texture";
             texDir = Directory.Exists(t) ? t : c;
-            title = string.Format("v4.8.1d 整装拼合 · 外部目录 ({0} 骨架/{1} ski)", actPool.Count, skis.Length);
+            title = string.Format("v4.8.2a 整装拼合 · 外部目录 ({0} 骨架/{1} ski)", actPool.Count, skis.Length);
             return;
         }
         throw new Exception("未找到资源 (APK内StreamingAssets与外部目录均无数据)");
@@ -500,22 +500,11 @@ public class PreviewV4 : MonoBehaviour
     }
     static List<FramePose> LoadSkeleton(ActSkel sk, int frame, List<FramePose> bind)
     {
-        int nb = sk.bones.Count;
-        var idx = new Dictionary<string, int>();
-        for (int i = 0; i < nb; i++) idx[sk.bones[i].name] = i;
-        var world = new FramePose[nb];
-        for (int i = 0; i < nb; i++)
-        {
-            var L = BoneLocal(sk.bones[i], frame);
-            int pi;
-            if (sk.bones[i].parent != null && idx.TryGetValue(sk.bones[i].parent, out pi)
-                && pi != i && pi < i && world[pi] != null)
-                world[i] = MatMul(world[pi], L);
-            else world[i] = L;
-        }
-        var W = new List<FramePose>(nb);
-        for (int i = 0; i < nb; i++)
-            W.Add((bind != null && bind[i] != null) ? MatMul(world[i], MatInv(bind[i])) : world[i]);
+        // v4.8.2a 定案: act 每骨 quat/trans 即蒙皮空间变换, 绑定块 pos=骨局部坐标 → 纯直接用
+        // (全件全帧形状比 0.7~1.27x 刚体稳定; 父链组合/混合式/bind逆均炸形, 本地五组实验定案)
+        // bind 参数保留兼容旧调用点, 本配方下不再使用
+        var W = new List<FramePose>(sk.bones.Count);
+        for (int i = 0; i < sk.bones.Count; i++) W.Add(BoneLocal(sk.bones[i], frame));
         return W;
     }
     static List<FramePose> LoadBind(ActSkel sk) { return LoadSkeleton(sk, FrameStand, null); }
@@ -729,7 +718,7 @@ public class PreviewV4 : MonoBehaviour
         // ---- D. 材质锚名 ----
         sd.anchors = ExtractAnchors(d);
 
-        sd.fmt = string.Format("v4.8.1e 顶点{0} 面{1} 流@0x{2:x}{3}{4}{5}",
+        sd.fmt = string.Format("v4.8.2a 顶点{0} 面{1} 流@0x{2:x}{3}{4}{5}",
             vcp, sd.tris.Count / 3, best,
             sd.anchors.Count > 0 ? " 锚" + sd.anchors.Count : "",
             beUsed ? " 面[大端]" : "", faceAfter ? " 面在流后" : "");
@@ -919,16 +908,16 @@ public class PreviewV4 : MonoBehaviour
         int lim = Math.Min(F - 12, 26 + 65536);
         int firstChunk = FindChunkAfter(d, 13);
         if (firstChunk < lim) lim = firstChunk;
-        for (int np = 26; np < lim; np++)
+        for (int p = 26; p < lim; p++)
         {
-            int x = U32(d, np);
+            int x = U32(d, p);
             if (x < 1 || x > 4096) continue;
             string s1 = null, s2 = null; int e1 = 0, e2 = 0;
-            if (!ActStr(d, np + 4, ref s1, ref e1, 64, 2)) continue;
+            if (!ActStr(d, p + 4, ref s1, ref e1, 64, 2)) continue;
             if (!ActStr(d, e1, ref s2, ref e2, 64, 2)) continue;
             string l1 = s1.ToLower(), l2 = s2.ToLower();
-            if (l1 == "root" || l1 == "bip01" || l2 == "null") cands.Insert(0, np);
-            else cands.Add(np);
+            if (l1 == "root" || l1 == "bip01" || l2 == "null") cands.Insert(0, p);
+            else cands.Add(p);
             if (cands.Count >= 10) break;
         }
         if (cands.Count == 0) throw new Exception("ACT节点表未定位");
@@ -953,7 +942,7 @@ public class PreviewV4 : MonoBehaviour
         }
         if (am.meshes == 0) throw new Exception("无网格节点(纯动画/特效)");
         am.nodes = nodeCount0;
-        am.fmt = string.Format("v4.8.1d ACT点云 节点表{0} 网格{1} 点{2}", nodeCount0, am.meshes, am.pts.Count);
+        am.fmt = string.Format("v4.8.2a ACT点云 节点表{0} 网格{1} 点{2}", nodeCount0, am.meshes, am.pts.Count);
         am.anchors = ExtractAnchorsAct(d);
         return am;
     }
@@ -1079,7 +1068,7 @@ public class PreviewV4 : MonoBehaviour
             curModel.transform.SetParent(pivot.transform, false);
             curModel.transform.localScale = new Vector3(s, s, s);
             var bc = mesh.bounds.center;
-            curModel.transform.localPosition = new Vector3(0f, 1.55f, 0f) - s * new Vector3(bc.x, bc.z, -bc.y);
+            curModel.transform.localPosition = new Vector3(0f, 1.55f, 0f) - s * bc;
             curModel.transform.localRotation = Quaternion.Euler(ModelRot);
             curModel.AddComponent<MeshFilter>().sharedMesh = mesh;
             var mr = curModel.AddComponent<MeshRenderer>();
@@ -1130,7 +1119,7 @@ public class PreviewV4 : MonoBehaviour
             curModel.transform.SetParent(pivot.transform, false);
             curModel.transform.localScale = new Vector3(s, s, s);
             var bc = mesh.bounds.center;
-            curModel.transform.localPosition = new Vector3(0f, 1.55f, 0f) - s * new Vector3(bc.x, bc.z, -bc.y);
+            curModel.transform.localPosition = new Vector3(0f, 1.55f, 0f) - s * bc;
             curModel.transform.localRotation = Quaternion.Euler(ModelRot);
             curModel.AddComponent<MeshFilter>().sharedMesh = mesh;
             var mr = curModel.AddComponent<MeshRenderer>();
