@@ -1,5 +1,21 @@
 // PreviewV4.cs — v4.8.1d 整装拼合预览台 (2026-10-13 晚热修)
 // ============================================================
+// v4.8.5 装机目检修 (2026-10-14 深夜, 依据 v4.8.4 装机 10 图):
+//  ① P1 ACT点云族取景全灭(武器2zhan2 ext=947248/斧钺w_hjg ext=131356/怪物iw199_04 ext=32768 → 空屏;
+//     翅膀xx_1_chibang_1 ext=464 → 贴脸穿模整屏翅面) + mesh小件(手套glo_00 106顶点 → 屏顶小碎块):
+//     v4.8.4 的 d50×3 截断有两个盲区 — (a)脏点≥50%时中位数落进脏簇, 截断错切真身;
+//     (b)薄密legit云(翅膀膜)d50过小, 过截→ext塌缩→相机入膜.
+//     新 RobustFrame = 「最密格定心 + 间距断崖截尾」:
+//       a) 每轴p2~p98粗盒 → 4×4×4网格 → 最密格质心定心(真身集中, 弥散脏簇夺不了主);
+//       b) 全点到心距离排序, 相邻比值>5的最大断崖=分离垃圾组, 从断崖截尾
+//          (连续legit云相邻比值~1.x无断崖→不截→细长翅膀不再塌缩); 深度≤2, 仅影响取景不改解析计数
+//       c) 定心用生长区【逐轴中位数】(粗格混2%垃圾时质心被拽偏5270); 并列格偏向全局中位
+//          (防0x8000双垃圾簇夺主); 冠军格区域生长BFS(≥35%冠军)后再取中位(均匀体单格偏半身)
+//       仿真验证 6/6 场景通过(scripts/verify_v485_frame.py), 甲胄守护与旧算法一致(84.0 vs 83.6)
+//  ② P1 BuildPointMesh 点片大小原用 raw ext(垃圾点撑爆94万→点片5683单位→单quad糊屏):
+//     改用稳健 ext, 夹紧 [0.02, 50]
+//  ③ 诊断: ACT 状态行 ext 显示 raw→robust 双值, 装机可直读截尾效果
+// ============================================================
 // v4.8.4 装机目检修 (2026-10-14 晚, 依据 14 张真机截图 + 清单互证):
 //  ① P1 脸部又小又偏上(hea_00): ski 取景改为只统计【面表引用】的顶点 (FrameReferenced) —
 //     ski 内未被面引用的锚点/辅助顶点(hea 类约1/3)把中位中心+p90跨度一起带偏;
@@ -151,7 +167,7 @@ public class PreviewV4 : MonoBehaviour
     static void Boot()
     {
         try { SetupCam(); KillOthers(); Scan(); RebuildCat(); ShowCurrent(); }
-        catch (Exception e) { line3 = "[v4.8.4] 启动失败: " + e.Message; }
+        catch (Exception e) { line3 = "[v4.8.5] 启动失败: " + e.Message; }
         var host = new GameObject("~PreviewV4");
         UnityEngine.Object.DontDestroyOnLoad(host);
         var pv = host.AddComponent<PreviewV4>();
@@ -287,7 +303,7 @@ public class PreviewV4 : MonoBehaviour
             pool.Sort();
             actPool = pool; useAsset = true;
             actorDir = "asset:creature/actor"; texDir = "asset:creature/texture";
-            title = string.Format("v4.8.4 整装拼合 · APK注入 ({0} 骨架/{1} ski, StreamingAssets)", pool.Count, nSki);
+            title = string.Format("v4.8.5 整装拼合 · APK注入 ({0} 骨架/{1} ski, StreamingAssets)", pool.Count, nSki);
             return;
         }
         // 2) 外部目录兜底
@@ -309,7 +325,7 @@ public class PreviewV4 : MonoBehaviour
             actPool.Sort();
             string t = Path.GetDirectoryName(c) + "/texture";
             texDir = Directory.Exists(t) ? t : c;
-            title = string.Format("v4.8.4 整装拼合 · 外部目录 ({0} 骨架/{1} ski)", actPool.Count, skis.Length);
+            title = string.Format("v4.8.5 整装拼合 · 外部目录 ({0} 骨架/{1} ski)", actPool.Count, skis.Length);
             return;
         }
         throw new Exception("未找到资源 (APK内StreamingAssets与外部目录均无数据)");
@@ -794,7 +810,7 @@ public class PreviewV4 : MonoBehaviour
         // ---- D. 材质锚名 ----
         sd.anchors = ExtractAnchors(d);
 
-        sd.fmt = string.Format("v4.8.4 顶点{0} 面{1} 流@0x{2:x}{3}{4}{5}{6}",
+        sd.fmt = string.Format("v4.8.5 顶点{0} 面{1} 流@0x{2:x}{3}{4}{5}{6}",
             vcp, sd.tris.Count / 3, best,
             sd.anchors.Count > 0 ? " 锚" + sd.anchors.Count : "",
             beUsed ? " 面[大端]" : "", faceAfter ? " 面在流后" : "",
@@ -1109,7 +1125,7 @@ public class PreviewV4 : MonoBehaviour
             if (am2.meshes > am.meshes) { am.meshes = am2.meshes; am.pts = am2.pts; }
         }
         am.nodes = nodeCount0;
-        am.fmt = string.Format("v4.8.4 ACT点云 节点表{0} 网格{1} 点{2}", nodeCount0, am.meshes, am.pts.Count);
+        am.fmt = string.Format("v4.8.5 ACT点云 节点表{0} 网格{1} 点{2}", nodeCount0, am.meshes, am.pts.Count);
         am.anchors = ExtractAnchorsAct(d);
         return am;
     }
@@ -1187,9 +1203,14 @@ public class PreviewV4 : MonoBehaviour
         _loadCo = hostPv.StartCoroutine(LoadShowCo(fileName));
     }
 
-    // v4.8.3: 稳健取景 — 逐轴中位数为中心, 到中心距离90百分位×2.2为跨度
-    // 目的: 光效面片/离群特效点不再劫持包围盒中心与缩放(修"模型又小又偏")
-    static void RobustFrame(Vector3[] vs, ref Vector3 bc, ref float ext)
+    // v4.8.5: 稳健取景 — 「最密格定心 + 间距断崖截尾」(替换 v4.8.3 逐轴中位 + v4.8.4 d50×3 截断)
+    // v4.8.4 d50×3 截断两盲区(装机10图实锤): ①脏点≥50%(武器/怪物特效帧)→中位数落进脏簇→错切真身→空屏;
+    // ②薄密legit云(翅膀膜)→d50过小→过截→ext塌缩→相机贴脸. 新法:
+    //   a) 每轴 p2~p98 粗盒 → 4×4×4 网格 → 最密格质心定心(真身集中, 弥散脏簇夺不了主);
+    //   b) 全点到心距离排序 → 相邻比值>5 的最大断崖 = 分离的垃圾远组 → 从断崖截尾
+    //      (连续 legit 云相邻比值~1.x, 无断崖 → 不截 → 细长翅膀不再塌缩);
+    //   c) ext = 存活点 p90×2.2. 仅影响取景不改解析计数; 深度≤2 递归有界.
+    static void RobustFrame(Vector3[] vs, ref Vector3 bc, ref float ext, int depth = 0)
     {
         int n = vs.Length;
         if (n == 0) { bc = Vector3.zero; ext = 1f; return; }
@@ -1197,28 +1218,102 @@ public class PreviewV4 : MonoBehaviour
         for (int i = 0; i < n; i++) { xs[i] = vs[i].x; ys[i] = vs[i].y; zs[i] = vs[i].z; }
         System.Array.Sort(xs); System.Array.Sort(ys); System.Array.Sort(zs);
         var med = new Vector3(xs[n / 2], ys[n / 2], zs[n / 2]);
-        var ds = new float[n];
-        for (int i = 0; i < n; i++) ds[i] = (vs[i] - med).magnitude;
-        System.Array.Sort(ds);
-        // v4.8.4: 中位距离锚定的离群剔除 — 点云混入特效关键帧坐标(ext 10万级)时,
-        // p90 仍被撑爆 → 空屏。以 d50 为锚, 只保留 d≤max(d50×3,0.02) 的点参与取景;
-        // 仅影响取景不改解析计数; 剔后保留<8点则回退原样; 每层严格减点, 递归有界
-        if (n > 16)
+        Vector3 cen = med;
+        if (n >= 24 && depth < 2)
         {
-            float d50 = ds[n / 2];
-            float lim = Mathf.Max(d50 * 3f, 0.02f);
-            int keep = 0;
-            for (int i = 0; i < n; i++) if (ds[i] <= lim) keep++;
-            if (keep >= 8 && keep < n)
+            // a) p2~p98 粗盒 + 4×4×4 最密格定心
+            var bmin = new Vector3(xs[n * 2 / 100], ys[n * 2 / 100], zs[n * 2 / 100]);
+            int h = Mathf.Max(n * 2 / 100, n * 98 / 100 - 1);
+            var bmax = new Vector3(xs[h], ys[h], zs[h]);
+            var span = bmax - bmin;
+            float sp = Mathf.Max(span.x, Mathf.Max(span.y, span.z));
+            if (sp > 1e-5f)
             {
-                var vs2 = new Vector3[keep]; int k = 0;
-                for (int i = 0; i < n; i++) if ((vs[i] - med).magnitude <= lim) vs2[k++] = vs[i];
-                RobustFrame(vs2, ref bc, ref ext);
-                return;
+                var cell = new Vector3(Mathf.Max(span.x, sp * 0.01f), Mathf.Max(span.y, sp * 0.01f), Mathf.Max(span.z, sp * 0.01f)) / 4f;
+                var cnt = new int[64];
+                for (int i = 0; i < n; i++)
+                {
+                    int cx = Mathf.Clamp((int)((vs[i].x - bmin.x) / cell.x), 0, 3);
+                    int cy = Mathf.Clamp((int)((vs[i].y - bmin.y) / cell.y), 0, 3);
+                    int cz = Mathf.Clamp((int)((vs[i].z - bmin.z) / cell.z), 0, 3);
+                    cnt[(cy * 4 + cz) * 4 + cx]++;
+                }
+                int bi = 0; for (int i = 1; i < 64; i++) if (cnt[i] > cnt[bi]) bi = i;
+                // v4.8.5b: 并列偏向 — 计数≥70%冠军的格里取离全局中位最近的
+                // (防 0x8000 型双垃圾紧凑簇与真身打平时夺主, 实测怪物 iw199)
+                int maxc = cnt[bi];
+                float bd = float.MaxValue;
+                for (int i = 0; i < 64; i++)
+                {
+                    if (cnt[i] < Mathf.Max(maxc * 7 / 10, 8)) continue;
+                    int ix = i % 4, iz = (i / 4) % 4, iy = i / 16;
+                    var cc = bmin + new Vector3((ix + 0.5f) * cell.x, (iy + 0.5f) * cell.y, (iz + 0.5f) * cell.z);
+                    float dd = (cc - med).sqrMagnitude;
+                    if (dd < bd) { bd = dd; bi = i; }
+                }
+                // v4.8.5c: 区域生长 — 从冠军格 BFS 吸收相邻格(≥35%冠军计数)再取中位,
+                // 均匀体(甲胄)无主格, 单格中位心会偏半身(实测偏差33); 长到全身后中位数≈体心
+                int maxc2 = cnt[bi];
+                var take = new bool[64];
+                var stk = new List<int>(); stk.Add(bi); take[bi] = true;
+                while (stk.Count > 0)
+                {
+                    int c = stk[stk.Count - 1]; stk.RemoveAt(stk.Count - 1);
+                    int ix = c % 4, iz = (c / 4) % 4, iy = c / 16;
+                    int n0 = ix > 0 ? c - 1 : -1, n1 = ix < 3 ? c + 1 : -1;
+                    int n2 = iy > 0 ? c - 16 : -1, n3 = iy < 3 ? c + 16 : -1;
+                    int n4 = iz > 0 ? c - 4 : -1, n5 = iz < 3 ? c + 4 : -1;
+                    if (n0 >= 0 && !take[n0] && cnt[n0] >= maxc2 * 35 / 100) { take[n0] = true; stk.Add(n0); }
+                    if (n1 >= 0 && !take[n1] && cnt[n1] >= maxc2 * 35 / 100) { take[n1] = true; stk.Add(n1); }
+                    if (n2 >= 0 && !take[n2] && cnt[n2] >= maxc2 * 35 / 100) { take[n2] = true; stk.Add(n2); }
+                    if (n3 >= 0 && !take[n3] && cnt[n3] >= maxc2 * 35 / 100) { take[n3] = true; stk.Add(n3); }
+                    if (n4 >= 0 && !take[n4] && cnt[n4] >= maxc2 * 35 / 100) { take[n4] = true; stk.Add(n4); }
+                    if (n5 >= 0 && !take[n5] && cnt[n5] >= maxc2 * 35 / 100) { take[n5] = true; stk.Add(n5); }
+                }
+                // v4.8.5b: 定心用生长区点的【逐轴中位数】而非质心 —
+                // 粗格(跨度/4, 可达22万单位)会混入少量格内垃圾(实测2%), 质心被拽偏5270;
+                // 区内真身占绝对多数时中位数天然落在真身上
+                var cxs = new List<float>(); var cys = new List<float>(); var czs = new List<float>();
+                for (int i = 0; i < n; i++)
+                {
+                    int cx = Mathf.Clamp((int)((vs[i].x - bmin.x) / cell.x), 0, 3);
+                    int cy = Mathf.Clamp((int)((vs[i].y - bmin.y) / cell.y), 0, 3);
+                    int cz = Mathf.Clamp((int)((vs[i].z - bmin.z) / cell.z), 0, 3);
+                    if (take[(cy * 4 + cz) * 4 + cx])
+                    { cxs.Add(vs[i].x); cys.Add(vs[i].y); czs.Add(vs[i].z); }
+                }
+                int m = cxs.Count;
+                if (m >= 8)
+                {
+                    cxs.Sort(); cys.Sort(); czs.Sort();
+                    cen = new Vector3(cxs[m / 2], cys[m / 2], czs[m / 2]);   // 生长区中位心 = 真身锚心
+                }
+            }
+        }
+        // b) 距离断崖截尾
+        var ds = new float[n];
+        for (int i = 0; i < n; i++) ds[i] = (vs[i] - cen).magnitude;
+        System.Array.Sort(ds);
+        if (n >= 24 && depth < 2)
+        {
+            float best = 5f;                       // 相邻比值>5 = 断崖(连续云约1.0~1.5)
+            int lo = Mathf.Max(n / 20, 7), hi = n - 2;
+            int cut = -1;
+            for (int k = lo; k < hi; k++)
+            {
+                float ratio = ds[k + 1] / Mathf.Max(ds[k], 1e-5f);
+                if (ratio > best) { best = ratio; cut = k; }
+            }
+            if (cut >= lo)
+            {
+                var vs2 = new List<Vector3>(cut + 1);
+                for (int i = 0; i < n; i++)
+                    if ((vs[i] - cen).magnitude <= ds[cut]) vs2.Add(vs[i]);
+                if (vs2.Count >= 8 && vs2.Count < n) { RobustFrame(vs2.ToArray(), ref bc, ref ext, depth + 1); return; }
             }
         }
         float r90 = ds[Mathf.Min(n - 1, n * 9 / 10)];
-        bc = med;
+        bc = cen;
         ext = Mathf.Max(r90 * 2.2f, 1e-3f);
     }
 
@@ -1310,7 +1405,7 @@ public class PreviewV4 : MonoBehaviour
             mat.color = new Color(0.72f, 0.72f, 0.76f);
             mr.sharedMaterial = mat;
 
-            line3 = string.Format("[v4.8.4] {0} 转{1:F0} | 骨架={2} ski:{3}B | 贴图=...",
+            line3 = string.Format("[v4.8.5] {0} 转{1:F0} | 骨架={2} ski:{3}B | 贴图=...",
                 sd.fmt, ModelRot.x, sk != null ? tag + ":" + sk.srcName : tag, d.Length);
 
             int anf = sk != null && sk.bones.Count > 0 ? sk.bones[0].nf : 0;
@@ -1326,7 +1421,7 @@ public class PreviewV4 : MonoBehaviour
         }
         catch (Exception e)
         {
-            line3 = "[v4.8.4] " + name + " 解析失败: " + e.Message + " (◀▶手动翻页)";
+            line3 = "[v4.8.5] " + name + " 解析失败: " + e.Message + " (◀▶手动翻页)";
             if (curModel != null) { UnityEngine.Object.Destroy(curModel); curModel = null; }
         }
     }
@@ -1337,12 +1432,12 @@ public class PreviewV4 : MonoBehaviour
         {
             if (d == null) throw new Exception("act 读取失败: " + err);
             var am = ParseActMesh(d);
-            Mesh mesh = BuildPointMesh(am.pts);
             float extRaw = 0f;                             // v4.8.3: 原始最大坐标(诊断用)
             foreach (var pv in am.pts) extRaw = Mathf.Max(extRaw, Mathf.Max(Mathf.Abs(pv.x), Mathf.Max(Mathf.Abs(pv.y), Mathf.Abs(pv.z))));
             Vector3 bc = Vector3.zero; float ext = 2f;
             var vsA = am.pts.ToArray();
-            RobustFrame(vsA, ref bc, ref ext);             // v4.8.3: 稳健取景, 光效面片不再劫持中心/缩放
+            RobustFrame(vsA, ref bc, ref ext);             // v4.8.5: 最密格定心+断崖截尾(先取景后建网格)
+            Mesh mesh = BuildPointMesh(am.pts, ext);       // v4.8.5: 点片大小用稳健ext
             _curS0 = ext > 1e-5f ? FitFor(name) / ext : 1f;
             _curBC = bc;
 
@@ -1363,31 +1458,25 @@ public class PreviewV4 : MonoBehaviour
             mat.color = new Color(0.62f, 0.70f, 0.82f);
             mr.sharedMaterial = mat;
 
-            line3 = "[v4.8.4] " + am.fmt + " ext=" + extRaw.ToString("F2") + " 转" + ModelRot.x.ToString("F0") + " | 贴图=...";
+            line3 = "[v4.8.5] " + am.fmt + " ext=" + extRaw.ToString("F0") + "→" + ext.ToString("F1") + " 转" + ModelRot.x.ToString("F0") + " | 贴图=...";
             if (hostPv != null)
                 hostPv.StartCoroutine(LoadTexCoAct(name, am.anchors, mat));
         }
         catch (Exception e)
         {
-            line3 = "[v4.8.4] " + name + " 点云失败: " + e.Message + " (◀▶手动翻页)";
+            line3 = "[v4.8.5] " + name + " 点云失败: " + e.Message + " (◀▶手动翻页)";
             if (curModel != null) { UnityEngine.Object.Destroy(curModel); curModel = null; }
         }
     }
 
     // 点云 → 每点一个小面向相机的双三角片
-    static Mesh BuildPointMesh(List<Vector3> pts)
+    static Mesh BuildPointMesh(List<Vector3> pts, float extR)   // v4.8.5: 点片大小改用稳健ext
     {
         // v4.8.3: 封顶16383点 → 65532顶点, 硬性低于16位索引65535上限(只用真机已验证的老API)
         int N = Math.Min(pts.Count, 16383);
-        var bmin = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
-        var bmax = new Vector3(float.MinValue, float.MinValue, float.MinValue);
-        for (int i = 0; i < pts.Count; i++)
-        {
-            bmin = Vector3.Min(bmin, pts[i]);
-            bmax = Vector3.Max(bmax, pts[i]);
-        }
-        float ext = Mathf.Max(bmax.x - bmin.x, Mathf.Max(bmax.y - bmin.y, bmax.z - bmin.z));
-        float s = Mathf.Max(ext * 0.006f, 0.02f);
+        // v4.8.5: 原来用 raw 包围盒(垃圾点撑到94万 → 点片5683单位 → 单quad糊屏);
+        // 改用稳健 ext 定片大小, 并夹紧上限
+        float s = Mathf.Clamp(extR * 0.006f, 0.02f, 50f);
         var vs = new Vector3[N * 4];
         var tris = new int[N * 6];
         for (int i = 0; i < N; i++)
