@@ -31,8 +31,8 @@ using UnityEngine.Networking;
 public class PreviewV4 : MonoBehaviour
 {
     // ===== 真机校准常量 =====
-    static readonly Vector3 ModelRot = new Vector3(0f, 0f, 0f); // v4.8.2a: 源数据=Y-up(真机横躺+发辫下垂+双靴直立三重实证), 撤销双重旋转
-    const int FrameStand = 477; // v4.8.2a: frame_scan 全帧联合自洽最优站立帧(score 565)
+    static readonly Vector3 ModelRot = new Vector3(0f, 0f, 0f); // v4.8.2b: 源数据=Y-up(真机横躺+发辫下垂+双靴直立三重实证), 撤销双重旋转
+    const int FrameStand = 477; // v4.8.2b: frame_scan 全帧联合自洽最优站立帧(score 565)
     const float FitSize = 3.4f;
     static float _zoom = 1f;
     static string _texSample = null;
@@ -99,7 +99,7 @@ public class PreviewV4 : MonoBehaviour
     static void Boot()
     {
         try { SetupCam(); KillOthers(); Scan(); RebuildCat(); ShowCurrent(); }
-        catch (Exception e) { line3 = "[v4.8.2a] 启动失败: " + e.Message; }
+        catch (Exception e) { line3 = "[v4.8.2b] 启动失败: " + e.Message; }
         var host = new GameObject("~PreviewV4");
         UnityEngine.Object.DontDestroyOnLoad(host);
         var pv = host.AddComponent<PreviewV4>();
@@ -235,7 +235,7 @@ public class PreviewV4 : MonoBehaviour
             pool.Sort();
             actPool = pool; useAsset = true;
             actorDir = "asset:creature/actor"; texDir = "asset:creature/texture";
-            title = string.Format("v4.8.2a 整装拼合 · APK注入 ({0} 骨架/{1} ski, StreamingAssets)", pool.Count, nSki);
+            title = string.Format("v4.8.2b 整装拼合 · APK注入 ({0} 骨架/{1} ski, StreamingAssets)", pool.Count, nSki);
             return;
         }
         // 2) 外部目录兜底
@@ -257,7 +257,7 @@ public class PreviewV4 : MonoBehaviour
             actPool.Sort();
             string t = Path.GetDirectoryName(c) + "/texture";
             texDir = Directory.Exists(t) ? t : c;
-            title = string.Format("v4.8.2a 整装拼合 · 外部目录 ({0} 骨架/{1} ski)", actPool.Count, skis.Length);
+            title = string.Format("v4.8.2b 整装拼合 · 外部目录 ({0} 骨架/{1} ski)", actPool.Count, skis.Length);
             return;
         }
         throw new Exception("未找到资源 (APK内StreamingAssets与外部目录均无数据)");
@@ -500,7 +500,7 @@ public class PreviewV4 : MonoBehaviour
     }
     static List<FramePose> LoadSkeleton(ActSkel sk, int frame, List<FramePose> bind)
     {
-        // v4.8.2a 定案: act 每骨 quat/trans 即蒙皮空间变换, 绑定块 pos=骨局部坐标 → 纯直接用
+        // v4.8.2b 定案: act 每骨 quat/trans 即蒙皮空间变换, 绑定块 pos=骨局部坐标 → 纯直接用
         // (全件全帧形状比 0.7~1.27x 刚体稳定; 父链组合/混合式/bind逆均炸形, 本地五组实验定案)
         // bind 参数保留兼容旧调用点, 本配方下不再使用
         var W = new List<FramePose>(sk.bones.Count);
@@ -718,7 +718,7 @@ public class PreviewV4 : MonoBehaviour
         // ---- D. 材质锚名 ----
         sd.anchors = ExtractAnchors(d);
 
-        sd.fmt = string.Format("v4.8.2a 顶点{0} 面{1} 流@0x{2:x}{3}{4}{5}",
+        sd.fmt = string.Format("v4.8.2b 顶点{0} 面{1} 流@0x{2:x}{3}{4}{5}",
             vcp, sd.tris.Count / 3, best,
             sd.anchors.Count > 0 ? " 锚" + sd.anchors.Count : "",
             beUsed ? " 面[大端]" : "", faceAfter ? " 面在流后" : "");
@@ -941,8 +941,15 @@ public class PreviewV4 : MonoBehaviour
             else p++;
         }
         if (am.meshes == 0) throw new Exception("无网格节点(纯动画/特效)");
+        // v4.8.2b 救援: 签名扫描仅抓到1个块(疑似误报)时, 用节点表走查再试, 取网格数多者
+        if (am.meshes <= 1)
+        {
+            var am2 = new ActMeshData();
+            try { WalkActNodes(d, cands[0] + 4, nodeCount0, F, am2); } catch (Exception) { }
+            if (am2.meshes > am.meshes) { am.meshes = am2.meshes; am.pts = am2.pts; }
+        }
         am.nodes = nodeCount0;
-        am.fmt = string.Format("v4.8.2a ACT点云 节点表{0} 网格{1} 点{2}", nodeCount0, am.meshes, am.pts.Count);
+        am.fmt = string.Format("v4.8.2b ACT点云 节点表{0} 网格{1} 点{2}", nodeCount0, am.meshes, am.pts.Count);
         am.anchors = ExtractAnchorsAct(d);
         return am;
     }
@@ -1112,6 +1119,9 @@ public class PreviewV4 : MonoBehaviour
             Mesh mesh = BuildPointMesh(am.pts);
             var b = mesh.bounds;
             float ext = Mathf.Max(b.extents.x, Mathf.Max(b.extents.y, b.extents.z));
+            float extRaw = ext;  // v4.8.2b 诊断: 原始包围盒尺寸进日志
+            if (float.IsNaN(ext) || float.IsInfinity(ext) || ext > 1e5f || ext < 1e-4f)
+                ext = 2.0f;  // 包围盒异常(伪网格/垃圾坐标): 标定尺度兜底, 至少不让缩放归零
             float s = ext > 1e-5f ? FitFor(name) * _zoom / ext : _zoom;
 
             if (curModel != null) UnityEngine.Object.Destroy(curModel);
@@ -1133,7 +1143,7 @@ public class PreviewV4 : MonoBehaviour
             mat.color = new Color(0.62f, 0.70f, 0.82f);
             mr.sharedMaterial = mat;
 
-            line3 = "[v4.8.1d] " + am.fmt + " | 贴图=...";
+            line3 = "[v4.8.1d] " + am.fmt + " ext=" + extRaw.ToString("F2") + " | 贴图=...";
             if (hostPv != null)
                 hostPv.StartCoroutine(LoadTexCoAct(name, am.anchors, mat));
         }
@@ -1172,6 +1182,7 @@ public class PreviewV4 : MonoBehaviour
             tris[t + 3] = b; tris[t + 4] = b + 2; tris[t + 5] = b + 3;
         }
         var mesh = new Mesh();
+        mesh.indexFormat = UnityEngine.Rendering.MeshIndexFormat.UInt32;  // v4.8.2b: >65535顶点必须32位索引, 否则真机静默失败→空渲染
         mesh.vertices = vs;
         mesh.triangles = tris;
         mesh.RecalculateBounds();
