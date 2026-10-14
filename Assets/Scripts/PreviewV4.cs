@@ -1,5 +1,25 @@
 // PreviewV4.cs — v4.8.1d 整装拼合预览台 (2026-10-13 晚热修)
 // ============================================================
+// v4.8.4 装机目检修 (2026-10-14 晚, 依据 14 张真机截图 + 清单互证):
+//  ① P1 脸部又小又偏上(hea_00): ski 取景改为只统计【面表引用】的顶点 (FrameReferenced) —
+//     ski 内未被面引用的锚点/辅助顶点(hea 类约1/3)把中位中心+p90跨度一起带偏;
+//     引用顶点<8 时退回全顶点。靴/甲不受影响(其顶点几乎全被引用)
+//  ② P1 点云空屏(4feng01 ext=859126 / iw02_04 ext=525472 / chibang05_03 ext=98940):
+//     RobustFrame 加中位距离锚定的离群剔除 — d>max(d50×3, 0.02) 的点不参与取景
+//     (仅影响取景, 不改解析计数; 剔后保留<8 点则回退原样; 每层严格减点, 递归有界)
+//  ③ P1 武器贴图✗未命中(6zhan01/4feng01/iw0401dao): 武器词根匹配不再锚定行首
+//     (iw0401dao 可命中 dao→sword), 且加跨阶兜底 a1..a9 (6zhan01→a5sword)
+//  ④ P0 时装家族炸形(fashion04 碎片) — 双样本字节级定案(clo_00对照):
+//     CRT_SkelSkin 头 = [skelRef][u16垫][u32 meshCount] ×mc:[网格名][材质名][面u16数][面表][1B标志]
+//     面表用【全局顶点索引】; 顶点区 = 一条全局数组(nbk 可达 6, 六骨权重 0.25×6=1.5 合法)
+//     病根×2: ChainVtx nbk≤4 在 326 条处撞 nbk=6 斩断数组(vcp 759→326) +
+//             面表段"≥最长50%"把子网格1(1101u16=49.5%)拒收 → 741面×vcp326 大量越界 = 碎片
+//     修复: nbk≤8 + 权重和≤2.5 + ParseMeshFaces 头部直读(面表按序拼接, vcpHint=最大索引+1,
+//           顶点不足时链尾续拼); 校验链: 名字全 IsW + 面数%3==0 + 尾部 CRT_MaterialLib 魔数,
+//           任何存疑 → null 回退旧启发式(bpf10 等异构头不受影响)
+//     验收: clo_00 413/660 不变✓; fashion04 326→759 顶点 / 741→1108 面, 索引0越界✓,
+//           本地网格渲染成片(与已知好文件同特征)✓
+//  解析层接口不变, 计数器口径不变 — verify_v481g 回归不受影响
 // v4.8.1d 热修（装机报错定位后当天修复）:
 //  ① "骨架表异常 nb=1050/2622" → ski 头不再解码骨架表 (role ski 头布局与 bpf10 样本不符,
 //     dissect_ski 式解码把面数当骨数); 顶点流改为自 offset 16 全长扫描, 最长自校验链者胜
@@ -131,7 +151,7 @@ public class PreviewV4 : MonoBehaviour
     static void Boot()
     {
         try { SetupCam(); KillOthers(); Scan(); RebuildCat(); ShowCurrent(); }
-        catch (Exception e) { line3 = "[v4.8.3] 启动失败: " + e.Message; }
+        catch (Exception e) { line3 = "[v4.8.4] 启动失败: " + e.Message; }
         var host = new GameObject("~PreviewV4");
         UnityEngine.Object.DontDestroyOnLoad(host);
         var pv = host.AddComponent<PreviewV4>();
@@ -267,7 +287,7 @@ public class PreviewV4 : MonoBehaviour
             pool.Sort();
             actPool = pool; useAsset = true;
             actorDir = "asset:creature/actor"; texDir = "asset:creature/texture";
-            title = string.Format("v4.8.3 整装拼合 · APK注入 ({0} 骨架/{1} ski, StreamingAssets)", pool.Count, nSki);
+            title = string.Format("v4.8.4 整装拼合 · APK注入 ({0} 骨架/{1} ski, StreamingAssets)", pool.Count, nSki);
             return;
         }
         // 2) 外部目录兜底
@@ -289,7 +309,7 @@ public class PreviewV4 : MonoBehaviour
             actPool.Sort();
             string t = Path.GetDirectoryName(c) + "/texture";
             texDir = Directory.Exists(t) ? t : c;
-            title = string.Format("v4.8.3 整装拼合 · 外部目录 ({0} 骨架/{1} ski)", actPool.Count, skis.Length);
+            title = string.Format("v4.8.4 整装拼合 · 外部目录 ({0} 骨架/{1} ski)", actPool.Count, skis.Length);
             return;
         }
         throw new Exception("未找到资源 (APK内StreamingAssets与外部目录均无数据)");
@@ -653,7 +673,7 @@ public class PreviewV4 : MonoBehaviour
         {
             if (o + 4 > F) break;
             int nbk = U32(d, o);
-            if (nbk < 1 || nbk > 4) break;
+            if (nbk < 1 || nbk > 8) break;   // v4.8.4: 4→8 — fashion04 实证 nbk=6(六骨权重)记录存在, ≤4 会把全局顶点数组拦腰斩断
             int q = o + 4;
             float tw = 0;
             for (int i = 0; i < nbk; i++)
@@ -665,7 +685,7 @@ public class PreviewV4 : MonoBehaviour
                 tw += w;
                 q += 30;
             }
-            if (nbk > 1 && (tw < 0.5f || tw > 1.6f)) return n;
+            if (nbk > 1 && (tw < 0.5f || tw > 2.5f)) return n;  // v4.8.4: 1.6→2.5 — nbk=6 全 0.25 权重 tw=1.5 合法
             if (q + 21 <= F)
             {
                 float u = F32(d, q + 13), v = F32(d, q + 17);
@@ -694,6 +714,12 @@ public class PreviewV4 : MonoBehaviour
         try { int t = 16; skelRef = ReadCStr(d, ref t, 64); } catch { }
         sd.skelRef = skelRef;
 
+        // ---- A2. v4.8.4: 头部驱动多子网格面表直读 (字节级定案: clo_00=1网格/fashion04=2网格):
+        // [skelRef][u16垫][u32 meshCount] ×mc:[u32 len][网格名][u32 len][材质名][u32面u16数][面表][1B标志=01]
+        // 面表用【全局顶点索引】(子网格共享接缝顶点, fashion04 实测: 子网格0=0..562, 子网格1引用0..758)
+        int vcpHint = -1, mcHit = 0;
+        var hdrTris = ParseMeshFaces(d, F, out vcpHint, out mcHit);
+
         // ---- B. 顶点流定位: 自16起全长扫描, 最长自校验链者胜 (ski_obj.py 实测格式) ----
         int best = -1, bestN = 0;
         for (int p = 16; p < F - 60; p++)
@@ -703,12 +729,88 @@ public class PreviewV4 : MonoBehaviour
             if (bestN > 4000) break;
         }
         if (bestN < 8) throw new Exception("顶点流未定位(最长链" + bestN + ")");
-        int p2 = best;
-        while (p2 < F - 8)
+        int p2 = WalkVerts(sd, d, best, F, int.MaxValue);
+        int vcp = sd.verts.Count;
+        // v4.8.4: 面表驱动补齐 — 极少数文件顶点数组间有插入块时, 最长链<vcpHint → 从链尾顺序续拼
+        if (hdrTris != null && vcpHint > vcp && vcpHint <= 60000)
+        {
+            int sp = p2;
+            while (sd.verts.Count < vcpHint && sp < F - 60)
+            {
+                int cn = ChainVtx(d, sp, F);
+                if (cn >= 8) { p2 = WalkVerts(sd, d, sp, F, vcpHint); sp = p2; }
+                else sp++;
+            }
+            vcp = sd.verts.Count;
+        }
+        if (vcp < 3) throw new Exception("0 顶点");
+
+        // ---- C. 面表: 小端 u16 (v4.7 误用大端 = 碎片化根因) ----
+        bool faceAfter = false, beUsed = false; int candCnt = 0;
+        if (hdrTris != null)
+        {
+            // v4.8.4: 头部直读 = 全部子网格面表按序拼接, 全局索引对全局顶点数组 — 不再启发式段收集
+            sd.tris = hdrTris;
+        }
+        else
+        {
+        // v4.8.1d (真机指纹定案): 面表在顶点流【之后】—— 流前最长u16段仅骨架/头部碎段,
+        // 而计数器vcp与链长互证(294@0xa14)。双区间收集: 流前[16,best) + 流后[walkEnd,F)
+        int walkEnd = p2;
+        // v4.8.1f: 双对齐×双端序候选段 → 按长度降序贪心; 重叠过半跳过(幽灵段), 产量(有效面)为纲
+        // (LE 表的 BE 奇对齐幽灵会复刻同值序列致双倍计数; 幽灵产量恒0 → 产出为零不占位)
+        var cands = new List<int[]>();
+        cands.AddRange(CollectRuns(d, 16, best, vcp, false));
+        cands.AddRange(CollectRuns(d, 16, best, vcp, true));
+        cands.AddRange(CollectRuns(d, walkEnd, F, vcp, false));
+        cands.AddRange(CollectRuns(d, walkEnd, F, vcp, true));
+        candCnt = cands.Count;
+        cands.Sort((x, y) => y[1].CompareTo(x[1]));
+        int maxLen = cands.Count > 0 ? cands[0][1] : 0;
+        var taken = new List<int[]>();   // 已产出段 [start, end)
+        foreach (var r in cands)
+        {
+            if (r[1] < maxLen / 2) continue;
+            int s0 = r[0], e0 = r[0] + 2 * r[1];
+            bool blocked = false;
+            foreach (var t in taken)
+            {
+                int ov = Math.Min(e0, t[1]) - Math.Max(s0, t[0]);
+                if (ov > 0 && ov * 2 > (e0 - s0)) { blocked = true; break; }
+            }
+            if (blocked) continue;
+            int before = sd.tris.Count;
+            FlushRun(sd, d, r[0], r[1], true, vcp, r[3] != 0);
+            if (sd.tris.Count > before)
+            {
+                taken.Add(new[] { s0, e0 });
+                if (r[3] != 0) beUsed = true;
+                if (r[0] >= walkEnd) faceAfter = true;
+            }
+        }
+        }
+        if (sd.tris.Count == 0) throw new Exception("0 面表(候选" + candCnt + "段)");
+
+        // ---- D. 材质锚名 ----
+        sd.anchors = ExtractAnchors(d);
+
+        sd.fmt = string.Format("v4.8.4 顶点{0} 面{1} 流@0x{2:x}{3}{4}{5}{6}",
+            vcp, sd.tris.Count / 3, best,
+            sd.anchors.Count > 0 ? " 锚" + sd.anchors.Count : "",
+            beUsed ? " 面[大端]" : "", faceAfter ? " 面在流后" : "",
+            mcHit > 1 ? " 子网格" + mcHit : "");
+        return sd;
+    }
+
+    // v4.8.4: 顶点记录走查(自 p 起, 逐条解析并入 sd, 到 limit 条/链断/EOF 止) — 返回结束偏移
+    static int WalkVerts(SkiData sd, byte[] d, int p, int F, int limit)
+    {
+        int p2 = p;
+        while (p2 < F - 8 && sd.verts.Count < limit)
         {
             if (p2 + 4 > F) break;
             int nbk = U32(d, p2);
-            if (nbk < 1 || nbk > 4) break;
+            if (nbk < 1 || nbk > 8) break;   // v4.8.4: 4→8 同 ChainVtx
             int q = p2 + 4;
             var v = new Vtx();
             v.bid = new byte[nbk]; v.w = new float[nbk]; v.pos = new Vector3[nbk];
@@ -731,54 +833,53 @@ public class PreviewV4 : MonoBehaviour
             if (sw > 1e-6f) for (int i = 0; i < v.w.Length; i++) v.w[i] /= sw;
             sd.verts.Add(v);
         }
-        int vcp = sd.verts.Count;
-        if (vcp < 3) throw new Exception("0 顶点");
+        return p2;
+    }
 
-        // ---- C. 面表: 小端 u16 (v4.7 误用大端 = 碎片化根因) ----
-        // v4.8.1d (真机指纹定案): 面表在顶点流【之后】—— 流前最长u16段仅骨架/头部碎段,
-        // 而计数器vcp与链长互证(294@0xa14)。双区间收集: 流前[16,best) + 流后[walkEnd,F)
-        int walkEnd = p2;
-        // v4.8.1f: 双对齐×双端序候选段 → 按长度降序贪心; 重叠过半跳过(幽灵段), 产量(有效面)为纲
-        // (LE 表的 BE 奇对齐幽灵会复刻同值序列致双倍计数; 幽灵产量恒0 → 产出为零不占位)
-        var cands = new List<int[]>();
-        cands.AddRange(CollectRuns(d, 16, best, vcp, false));
-        cands.AddRange(CollectRuns(d, 16, best, vcp, true));
-        cands.AddRange(CollectRuns(d, walkEnd, F, vcp, false));
-        cands.AddRange(CollectRuns(d, walkEnd, F, vcp, true));
-        cands.Sort((x, y) => y[1].CompareTo(x[1]));
-        int maxLen = cands.Count > 0 ? cands[0][1] : 0;
-        var taken = new List<int[]>();   // 已产出段 [start, end)
-        bool faceAfter = false, beUsed = false;
-        foreach (var r in cands)
+    // v4.8.4: 头部驱动多子网格面表直读 — 布局字节级定案(clo_00/fashion04 双样本互证):
+    // [FF FF 0C CRT_SkelSkin][u32 len][skelRef][u16垫][u32 meshCount]
+    //   ×mc: [u32 len][网格名][u32 len][材质名][u32 面u16数][面表(LE u16)][1B 标志=01]
+    // [ff ff][u16=15]["CRT_MaterialLib"]...
+    // 成功=全部子网格面表拼接(全局顶点索引); 任何存疑返回 null → 回退启发式段收集(bpf10 等异构头)
+    static List<int> ParseMeshFaces(byte[] d, int F, out int vcpHint, out int mc)
+    {
+        vcpHint = -1; mc = 0;
+        try
         {
-            if (r[1] < maxLen / 2) continue;
-            int s0 = r[0], e0 = r[0] + 2 * r[1];
-            bool blocked = false;
-            foreach (var t in taken)
+            int o = 16;
+            int nl = (int)U32(d, o);
+            if (nl < 1 || nl > 64 || o + 4 + nl + 2 > F) return null;
+            for (int i = 0; i < nl; i++) if (!IsW(d[o + 4 + i])) return null;
+            o += 4 + nl + 2;                          // skelRef + u16垫
+            mc = (int)U32(d, o); o += 4;
+            if (mc < 1 || mc > 8) return null;   // v4.8.4: ≤8 — 校验链足够强, 覆盖多件套时装
+            var tris = new List<int>(); int mx = 0;
+            for (int m = 0; m < mc; m++)
             {
-                int ov = Math.Min(e0, t[1]) - Math.Max(s0, t[0]);
-                if (ov > 0 && ov * 2 > (e0 - s0)) { blocked = true; break; }
+                for (int k = 0; k < 2; k++)           // 网格名 + 材质名
+                {
+                    int sn = (int)U32(d, o);
+                    if (sn < 2 || sn > 48 || o + 4 + sn > F) return null;
+                    for (int i = 0; i < sn; i++) if (!IsW(d[o + 4 + i])) return null;
+                    o += 4 + sn;
+                }
+                int fc = (int)U32(d, o); o += 4;
+                if (fc < 3 || fc > 262144 || fc % 3 != 0 || o + 2 * fc > F) return null;
+                for (int j = 0; j < fc; j++)
+                {
+                    int a = (int)U16(d, o + 2 * j);
+                    tris.Add(a);
+                    if (a > mx) mx = a;
+                }
+                o += 2 * fc + 1;                      // 面表 + 1B标志
             }
-            if (blocked) continue;
-            int before = sd.tris.Count;
-            FlushRun(sd, d, r[0], r[1], true, vcp, r[3] != 0);
-            if (sd.tris.Count > before)
-            {
-                taken.Add(new[] { s0, e0 });
-                if (r[3] != 0) beUsed = true;
-                if (r[0] >= walkEnd) faceAfter = true;
-            }
+            if (o + 2 > F || d[o] != 0xFF || d[o + 1] != 0xFF) return null;
+            if (o + 19 > F || Str(d, o + 4, 15) != "CRT_MaterialLib") return null;
+            if (mx + 1 > 60000) return null;
+            vcpHint = mx + 1;
+            return tris;
         }
-        if (sd.tris.Count == 0) throw new Exception("0 面表(候选" + cands.Count + "段)");
-
-        // ---- D. 材质锚名 ----
-        sd.anchors = ExtractAnchors(d);
-
-        sd.fmt = string.Format("v4.8.3 顶点{0} 面{1} 流@0x{2:x}{3}{4}{5}",
-            vcp, sd.tris.Count / 3, best,
-            sd.anchors.Count > 0 ? " 锚" + sd.anchors.Count : "",
-            beUsed ? " 面[大端]" : "", faceAfter ? " 面在流后" : "");
-        return sd;
+        catch { return null; }
     }
     // 面索引解码: 大端 u16 (v4.8.1e 定案: 面表=头部后 BE u16, v4.7 曾被顶点流问题连坐冤枉)
     static int I16(byte[] d, int p, bool be) { return be ? ((d[p] << 8) | d[p + 1]) : U16(d, p); }
@@ -1008,7 +1109,7 @@ public class PreviewV4 : MonoBehaviour
             if (am2.meshes > am.meshes) { am.meshes = am2.meshes; am.pts = am2.pts; }
         }
         am.nodes = nodeCount0;
-        am.fmt = string.Format("v4.8.3 ACT点云 节点表{0} 网格{1} 点{2}", nodeCount0, am.meshes, am.pts.Count);
+        am.fmt = string.Format("v4.8.4 ACT点云 节点表{0} 网格{1} 点{2}", nodeCount0, am.meshes, am.pts.Count);
         am.anchors = ExtractAnchorsAct(d);
         return am;
     }
@@ -1099,9 +1200,49 @@ public class PreviewV4 : MonoBehaviour
         var ds = new float[n];
         for (int i = 0; i < n; i++) ds[i] = (vs[i] - med).magnitude;
         System.Array.Sort(ds);
+        // v4.8.4: 中位距离锚定的离群剔除 — 点云混入特效关键帧坐标(ext 10万级)时,
+        // p90 仍被撑爆 → 空屏。以 d50 为锚, 只保留 d≤max(d50×3,0.02) 的点参与取景;
+        // 仅影响取景不改解析计数; 剔后保留<8点则回退原样; 每层严格减点, 递归有界
+        if (n > 16)
+        {
+            float d50 = ds[n / 2];
+            float lim = Mathf.Max(d50 * 3f, 0.02f);
+            int keep = 0;
+            for (int i = 0; i < n; i++) if (ds[i] <= lim) keep++;
+            if (keep >= 8 && keep < n)
+            {
+                var vs2 = new Vector3[keep]; int k = 0;
+                for (int i = 0; i < n; i++) if ((vs[i] - med).magnitude <= lim) vs2[k++] = vs[i];
+                RobustFrame(vs2, ref bc, ref ext);
+                return;
+            }
+        }
         float r90 = ds[Mathf.Min(n - 1, n * 9 / 10)];
         bc = med;
         ext = Mathf.Max(r90 * 2.2f, 1e-3f);
+    }
+
+    // v4.8.4: 只用【被面表引用】的顶点取景 — ski 里未被面引用的锚点/辅助顶点
+    // (hea_00 实测约1/3顶点离群)会把中位中心与p90一起带偏 → "脸又小又偏上";
+    // 引用顶点<8 时退回全顶点(纯点云/空面表场景)
+    static void FrameReferenced(Vector3[] vs, List<int> tris, ref Vector3 bc, ref float ext)
+    {
+        var mark = new bool[vs.Length];
+        int used = 0;
+        for (int i = 0; i + 2 < tris.Count; i += 3)
+        {
+            int a = tris[i], b = tris[i + 1], c = tris[i + 2];
+            if (a >= 0 && a < vs.Length && !mark[a]) { mark[a] = true; used++; }
+            if (b >= 0 && b < vs.Length && !mark[b]) { mark[b] = true; used++; }
+            if (c >= 0 && c < vs.Length && !mark[c]) { mark[c] = true; used++; }
+        }
+        if (used >= 8)
+        {
+            var rv = new Vector3[used]; int k = 0;
+            for (int i = 0; i < vs.Length; i++) if (mark[i]) rv[k++] = vs[i];
+            RobustFrame(rv, ref bc, ref ext);
+        }
+        else RobustFrame(vs, ref bc, ref ext);
     }
 
     static System.Collections.IEnumerator LoadShowCo(string fileName)
@@ -1148,7 +1289,7 @@ public class PreviewV4 : MonoBehaviour
             mesh.RecalculateBounds();
 
             Vector3 bc = Vector3.zero; float ext = 1f;
-            RobustFrame(vs, ref bc, ref ext);              // v4.8.3: 稳健取景(中位数中心+百分位跨度)
+            FrameReferenced(vs, sd.tris, ref bc, ref ext); // v4.8.4: 面表引用顶点取景, 锚点顶点不再劫持
             _curS0 = ext > 1e-5f ? FitFor(name) / ext : 1f;
             _curBC = bc;
 
@@ -1169,7 +1310,7 @@ public class PreviewV4 : MonoBehaviour
             mat.color = new Color(0.72f, 0.72f, 0.76f);
             mr.sharedMaterial = mat;
 
-            line3 = string.Format("[v4.8.1d] {0} 转{1:F0} | 骨架={2} ski:{3}B | 贴图=...",
+            line3 = string.Format("[v4.8.4] {0} 转{1:F0} | 骨架={2} ski:{3}B | 贴图=...",
                 sd.fmt, ModelRot.x, sk != null ? tag + ":" + sk.srcName : tag, d.Length);
 
             int anf = sk != null && sk.bones.Count > 0 ? sk.bones[0].nf : 0;
@@ -1185,7 +1326,7 @@ public class PreviewV4 : MonoBehaviour
         }
         catch (Exception e)
         {
-            line3 = "[v4.8.1d] " + name + " 解析失败: " + e.Message + " (◀▶手动翻页)";
+            line3 = "[v4.8.4] " + name + " 解析失败: " + e.Message + " (◀▶手动翻页)";
             if (curModel != null) { UnityEngine.Object.Destroy(curModel); curModel = null; }
         }
     }
@@ -1222,13 +1363,13 @@ public class PreviewV4 : MonoBehaviour
             mat.color = new Color(0.62f, 0.70f, 0.82f);
             mr.sharedMaterial = mat;
 
-            line3 = "[v4.8.1d] " + am.fmt + " ext=" + extRaw.ToString("F2") + " 转" + ModelRot.x.ToString("F0") + " | 贴图=...";
+            line3 = "[v4.8.4] " + am.fmt + " ext=" + extRaw.ToString("F2") + " 转" + ModelRot.x.ToString("F0") + " | 贴图=...";
             if (hostPv != null)
                 hostPv.StartCoroutine(LoadTexCoAct(name, am.anchors, mat));
         }
         catch (Exception e)
         {
-            line3 = "[v4.8.1d] " + name + " 点云失败: " + e.Message + " (◀▶手动翻页)";
+            line3 = "[v4.8.4] " + name + " 点云失败: " + e.Message + " (◀▶手动翻页)";
             if (curModel != null) { UnityEngine.Object.Destroy(curModel); curModel = null; }
         }
     }
@@ -1354,15 +1495,23 @@ public class PreviewV4 : MonoBehaviour
                     cand = cand.Substring(0, k2);
                 }
             }
-        var m = Regex.Match(name, @"^(\d)(\d?)(dao|zhan|jian|feng|shu|gong|qiang)");
+        // v4.8.4: 不锚定行首 — iw0401dao 等怪物武器名也能命中 dao→sword 词根
+        var m = Regex.Match(name, @"(\d)(\d?)(dao|zhan|jian|feng|shu|gong|qiang)");
         if (m.Success)
         {
             string tier = m.Groups[1].Value;
             string fam = m.Groups[3].Value;
             string word = fam == "feng" ? "axe" : fam == "shu" ? "stick"
                         : fam == "gong" ? "bow" : fam == "qiang" ? "spear" : "sword";
-            string[] cands = { "a" + tier + word, "a" + tier + word + "01", tier + word, tier + word + "01" };
-            foreach (var c in cands) { p = TryTex(c); if (p != null) return p; }
+            // v4.8.4: 跨阶兜底 — 贴图库常缺高阶同名(6zhan01 无 a6sword 但有 a5sword);
+            // 先本阶, 再 a1..a9 全阶扫描
+            var tiers = new List<string> { tier };
+            for (int t = 1; t <= 9; t++) { string ts = t.ToString(); if (ts != tier) tiers.Add(ts); }
+            foreach (var t2 in tiers)
+            {
+                string[] cands = { "a" + t2 + word, "a" + t2 + word + "01", t2 + word, t2 + word + "01" };
+                foreach (var c in cands) { p = TryTex(c); if (p != null) return p; }
+            }
         }
         if (name.Contains("chibang"))                  // v4.8.3: 翅膀贴图兜底(0_chibang05→a_6_chibang)
         {
