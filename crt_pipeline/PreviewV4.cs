@@ -1,5 +1,24 @@
 // PreviewV4.cs — v4.8.1d 整装拼合预览台 (2026-10-13 晚热修)
 // ============================================================
+// v4.8.7 本地全量导入 (2026-10-20 晚, 用户定调: bundle 只装文档代码, 资源留手机本地直读):
+//  ① 病灶: 装机只吃 StreamingAssets 注入子集(测试部分) — 池里武器/怪物/翅膀有, 甲胄贴图缺族;
+//     pak 不在游戏目录散放(ls/find 双空), 全量资源在手机本地 pak_out
+//  ② 新架构「双源分层」: ProbeLocal() 探测 5 个候选路径(游戏端/pak_out, Game/pak_out,
+//     pak_out2, persistentDataPath×2) → localActorDir/localTexDir;
+//     ReadActorFile/ReadTexFile/TexExists 一律【本地优先, SA兜底】(每读try-catch, 本地缺失不炸);
+//     Scan() SA分支合并本地骨架进 actPool; RebuildCat() 合并本地 ski/act 进浏览池(HashSet去重);
+//     TexPoolNames() 合并贴图池(本地+SA排序去重) → v4.8.6 的 TexFamNote 自动适配本地真身
+//  ③ 诊断: 标题行显示 探测结果[本地✓/×] + 本地 ski/骨 增量计数 — 装机一眼看清双源状态
+//  ④ 解析层零改动 (verify 判据不受影响); 权限依据: BootGuard 曾成功直写 /storage/emulated/0/Download
+// ============================================================
+// v4.8.6 定案配套小修 (2026-10-20, 会话 git 归档后):
+//  ① 定案: hj/mj/ss 甲胄贴图✗未命中 = 源包无此族贴图 — manifest.csv(awt包) texture/ 共149个dds
+//     全为 a_wt_*; 装机池样本[a5sword,a_6_chibang,a_wt_*] 与 a_hj/a_mj/a_ss 字典序应在场而缺席, 双证一致。
+//     真身贴图应在游戏目录其余门派 pak (ahj/amj/ass?) → 待用户解包回传, 非代码缺陷
+//  ② UI: 「本职业无此部件」占位时清掉旧网格与旧状态行(此前残留上一件模型, 误读为渲染异常)
+//  ③ 诊断: 贴图✗未命中行追加族缺失提示 — "✗未命中(池N个[样本],缺a_hj族(待解该族pak))",
+//     池全量名一次IO缓存(_texPool), 不逐件重扫
+// ============================================================
 // v4.8.5 装机目检修 (2026-10-14 深夜, 依据 v4.8.4 装机 10 图):
 //  ① P1 ACT点云族取景全灭(武器2zhan2 ext=947248/斧钺w_hjg ext=131356/怪物iw199_04 ext=32768 → 空屏;
 //     翅膀xx_1_chibang_1 ext=464 → 贴脸穿模整屏翅面) + mesh小件(手套glo_00 106顶点 → 屏顶小碎块):
@@ -74,6 +93,41 @@ public class PreviewV4 : MonoBehaviour
     const float FitSize = 3.4f;
     static float _zoom = 1f;
     static string _texSample = null;
+    static string[] _texPool = null;                // v4.8.6: 贴图池全量名(一次IO缓存)
+    // v4.8.7: 合并贴图池 — 本地 pak_out/creature/texture 优先, SA/外部目录补齐, 排序去重
+    static string[] TexPoolNames()
+    {
+        if (_texPool != null) return _texPool;
+        var l = new List<string>();
+        if (useAsset)
+        {
+            var ls = ListAssets("creature/texture");
+            if (ls != null) l.AddRange(ls);
+        }
+        else if (texDir != null && Directory.Exists(texDir))
+        {
+            try { foreach (var f in Directory.GetFiles(texDir)) l.Add(Path.GetFileName(f)); } catch (Exception) { }
+        }
+        if (localTexDir != null)
+        {
+            var seen = new HashSet<string>(l);
+            try { foreach (var f in Directory.GetFiles(localTexDir)) { var n = Path.GetFileName(f); if (seen.Add(n)) l.Add(n); } }
+            catch (Exception) { }
+        }
+        l.Sort();
+        _texPool = l.ToArray();
+        return _texPool;
+    }
+    // v4.8.6: 未命中时的族缺失诊断 — manifest定案pak仅含a_wt族甲胄贴图,
+    // hj/mj/ss 在池内必然缺席 → 提示"待解该族pak", 避免误判为代码缺陷
+    static string TexFamNote(string skiName)
+    {
+        if (_texPool == null || string.IsNullOrEmpty(skiName)) return "";
+        if (!skiName.StartsWith("a_") || skiName.Length < 4) return "";
+        string fam = skiName.Substring(0, 4);       // a_hj / a_mj / a_ss / a_wt
+        for (int i = 0; i < _texPool.Length; i++) if (_texPool[i].StartsWith(fam)) return "";
+        return ",缺" + fam + "族(待解该族pak)";
+    }
     // 骨骼动画播放状态
     static ActSkel _animSk; static SkiData _animSd; static Mesh _animMesh; static List<FramePose> _animBind;
     static Coroutine _animCo;
@@ -167,7 +221,7 @@ public class PreviewV4 : MonoBehaviour
     static void Boot()
     {
         try { SetupCam(); KillOthers(); Scan(); RebuildCat(); ShowCurrent(); }
-        catch (Exception e) { line3 = "[v4.8.5] 启动失败: " + e.Message; }
+        catch (Exception e) { line3 = "[v4.8.7] 启动失败: " + e.Message; }
         var host = new GameObject("~PreviewV4");
         UnityEngine.Object.DontDestroyOnLoad(host);
         var pv = host.AddComponent<PreviewV4>();
@@ -195,6 +249,33 @@ public class PreviewV4 : MonoBehaviour
     static PreviewV4 hostPv;
     static Coroutine _loadCo;
     static bool useAsset = false;
+    // v4.8.7: 本地全量层 — pak_out 直读(双源合并: 本地优先, SA 兜底)
+    // 依据: ①装机池只有注入子集(测试部分), 手机本地 pak_out 才是全量 ②BootGuard 已证可写 /storage/emulated/0
+    static string localActorDir = null, localTexDir = null;
+    static string localProbe = "";                  // 探测诊断: "pak_out✓ pak_out2× …"
+    static void ProbeLocal()
+    {
+        localActorDir = null; localTexDir = null; localProbe = "";
+        string pd = Application.persistentDataPath;
+        string[] cands = {
+            "/storage/emulated/0/Game/游戏端/pak_out/creature/actor",
+            "/storage/emulated/0/Game/pak_out/creature/actor",
+            "/storage/emulated/0/Game/游戏端/pak_out2/creature/actor",
+            pd + "/pak_out/creature/actor",
+            pd + "/creature/actor",
+        };
+        foreach (var c in cands)
+        {
+            bool ex = Directory.Exists(c);
+            string tag = Path.GetFileName(Path.GetDirectoryName(Path.GetDirectoryName(c)));
+            localProbe += (localProbe.Length > 0 ? " " : "") + tag + (ex ? "✓" : "×");
+            if (!ex) continue;
+            localActorDir = c;
+            string t = Path.GetDirectoryName(c) + "/texture";
+            localTexDir = Directory.Exists(t) ? t : c;
+            return;
+        }
+    }
     static AndroidJavaObject _am;
     static AndroidJavaObject AM()
     {
@@ -255,16 +336,31 @@ public class PreviewV4 : MonoBehaviour
     }
     static byte[] ReadActorFile(string fn)
     {
+        // v4.8.7: 本地全量层优先 — 本地没有该文件才回落 SA/外部目录
+        if (localActorDir != null)
+        {
+            try { var p = Path.Combine(localActorDir, fn); if (File.Exists(p)) return File.ReadAllBytes(p); } catch (Exception) { }
+        }
         return useAsset ? ReadAsset("creature/actor/" + fn)
                         : File.ReadAllBytes(Path.Combine(actorDir, fn));
     }
     static byte[] ReadTexFile(string fn)
     {
+        // v4.8.7: 本地全量层优先 — pak_out 的贴图不经过注入, 直接读盘
+        if (localTexDir != null)
+        {
+            try { var p = Path.Combine(localTexDir, fn); if (File.Exists(p)) return File.ReadAllBytes(p); } catch (Exception) { }
+        }
         return useAsset ? ReadAsset("creature/texture/" + fn)
                         : File.ReadAllBytes(Path.Combine(texDir, fn));
     }
     static bool TexExists(string fn)
     {
+        // v4.8.7: 本地优先, SA/外部目录兜底
+        if (localTexDir != null)
+        {
+            try { if (File.Exists(Path.Combine(localTexDir, fn))) return true; } catch (Exception) { }
+        }
         return useAsset ? HasAsset("creature/texture/" + fn)
                         : File.Exists(Path.Combine(texDir, fn));
     }
@@ -290,6 +386,8 @@ public class PreviewV4 : MonoBehaviour
     }
     static void Scan()
     {
+        // 0) v4.8.7: 本地全量层探测 (无论走哪个分支都要做 — 手机 pak_out 是全量真身)
+        ProbeLocal();
         // 1) APK 内 StreamingAssets
         var pool = new List<string>();
         int nSki = 0;
@@ -300,33 +398,58 @@ public class PreviewV4 : MonoBehaviour
         }
         if (pool.Count > 0 || nSki > 0)
         {
-            pool.Sort();
+            // v4.8.7: 合并本地 pak_out (骨架补进actPool; ski计数并入标题; RebuildCat 再做浏览层合并)
+            int nSkiLoc = 0, nActLoc = 0;
+            if (localActorDir != null)
+            {
+                try
+                {
+                    var seen = new HashSet<string>(pool);
+                    foreach (var f in Directory.GetFiles(localActorDir))
+                    {
+                        string n = Path.GetFileName(f), e = Path.GetExtension(f).ToLower();
+                        if (e == ".ski") { nSkiLoc++; continue; }
+                        if (e == ".act" && n.StartsWith("role_") && seen.Add(n)) { pool.Add(n); nActLoc++; }
+                    }
+                }
+                catch (Exception) { }
+                pool.Sort();
+            }
             actPool = pool; useAsset = true;
             actorDir = "asset:creature/actor"; texDir = "asset:creature/texture";
-            title = string.Format("v4.8.5 整装拼合 · APK注入 ({0} 骨架/{1} ski, StreamingAssets)", pool.Count, nSki);
+            title = string.Format("v4.8.7 整装拼合 · APK注入{0}骨/{1}ski{2}",
+                pool.Count, nSki + nSkiLoc,
+                localActorDir != null
+                    ? string.Format(" +本地(含{0}ski/{1}骨) ✓[{2}]", nSkiLoc, nActLoc, localProbe)
+                    : " 本地×[" + localProbe + "]");
             return;
         }
         // 2) 外部目录兜底
-        string pd = Application.persistentDataPath;
-        string[] cands = {
-            "/storage/emulated/0/Game/pak_out/creature/actor",
-            pd + "/pak_out/creature/actor",
-            pd + "/creature/actor",
-        };
-        foreach (var c in cands)
         {
-            if (!Directory.Exists(c)) continue;
-            var acts = Directory.GetFiles(c, "role_*.act");
-            var skis = Directory.GetFiles(c, "*.ski");
-            if (acts.Length == 0 && skis.Length == 0) continue;
-            actorDir = c; useAsset = false;
-            actPool = new List<string>();
-            foreach (var a in acts) actPool.Add(a);
-            actPool.Sort();
-            string t = Path.GetDirectoryName(c) + "/texture";
-            texDir = Directory.Exists(t) ? t : c;
-            title = string.Format("v4.8.5 整装拼合 · 外部目录 ({0} 骨架/{1} ski)", actPool.Count, skis.Length);
-            return;
+            string pd = Application.persistentDataPath;
+            string[] cands = {
+                "/storage/emulated/0/Game/pak_out/creature/actor",
+                "/storage/emulated/0/Game/游戏端/pak_out/creature/actor",
+                pd + "/pak_out/creature/actor",
+                pd + "/creature/actor",
+            };
+            foreach (var c in cands)
+            {
+                if (!Directory.Exists(c)) continue;
+                var acts = Directory.GetFiles(c, "role_*.act");
+                var skis = Directory.GetFiles(c, "*.ski");
+                if (acts.Length == 0 && skis.Length == 0) continue;
+                actorDir = c; useAsset = false;
+                localActorDir = c;                                 // v4.8.7: 外部模式下本地层=同目录, 分层读统一
+                string t = Path.GetDirectoryName(c) + "/texture";
+                texDir = Directory.Exists(t) ? t : c;
+                localTexDir = Directory.Exists(t) ? t : c;
+                actPool = new List<string>();
+                foreach (var a in acts) actPool.Add(a);
+                actPool.Sort();
+                title = string.Format("v4.8.7 整装拼合 · 外部目录 ({0} 骨架/{1} ski)", actPool.Count, skis.Length);
+                return;
+            }
         }
         throw new Exception("未找到资源 (APK内StreamingAssets与外部目录均无数据)");
     }
@@ -352,6 +475,23 @@ public class PreviewV4 : MonoBehaviour
                 {
                     string ext = Path.GetExtension(f).ToLower();
                     if (ext == ".ski" || ext == ".act") all.Add(Path.GetFileName(f));
+                }
+            }
+            catch (Exception) { }
+        }
+        // v4.8.7: 本地 pak_out 合并进浏览池(去重) — 全量模型不经注入直接可用
+        if (localActorDir != null)
+        {
+            try
+            {
+                var seen = new HashSet<string>();
+                foreach (var x in all) seen.Add(x);
+                foreach (var f in Directory.GetFiles(localActorDir))
+                {
+                    string e = Path.GetExtension(f).ToLower();
+                    if (e != ".ski" && e != ".act") continue;
+                    var n = Path.GetFileName(f);
+                    if (seen.Add(n)) all.Add(n);
                 }
             }
             catch (Exception) { }
@@ -810,7 +950,7 @@ public class PreviewV4 : MonoBehaviour
         // ---- D. 材质锚名 ----
         sd.anchors = ExtractAnchors(d);
 
-        sd.fmt = string.Format("v4.8.5 顶点{0} 面{1} 流@0x{2:x}{3}{4}{5}{6}",
+        sd.fmt = string.Format("v4.8.7 顶点{0} 面{1} 流@0x{2:x}{3}{4}{5}{6}",
             vcp, sd.tris.Count / 3, best,
             sd.anchors.Count > 0 ? " 锚" + sd.anchors.Count : "",
             beUsed ? " 面[大端]" : "", faceAfter ? " 面在流后" : "",
@@ -1125,7 +1265,7 @@ public class PreviewV4 : MonoBehaviour
             if (am2.meshes > am.meshes) { am.meshes = am2.meshes; am.pts = am2.pts; }
         }
         am.nodes = nodeCount0;
-        am.fmt = string.Format("v4.8.5 ACT点云 节点表{0} 网格{1} 点{2}", nodeCount0, am.meshes, am.pts.Count);
+        am.fmt = string.Format("v4.8.7 ACT点云 节点表{0} 网格{1} 点{2}", nodeCount0, am.meshes, am.pts.Count);
         am.anchors = ExtractAnchorsAct(d);
         return am;
     }
@@ -1185,7 +1325,14 @@ public class PreviewV4 : MonoBehaviour
     // ================================================================
     static void ShowCurrent()
     {
-        if (curSkiList.Count == 0) { line2 = "(本分类当前职业无模型) 池内: " + poolStat; return; }
+        if (curSkiList.Count == 0)
+        {
+            line2 = "(本分类当前职业无模型) 池内: " + poolStat;
+            line3 = "";                                            // v4.8.6: 清旧状态行
+            if (hostPv != null && _animCo != null) { hostPv.StopCoroutine(_animCo); _animCo = null; }
+            if (curModel != null) { UnityEngine.Object.Destroy(curModel); curModel = null; }  // v4.8.6: 清旧网格, 此前残留上一件
+            return;
+        }
         if (curIdx >= curSkiList.Count) curIdx = 0;
         curSki = curSkiList[curIdx];
         StartShow(curSki);
@@ -1343,7 +1490,18 @@ public class PreviewV4 : MonoBehaviour
     static System.Collections.IEnumerator LoadShowCo(string fileName)
     {
         byte[] d; string err = "";
-        if (useAsset)
+        // v4.8.7: 本地全量层优先 — 本地 pak_out 直读(同步), 缺失才回落 SA/外部目录
+        d = null;
+        if (localActorDir != null)
+        {
+            try
+            {
+                var lp = Path.Combine(localActorDir, fileName);
+                if (File.Exists(lp)) d = File.ReadAllBytes(lp);
+            }
+            catch (Exception) { }
+        }
+        if (d == null && useAsset)
         {
             using (var wr = UnityWebRequest.Get(Application.streamingAssetsPath + "/creature/actor/" + fileName))
             {
@@ -1352,7 +1510,7 @@ public class PreviewV4 : MonoBehaviour
                 else d = wr.downloadHandler.data;
             }
         }
-        else
+        else if (d == null)
         {
             try { d = File.ReadAllBytes(Path.Combine(actorDir, fileName)); }
             catch (Exception e2) { d = null; err = e2.Message; }
@@ -1405,7 +1563,7 @@ public class PreviewV4 : MonoBehaviour
             mat.color = new Color(0.72f, 0.72f, 0.76f);
             mr.sharedMaterial = mat;
 
-            line3 = string.Format("[v4.8.5] {0} 转{1:F0} | 骨架={2} ski:{3}B | 贴图=...",
+            line3 = string.Format("[v4.8.7] {0} 转{1:F0} | 骨架={2} ski:{3}B | 贴图=...",
                 sd.fmt, ModelRot.x, sk != null ? tag + ":" + sk.srcName : tag, d.Length);
 
             int anf = sk != null && sk.bones.Count > 0 ? sk.bones[0].nf : 0;
@@ -1421,7 +1579,7 @@ public class PreviewV4 : MonoBehaviour
         }
         catch (Exception e)
         {
-            line3 = "[v4.8.5] " + name + " 解析失败: " + e.Message + " (◀▶手动翻页)";
+            line3 = "[v4.8.7] " + name + " 解析失败: " + e.Message + " (◀▶手动翻页)";
             if (curModel != null) { UnityEngine.Object.Destroy(curModel); curModel = null; }
         }
     }
@@ -1458,13 +1616,13 @@ public class PreviewV4 : MonoBehaviour
             mat.color = new Color(0.62f, 0.70f, 0.82f);
             mr.sharedMaterial = mat;
 
-            line3 = "[v4.8.5] " + am.fmt + " ext=" + extRaw.ToString("F0") + "→" + ext.ToString("F1") + " 转" + ModelRot.x.ToString("F0") + " | 贴图=...";
+            line3 = "[v4.8.7] " + am.fmt + " ext=" + extRaw.ToString("F0") + "→" + ext.ToString("F1") + " 转" + ModelRot.x.ToString("F0") + " | 贴图=...";
             if (hostPv != null)
                 hostPv.StartCoroutine(LoadTexCoAct(name, am.anchors, mat));
         }
         catch (Exception e)
         {
-            line3 = "[v4.8.5] " + name + " 点云失败: " + e.Message + " (◀▶手动翻页)";
+            line3 = "[v4.8.7] " + name + " 点云失败: " + e.Message + " (◀▶手动翻页)";
             if (curModel != null) { UnityEngine.Object.Destroy(curModel); curModel = null; }
         }
     }
@@ -1634,14 +1792,14 @@ public class PreviewV4 : MonoBehaviour
     {
         if (p == null)
         {
+            if (_texPool == null) _texPool = TexPoolNames();   // v4.8.7: 合并池(本地+SA)一次IO缓存
             if (_texSample == null)
             {
-                var ls = ListAssets("creature/texture");
                 var tsb = new System.Text.StringBuilder();
-                for (int i = 0; i < ls.Length && i < 6; i++) { if (i > 0) tsb.Append(','); tsb.Append(ls[i]); }
-                _texSample = ls.Length == 0 ? "(目录空)" : tsb.ToString();
+                for (int i = 0; i < _texPool.Length && i < 6; i++) { if (i > 0) tsb.Append(','); tsb.Append(_texPool[i]); }
+                _texSample = _texPool.Length == 0 ? "(目录空)" : tsb.ToString();
             }
-            line3 += " ✗未命中(池样本[" + _texSample + "])";
+            line3 += " ✗未命中(池" + _texPool.Length + "个[" + _texSample + "]" + TexFamNote(skiName) + ")";   // v4.8.6
             yield break;
         }
         if (texCache.TryGetValue(p, out var tc) && tc != null)
@@ -1651,7 +1809,12 @@ public class PreviewV4 : MonoBehaviour
             yield break;
         }
         byte[] raw = null;
-        if (useAsset)
+        // v4.8.7: 本地全量层优先 — pak_out 直读(同步IO, 快于 UnityWebRequest; 每读try-catch不炸)
+        if (localTexDir != null && !string.IsNullOrEmpty(p))
+        {
+            try { var lp = Path.Combine(localTexDir, p); if (File.Exists(lp)) raw = File.ReadAllBytes(lp); } catch (Exception) { }
+        }
+        if (raw == null && useAsset)
         {
             using (var wr = UnityWebRequest.Get(Application.streamingAssetsPath + "/creature/texture/" + p))
             {
@@ -1659,7 +1822,7 @@ public class PreviewV4 : MonoBehaviour
                 if (wr.result == UnityWebRequest.Result.Success) raw = wr.downloadHandler.data;
             }
         }
-        else
+        else if (raw == null)
         {
             try { raw = ReadTexFile(p); } catch (Exception) { raw = null; }
         }
