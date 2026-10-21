@@ -1123,6 +1123,290 @@ public class PreviewV4 : MonoBehaviour
         public int nodes, meshes;
         public string fmt = "";
         public List<string> anchors = new List<string>();
+        // v4.8.8: 容器真网格 (CRT_SkelSkin/CRT_VaSkin 块解析成功时填充)
+        public List<Vector3> rverts = new List<Vector3>();
+        public List<Vector2> ruvs = new List<Vector2>();
+        public List<int> rtris = new List<int>();
+        public bool real { get { return rverts != null && rverts.Count > 2 && rtris != null && rtris.Count >= 3; } }
+    }
+
+    // ================================================================
+    //  v4.8.8: CRT_Actor 容器解析 — 武器/坐骑/翅膀真网格 (替换点云误读)
+    //  布局逆向定案 (样本闭环: iwgong01/iw0401huan_04/1dao01/6dao01/0_chibang01_01):
+    //  · 块流 = [FF FF][u16 块名长][块名]...: CRT_Actor/CRT_SkelSkin/CRT_VaSkin/CRT_MaterialLib/CRT_Mtl*/
+    //    CRT_EffectEmitter
+    //  · CRT_SkelSkin 块 = [u32 len][skelRef][u16垫][u32 mc] ×mc:[u32 len][网格名][u32 len][材质名]
+    //    [u32 面数][面表 LE u16][01标志] — 与 .ski 的 ParseMeshFaces 结构一致, 面表后紧跟本块顶点链
+    //  · CRT_VaSkin 块 = [u32 len][名][标志字节][u32 len][名][u32 len][名][u32 面数][面表 LE u16]
+    //  · 顶点: ski 式自校验记录链 (nbk+骨id/权重/每骨pos 变长记录, ChainVtx/WalkVerts 直接复用);
+    //    或 VaSkin 32B定长池 [pos3][nrm3][uv2] 全LE (前缀 u16 顶点数)
+    //  ================================================================
+    class ActSub { public string mesh, mat; public List<int> idx = new List<int>(); public int faceEnd; }
+
+    static bool ActNameAt(byte[] d, int q, int maxn)
+    {
+        if (q + 4 > d.Length) return false;
+        int n = U32(d, q);
+        if (n < 1 || n > maxn || q + 4 + n > d.Length) return false;
+        return Printable(d, q + 4, n);
+    }
+    static string ActNameGet(byte[] d, int q, out int end)
+    {
+        int n = U32(d, q);
+        end = q + 4 + n;
+        return Str(d, q + 4, n);
+    }
+
+    static ActSub ParseSkelChunkFaces(byte[] d, int o, int F)
+    {
+        try
+        {
+            int p = o + 4 + U16(d, o + 2);                     // 块名后 (FF FF + u16长 + 名字)
+            if (!ActNameAt(d, p, 64)) return null;
+            int skEnd;                                         // skelRef (跳过)
+            ActNameGet(d, p, out skEnd);
+            p = skEnd;
+            if (p + 6 > F) return null;
+            p += 2;                                            // u16 垫
+            int mc = U32(d, p); p += 4;
+            if (mc < 1 || mc > 8) return null;
+            var s = new ActSub();
+            for (int m = 0; m < mc; m++)
+            {
+                if (!ActNameAt(d, p, 48)) return null;
+                string mesh = ActNameGet(d, p, out p);
+                if (!ActNameAt(d, p, 48)) return null;
+                string mat = ActNameGet(d, p, out p);
+                int fc = U32(d, p); p += 4;
+                if (fc < 3 || fc > 262144 || fc % 3 != 0 || p + 2 * fc + 1 > F) return null;
+                for (int j = 0; j < fc; j++)
+                {
+                    int a = U16(d, p + 2 * j);
+                    if (a > 60000) return null;
+                    s.idx.Add(a);
+                }
+                p += 2 * fc + 1;                               // 面表 + 01标志
+                if (m == 0) { s.mesh = mesh; s.mat = mat; }
+            }
+            s.faceEnd = p;
+            return s;
+        }
+        catch (Exception) { return null; }
+    }
+    static int SkipName(byte[] d, int p) { return p + 4 + U32(d, p); }
+
+    static ActSub ParseVaChunkFaces(byte[] d, int o, int F)
+    {
+        try
+        {
+            int p = o + 4 + U16(d, o + 2);                     // 块名后
+            int names = 0;
+            while (names < 3)                                  // 观测: 恰好3个名字字段(中间夹标志字节)
+            {
+                bool got = false;
+                for (int skip = 0; skip <= 8 && p + skip + 4 <= F; skip++)
+                {
+                    if (ActNameAt(d, p + skip, 64)) { p = SkipName(d, p + skip); names++; got = true; break; }
+                }
+                if (!got) break;
+            }
+            if (names < 2) return null;
+            int cnt = U32(d, p); p += 4;
+            if (cnt < 3 || cnt > 300000 || p + 2 * cnt > F) return null;
+            var s = new ActSub();
+            int mx = 0;
+            for (int k = 0; k < cnt; k++)
+            {
+                int a = U16(d, p + 2 * k);
+                if (a > 60000) return null;
+                s.idx.Add(a); if (a > mx) mx = a;
+            }
+            p += 2 * cnt;
+            // 面表尾应贴近下一块头 (0~4字节垫) 或文件尾
+            bool okEnd = p + 4 >= F;
+            for (int e = 0; e <= 4 && !okEnd && p + 1 + e < F; e++)
+                if (d[p + e] == 0xFF && d[p + e + 1] == 0xFF) okEnd = true;
+            if (!okEnd) return null;
+            s.faceEnd = p;
+            return s;
+        }
+        catch (Exception) { return null; }
+    }
+
+    // 三角形抽样边长 — 顶点/面表配对质量判据 (真配对边短, 错配/垃圾边超长或全零)
+    static float ActEdgeCheck(List<Vector3> vs, List<int> idx)
+    {
+        int nt = idx.Count / 3;
+        if (nt == 0) return 0f;
+        int n = Math.Min(24, nt);
+        float tot = 0f; int cnt = 0;
+        for (int k = 0; k < n; k++)
+        {
+            int t = k * nt / n;
+            int a = idx[t * 3], b = idx[t * 3 + 1], c = idx[t * 3 + 2];
+            if (a >= vs.Count || b >= vs.Count || c >= vs.Count) return 1e9f;
+            tot += Vector3.Distance(vs[a], vs[b]) + Vector3.Distance(vs[b], vs[c]) + Vector3.Distance(vs[c], vs[a]);
+            cnt += 3;
+        }
+        return cnt > 0 ? tot / cnt : 1e9f;
+    }
+
+    // 从块面表尾提取顶点: A) ski记录链(续拼) B) VaSkin 32B定长池; 成功返回 true
+    static bool ExtractActVerts(ActMeshData am, ActSub s, byte[] d, int F)
+    {
+        int vNeed = 0;
+        for (int i = 0; i < s.idx.Count; i++) if (s.idx[i] + 1 > vNeed) vNeed = s.idx[i] + 1;
+        if (vNeed < 3 || vNeed > 60000) return false;
+        int winLo = s.faceEnd, winHi = Math.Min(F, s.faceEnd + 65536);
+
+        // ---- A. ski 记录链 (武器/怪物/翅膀) ----
+        int bestP = -1, bestN = 0;
+        for (int p = winLo; p < winHi - 60; p++)
+        {
+            int n = ChainVtx(d, p, F);
+            if (n > bestN) { bestN = n; bestP = p; }
+            if (bestN >= vNeed) break;
+        }
+        if (bestP >= 0 && bestN >= Math.Min(8, vNeed))
+        {
+            var tmp = new SkiData();
+            int sp = bestP, guard = 0;
+            while (tmp.verts.Count < vNeed && sp < winHi && guard < 4096)
+            {
+                int p2 = WalkVerts(tmp, d, sp, F, vNeed - tmp.verts.Count);
+                if (p2 <= sp) { sp++; guard++; continue; }
+                sp = p2;
+            }
+            if (tmp.verts.Count >= vNeed)
+            {
+                int vb = am.rverts.Count;
+                for (int i = 0; i < vNeed; i++)
+                {
+                    am.rverts.Add(tmp.verts[i].pos0);
+                    am.ruvs.Add(i < tmp.uv.Count ? tmp.uv[i] : Vector2.zero);
+                }
+                var probe = new List<Vector3>(vNeed);
+                for (int i = 0; i < vNeed; i++) probe.Add(am.rverts[vb + i]);
+                if (ActEdgeCheck(probe, s.idx) < 4.0f)
+                {
+                    AppendSubTris(am, s, vb);
+                    return true;
+                }
+                am.rverts.RemoveRange(vb, vNeed);
+                am.ruvs.RemoveRange(vb, vNeed);
+            }
+        }
+
+        // ---- B. VaSkin 32B定长池 [pos3][nrm3][uv2] 全LE, 前缀u16/u32 == vNeed (坐骑/静态) ----
+        for (int pre = 2; pre <= 4 && winLo + pre + vNeed * 32 <= F; pre += 2)
+        {
+            for (int s0 = winLo; s0 + pre + vNeed * 32 <= Math.Min(winHi, F); s0++)
+            {
+                int c = pre == 2 ? U16(d, s0) : U32(d, s0);
+                if (c != vNeed) continue;
+                int ps = s0 + pre;
+                int nok = 0, uok = 0, tot0 = 0;
+                for (int v = 0; v < vNeed; v++)
+                {
+                    int o = ps + v * 32;
+                    float x = F32(d, o), y = F32(d, o + 4), z = F32(d, o + 8);
+                    float nx = F32(d, o + 12), ny = F32(d, o + 16), nz = F32(d, o + 20);
+                    float u = F32(d, o + 24), w = F32(d, o + 28);
+                    if (x != x || y != y || z != z || Mathf.Abs(x) > 1e5f || Mathf.Abs(y) > 1e5f || Mathf.Abs(z) > 1e5f) break;
+                    if (x == 0f && y == 0f && z == 0f && nx == 0f && ny == 0f && nz == 0f) break;
+                    float nl = Mathf.Sqrt(nx * nx + ny * ny + nz * nz);
+                    if (Mathf.Abs(nl - 1f) < 0.2f) nok++;
+                    if (u > -0.05f && u < 1.05f && w > -0.05f && w < 1.05f) uok++;
+                    tot0++;
+                }
+                if (tot0 < vNeed || nok * 100 / vNeed < 55 || uok * 100 / vNeed < 55) continue;
+                int vb2 = am.rverts.Count;
+                for (int v = 0; v < vNeed; v++)
+                {
+                    int o = ps + v * 32;
+                    am.rverts.Add(new Vector3(F32(d, o), F32(d, o + 4), F32(d, o + 8)));
+                    am.ruvs.Add(new Vector2(F32(d, o + 24), F32(d, o + 28)));
+                }
+                var probe2 = new List<Vector3>(vNeed);
+                for (int i = 0; i < vNeed; i++) probe2.Add(am.rverts[vb2 + i]);
+                if (ActEdgeCheck(probe2, s.idx) < 4.0f)
+                {
+                    AppendSubTris(am, s, vb2);
+                    return true;
+                }
+                am.rverts.RemoveRange(vb2, vNeed);
+                am.ruvs.RemoveRange(vb2, vNeed);
+            }
+        }
+        return false;
+    }
+    static void AppendSubTris(ActMeshData am, ActSub s, int vb)
+    {
+        for (int k = 0; k + 2 < s.idx.Count; k += 3)
+        {
+            int a = s.idx[k] + vb, b = s.idx[k + 1] + vb, c = s.idx[k + 2] + vb;
+            if (a == b || b == c || a == c) continue;
+            am.rtris.Add(a); am.rtris.Add(b); am.rtris.Add(c);
+        }
+    }
+
+    // 容器解析主入口: 遍历块流 → 面表 + 顶点 → 真网格; 未命中返回 null
+    static ActMeshData ParseActContainer(byte[] d)
+    {
+        int F = d.Length;
+        if (F < 64 || d[0] != 0xFF || d[1] != 0xFF) return null;
+        if (IndexOf(d, "CRT_Actor", 0) < 0 && IndexOf(d, "CRT_SkelSkin", 0) < 0 && IndexOf(d, "CRT_VaSkin", 0) < 0) return null;
+        var subs = new List<ActSub>();
+        var matNames = new List<string>();
+        int o = 4, nodes = 0;
+        while (o < F - 8)
+        {
+            if (d[o] == 0xFF && d[o + 1] == 0xFF)
+            {
+                int nl = U16(d, o + 2);
+                if (nl >= 4 && nl <= 32 && o + 4 + nl <= F && Printable(d, o + 4, nl))
+                {
+                    string nm = Str(d, o + 4, nl);
+                    if (nm == "CRT_SkelSkin")
+                    {
+                        var s = ParseSkelChunkFaces(d, o, F);
+                        if (s != null) { subs.Add(s); o = s.faceEnd; continue; }
+                    }
+                    else if (nm == "CRT_VaSkin")
+                    {
+                        var s = ParseVaChunkFaces(d, o, F);
+                        if (s != null) { subs.Add(s); o = s.faceEnd; continue; }
+                    }
+                    o += 4 + nl;
+                    continue;
+                }
+            }
+            o++;
+        }
+        if (subs.Count == 0) return null;
+        var am = new ActMeshData();
+        am.nodes = nodes; am.meshes = 0;
+        foreach (var s in subs)
+        {
+            if (ExtractActVerts(am, s, d, F))
+            {
+                am.meshes++;
+                if (!string.IsNullOrEmpty(s.mat) && !matNames.Contains(s.mat)) matNames.Add(s.mat);
+            }
+        }
+        if (!am.real) return null;
+        // 材质名优先作贴图锚 (块内解析的可信度高于扫描); 兼容 _m 去除变体
+        var anchors = new List<string>();
+        foreach (var mn in matNames)
+        {
+            anchors.Add(mn);
+            int u = mn.LastIndexOf('_');
+            if (u > 0 && mn.Length - u <= 3) anchors.Add(mn.Substring(0, u));
+        }
+        foreach (var a in ExtractAnchorsAct(d)) if (!anchors.Contains(a)) anchors.Add(a);
+        am.anchors = anchors;
+        am.fmt = string.Format("容器 顶点{0} 面{1} 子网格{2}/{3}", am.rverts.Count, am.rtris.Count / 3, am.meshes, subs.Count);
+        return am;
     }
 
     static bool ActStr(byte[] d, int off, ref string s, ref int end, int maxn, int minn)
@@ -1589,40 +1873,98 @@ public class PreviewV4 : MonoBehaviour
         try
         {
             if (d == null) throw new Exception("act 读取失败: " + err);
-            var am = ParseActMesh(d);
+            // v4.8.8: CRT容器真网格优先, 旧点云扫描兜底
+            ActMeshData am = null;
+            try { am = ParseActContainer(d); } catch (Exception) { am = null; }
+            bool real = am != null && am.real;
+            if (!real && am == null)
+            {
+                try { am = ParseActMesh(d); } catch (Exception) { am = null; }
+            }
+            if (am == null) throw new Exception("act 解析失败(容器/点云均未命中)");
+
+            if (real)
+            {
+                // ---- v4.8.8 真网格渲染 (与 ski 路径同管线) ----
+                var vs = am.rverts.ToArray();
+                if (vs.Length > 65534) throw new Exception("顶点超16位索引上限 " + vs.Length);
+                var mesh = new Mesh();
+                mesh.vertices = vs;
+                mesh.uv = am.ruvs.Count >= vs.Length ? am.ruvs.ToArray() : new Vector2[vs.Length];
+                mesh.triangles = am.rtris.ToArray();
+                mesh.RecalculateNormals();
+                mesh.RecalculateBounds();
+
+                Vector3 mn = vs[0], mx = vs[0];
+                for (int i = 1; i < vs.Length; i++)
+                {
+                    if (vs[i].x < mn.x) mn.x = vs[i].x; if (vs[i].x > mx.x) mx.x = vs[i].x;
+                    if (vs[i].y < mn.y) mn.y = vs[i].y; if (vs[i].y > mx.y) mx.y = vs[i].y;
+                    if (vs[i].z < mn.z) mn.z = vs[i].z; if (vs[i].z > mx.z) mx.z = vs[i].z;
+                }
+                Vector3 bc = (mn + mx) * 0.5f;
+                float ext = Mathf.Max(mx.x - mn.x, Mathf.Max(mx.y - mn.y, mx.z - mn.z));
+                if (ext < 1e-4f) ext = 1f;
+                _curS0 = FitFor(name) / ext;
+                _curBC = bc;
+
+                if (curModel != null) UnityEngine.Object.Destroy(curModel);
+                curModel = new GameObject(name);
+                curModel.transform.SetParent(pivot.transform, false);
+                curModel.transform.localRotation = Quaternion.Euler(ModelRot);
+                ApplyFrame();
+                curModel.AddComponent<MeshFilter>().sharedMesh = mesh;
+                var mr = curModel.AddComponent<MeshRenderer>();
+
+                Shader sh = Shader.Find("Standard");
+                if (sh == null) sh = Shader.Find("Legacy Shaders/Diffuse");
+                if (sh == null) sh = Shader.Find("Mobile/Diffuse");
+                if (sh == null) sh = Shader.Find("Unlit/Texture");
+                if (sh == null) throw new Exception("无可用Shader(构建裁剪)");
+                var mat = new Material(sh);
+                mat.color = new Color(0.72f, 0.72f, 0.76f);
+                mr.sharedMaterial = mat;
+
+                line3 = "[v4.8.8] " + am.fmt + " 转" + ModelRot.x.ToString("F0") + " | 贴图=...";
+                if (hostPv != null)
+                    hostPv.StartCoroutine(LoadTexCoAct(name, am.anchors, mat));
+                return;
+            }
+
+            // ---- 旧点云路径 (兜底) ----
             float extRaw = 0f;                             // v4.8.3: 原始最大坐标(诊断用)
             foreach (var pv in am.pts) extRaw = Mathf.Max(extRaw, Mathf.Max(Mathf.Abs(pv.x), Mathf.Max(Mathf.Abs(pv.y), Mathf.Abs(pv.z))));
-            Vector3 bc = Vector3.zero; float ext = 2f;
+            Vector3 bc2 = Vector3.zero; float ext2 = 2f;
             var vsA = am.pts.ToArray();
-            RobustFrame(vsA, ref bc, ref ext);             // v4.8.5: 最密格定心+断崖截尾(先取景后建网格)
-            Mesh mesh = BuildPointMesh(am.pts, ext);       // v4.8.5: 点片大小用稳健ext
-            _curS0 = ext > 1e-5f ? FitFor(name) / ext : 1f;
-            _curBC = bc;
+            RobustFrame(vsA, ref bc2, ref ext2);           // v4.8.5: 最密格定心+断崖截尾(先取景后建网格)
+            Mesh pmesh = BuildPointMesh(am.pts, ext2);     // v4.8.5: 点片大小用稳健ext
+            _curS0 = ext2 > 1e-5f ? FitFor(name) / ext2 : 1f;
+            _curBC = bc2;
 
             if (curModel != null) UnityEngine.Object.Destroy(curModel);
             curModel = new GameObject(name);
             curModel.transform.SetParent(pivot.transform, false);
             curModel.transform.localRotation = Quaternion.Euler(ModelRot);
             ApplyFrame();
-            curModel.AddComponent<MeshFilter>().sharedMesh = mesh;
-            var mr = curModel.AddComponent<MeshRenderer>();
+            curModel.AddComponent<MeshFilter>().sharedMesh = pmesh;
+            var mr2 = curModel.AddComponent<MeshRenderer>();
 
-            Shader sh = Shader.Find("Unlit/Color");
-            if (sh == null) sh = Shader.Find("Legacy Shaders/VertexLit");
-            if (sh == null) sh = Shader.Find("Mobile/VertexLit");
-            if (sh == null) sh = Shader.Find("Legacy Shaders/Diffuse");
-            if (sh == null) throw new Exception("无可用Shader(构建裁剪)");
-            var mat = new Material(sh);
-            mat.color = new Color(0.62f, 0.70f, 0.82f);
-            mr.sharedMaterial = mat;
+            Shader sh2 = Shader.Find("Unlit/Color");
+            if (sh2 == null) sh2 = Shader.Find("Legacy Shaders/VertexLit");
+            if (sh2 == null) sh2 = Shader.Find("Mobile/VertexLit");
+            if (sh2 == null) sh2 = Shader.Find("Legacy Shaders/Diffuse");
+            if (sh2 == null) throw new Exception("无可用Shader(构建裁剪)");
+            var mat2 = new Material(sh2);
+            mat2.color = new Color(0.62f, 0.70f, 0.82f);
+            mr2.sharedMaterial = mat2;
 
-            line3 = "[v4.8.7] " + am.fmt + " ext=" + extRaw.ToString("F0") + "→" + ext.ToString("F1") + " 转" + ModelRot.x.ToString("F0") + " | 贴图=...";
+            line3 = "[v4.8.8] " + am.fmt + " ext=" + extRaw.ToString("F0") + "→" + ext2.ToString("F1") + " 转" + ModelRot.x.ToString("F0") + " | 贴图=...";
             if (hostPv != null)
-                hostPv.StartCoroutine(LoadTexCoAct(name, am.anchors, mat));
+                hostPv.StartCoroutine(LoadTexCoAct(name, am.anchors, mat2));
         }
         catch (Exception e)
         {
-            line3 = "[v4.8.7] " + name + " 点云失败: " + e.Message + " (◀▶手动翻页)";
+            line3 = "[v4.8.8] " + name + " 解析失败: " + e.Message + " (◀▶手动翻页)";
             if (curModel != null) { UnityEngine.Object.Destroy(curModel); curModel = null; }
         }
     }
@@ -1838,7 +2180,7 @@ public class PreviewV4 : MonoBehaviour
             if (mat != null) { mat.mainTexture = t; mat.color = Color.white; }
             line3 += " ✓" + p;
         }
-        else line3 += " ✗解码失败:" + p;
+        else line3 += " ✗解码失败:" + p + (DdsV4.LastErr != null ? "[" + DdsV4.LastErr + "]" : "");
     }
 
     // ================================================================
@@ -1931,10 +2273,13 @@ public class PreviewV4 : MonoBehaviour
 // ================================================================
 public static class DdsV4
 {
+    public static string LastErr = null;   // v4.8.8: 解码失败原因 (诊断输出)
+
     public static Texture2D LoadFromMemory(byte[] raw, string name)
     {
+        LastErr = null;
         try { return Inner(raw, name); }
-        catch (Exception) { return null; }
+        catch (Exception e) { LastErr = "异常:" + e.Message; return null; }
     }
 
     static Texture2D Inner(byte[] raw, string name)
@@ -1969,13 +2314,78 @@ public static class DdsV4
         }
         if ((pfFlags & 0x4) != 0)
         {
+            // v4.8.8: DX10 扩展头 (fourcc="DX10", DXGI格式在128偏移, 数据从148起)
+            if (fourcc == 0x30315844 && raw.Length >= 148)
+            {
+                int dxgi = BitConverter.ToInt32(raw, 128);
+                dataOff = 148;
+                if (dxgi >= 70 && dxgi <= 72) fourcc = 0x31545844;        // BC1
+                else if (dxgi >= 73 && dxgi <= 75) fourcc = 0x33545844;   // BC2
+                else if (dxgi >= 76 && dxgi <= 78) fourcc = 0x35545844;   // BC3
+                else if (dxgi >= 79 && dxgi <= 81) fourcc = 0x31495441;   // BC4→ATI1
+                else if (dxgi >= 82 && dxgi <= 84) fourcc = 0x32495441;   // BC5→ATI2
+                else { LastErr = "DX10 dxgi=" + dxgi; return null; }
+            }
             if (fourcc == 0x31545844) return DecodeDXT(raw, dataOff, width, height, false, name, 0, false);
             if (fourcc == 0x33545844) return DecodeDXT(raw, dataOff, width, height, true, name, 8, false);
             if (fourcc == 0x35545844) return DecodeDXT(raw, dataOff, width, height, true, name, 8, true);
+            // v4.8.8: BC4/BC5 (ATI1/ATI2 — 原生fourcc或DX10映射)
+            if (fourcc == 0x31495441) return DecodeBC45(raw, dataOff, width, height, false, name);
+            if (fourcc == 0x32495441) return DecodeBC45(raw, dataOff, width, height, true, name);
+            LastErr = "fourcc=" + fourcc.ToString("X8");
             return null;
         }
         bool hasAlpha = (pfFlags & 0x1) != 0 || (pfFlags & 0x2) != 0;
         return DecodeRaw(raw, dataOff, width, height, hasAlpha, name);
+    }
+
+    // v4.8.8: BC4/BC5 (ATI1/ATI2) — 每块8B单通道/16B双通道, 2端点+6bit索引调色板
+    static Texture2D DecodeBC45(byte[] raw, int off, int w, int h, bool two, string name)
+    {
+        if (w <= 0 || h <= 0 || w > 8192 || h > 8192) { LastErr = "BC45尺寸异常"; return null; }
+        int bw = (w + 3) / 4, bh = (h + 3) / 4;
+        int bs = two ? 16 : 8;
+        if (off + (long)bw * bh * bs > raw.Length) { LastErr = "BC45数据不足"; return null; }
+        var px = new Color32[w * h];
+        var pal = new float[8];
+        var blk = new float[4, 4, 2];
+        for (int by = 0; by < bh; by++)
+            for (int bx = 0; bx < bw; bx++)
+            {
+                int bo = off + (by * bw + bx) * bs;
+                int cx = Math.Min(4, w - bx * 4), cy = Math.Min(4, h - by * 4);
+                for (int ch = 0; ch < (two ? 2 : 1); ch++)
+                {
+                    int c0 = raw[bo + ch * 8], c1 = raw[bo + ch * 8 + 1];
+                    ulong bits = 0;
+                    for (int i = 0; i < 6; i++) bits |= (ulong)raw[bo + ch * 8 + 2 + i] << (8 * i);
+                    pal[0] = c0; pal[1] = c1;
+                    if (c0 > c1) { for (int i = 2; i < 8; i++) pal[i] = ((8 - i) * c0 + (i - 1) * c1) / 7f; }
+                    else { for (int i = 2; i < 6; i++) pal[i] = ((6 - i) * c0 + (i - 2) * c1) / 5f; pal[6] = 0f; pal[7] = 255f; }
+                    for (int y = 0; y < cy; y++)
+                        for (int x = 0; x < cx; x++)
+                            blk[y, x, ch] = pal[(int)((bits >> (3 * (y * 4 + x))) & 7)];
+                }
+                for (int y = 0; y < cy; y++)
+                    for (int x = 0; x < cx; x++)
+                    {
+                        int pi = (by * 4 + y) * w + bx * 4 + x;
+                        if (two)
+                        {
+                            byte r = (byte)Mathf.Clamp(blk[y, x, 0], 0f, 255f);
+                            byte g = (byte)Mathf.Clamp(blk[y, x, 1], 0f, 255f);
+                            px[pi] = new Color32(r, g, 255, 255);
+                        }
+                        else
+                        {
+                            byte g2 = (byte)Mathf.Clamp(blk[y, x, 0], 0f, 255f);
+                            px[pi] = new Color32(g2, g2, g2, 255);
+                        }
+                    }
+            }
+        var tex = new Texture2D(w, h, TextureFormat.RGBA32, false);
+        tex.SetPixels32(px); tex.Apply(); tex.name = name;
+        return tex;
     }
 
     static Texture2D DecodeDXT(byte[] raw, int off, int w, int h, bool hasAlpha, string name, int alphaBytes, bool dxt5)
