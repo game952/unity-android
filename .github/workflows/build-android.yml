@@ -54,3 +54,4 @@ jobs:
           name: MyGame-Android
           path: build/Android/**/*.apk
           if-no-files-found: error
+          retention-days: 1
