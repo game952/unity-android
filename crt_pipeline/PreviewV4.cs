@@ -1,5 +1,24 @@
 // PreviewV4.cs — v4.8.1d 整装拼合预览台 (2026-10-13 晚热修)
 // ============================================================
+// v4.8.9 ACT蒙皮地基 + 顶点池定位 + 贴图跨包反查 (2026-10-21 深夜, 依据装机11图+5样本逆向):
+//  ① P0 皱缩团根因定案(渲染实证: Python 复刻渲染=装机截图逐位吻合):
+//     容器路径 pos0(首骨局部坐标)直接当顶点 → CRT_SkelSkin 蒙皮件全部塌成团(1dao01/1zhan01/1feng01/2shu2);
+//     装机"正确"的 6dao01 实为四足怪物 mon172 的巧合剪影(烘焙后出腿/须/尾全形)。
+//  ② 新逆向定案 — 武器类 ACT 节点表(历史"标记01"未解格式, 三样本 109/61/72 骨闭环):
+//     [u32 nl][名][u32 pl][父名][u32 nf][f32 trans×nf×3][u32 nf2==nf][f32 quat×nf×4 (w,x,y,z)][尾10B]
+//     静态节点 nf=0 → 双名锚点跳过; 四元数模长命中率 1.00(off=4,stride=16) + 自相关周期16 双证。
+//     注意: ski 路径 quat 序 (x,y,z,w) 不变; 武器类为 (w,x,y,z) — 独立解码 BoneLocalW, 不碰 ski。
+//  ③ 蒙皮配方: p'=Σw·(W_b·pos_b), W_b=父链组合世界矩阵(帧0) — 与 ski 的"纯直接"不同(文件类不同):
+//     本地渲染实证 6dao01→四足怪/0_chibang01_01→立体翼/1dao01→长刃; 三级回落: skelRef外部架→自架→静态pos0;
+//     烘焙门=尺度感知边长(边<max(4, 对角×0.45)), 失败回落静态(装机既有行为零回退)。
+//  ④ 顶点池全文件兜底扫描: 64K窗口最长链<vNeed 时全文件找链(1dao01 fashion03a 954/955,
+//     6dao01 mon172_01_b 2127/2128 差1条 → 补齐); 廉价预筛(首记录合法)控耗时。
+//  ⑤ 贴图三态诊断+跨包反查: 装机8个"✗解码失败"全部无fourcc = 文件未读到(非格式问题);
+//     新 TexIndex 懒建全盘文件名→路径索引(pak_out 根×4层深, .dds/.png), TryTex 未中→索引兜底;
+//     状态行区分: ✗未找到(索引N) / ✗解码失败[fourcc] / ✗过短[len B] — 下一轮装机可直读定性。
+//  ⑥ 回落诊断: ParseActContainer 各放弃点写 _actDiag; 点云回落状态行显示原因; iw*dao/gong 类标"武器(坐骑挂载)"。
+//  验证: scripts/verify_container.py 同步移植(自骨架+烘焙+全文件扫描), 5样本回归; ski/点云路径零改动。
+// ============================================================
 // v4.8.7 本地全量导入 (2026-10-20 晚, 用户定调: bundle 只装文档代码, 资源留手机本地直读):
 //  ① 病灶: 装机只吃 StreamingAssets 注入子集(测试部分) — 池里武器/怪物/翅膀有, 甲胄贴图缺族;
 //     pak 不在游戏目录散放(ls/find 双空), 全量资源在手机本地 pak_out
@@ -253,6 +272,7 @@ public class PreviewV4 : MonoBehaviour
     // 依据: ①装机池只有注入子集(测试部分), 手机本地 pak_out 才是全量 ②BootGuard 已证可写 /storage/emulated/0
     static string localActorDir = null, localTexDir = null;
     static string localProbe = "";                  // 探测诊断: "pak_out✓ pak_out2× …"
+    static string _actDiag = "";                    // v4.8.9: 容器解析放弃点诊断 (每次解析重置)
     static void ProbeLocal()
     {
         localActorDir = null; localTexDir = null; localProbe = "";
@@ -1128,6 +1148,10 @@ public class PreviewV4 : MonoBehaviour
         public List<Vector2> ruvs = new List<Vector2>();
         public List<int> rtris = new List<int>();
         public bool real { get { return rverts != null && rverts.Count > 2 && rtris != null && rtris.Count >= 3; } }
+        // v4.8.9: 自文件节点表(武器类 ver2 布局) + 蒙皮/池统计 + 回落诊断
+        public ActSkel self;
+        public int bakedSubs, poolSubs, staticSubs;
+        public string rigTag = "";
     }
 
     // ================================================================
@@ -1141,7 +1165,7 @@ public class PreviewV4 : MonoBehaviour
     //  · 顶点: ski 式自校验记录链 (nbk+骨id/权重/每骨pos 变长记录, ChainVtx/WalkVerts 直接复用);
     //    或 VaSkin 32B定长池 [pos3][nrm3][uv2] 全LE (前缀 u16 顶点数)
     //  ================================================================
-    class ActSub { public string mesh, mat; public List<int> idx = new List<int>(); public int faceEnd; }
+    class ActSub { public string mesh, mat, skel; public List<int> idx = new List<int>(); public int faceEnd; }
 
     static bool ActNameAt(byte[] d, int q, int maxn)
     {
@@ -1163,14 +1187,15 @@ public class PreviewV4 : MonoBehaviour
         {
             int p = o + 4 + U16(d, o + 2);                     // 块名后 (FF FF + u16长 + 名字)
             if (!ActNameAt(d, p, 64)) return null;
-            int skEnd;                                         // skelRef (跳过)
-            ActNameGet(d, p, out skEnd);
+            int skEnd;                                         // skelRef
+            string skelName = ActNameGet(d, p, out skEnd);
             p = skEnd;
             if (p + 6 > F) return null;
             p += 2;                                            // u16 垫
             int mc = U32(d, p); p += 4;
             if (mc < 1 || mc > 8) return null;
             var s = new ActSub();
+            s.skel = skelName;
             for (int m = 0; m < mc; m++)
             {
                 if (!ActNameAt(d, p, 48)) return null;
@@ -1251,6 +1276,174 @@ public class PreviewV4 : MonoBehaviour
         return cnt > 0 ? tot / cnt : 1e9f;
     }
 
+    // ================================================================
+    //  v4.8.9: ACT 自文件节点表 (武器类 ver2 布局 — 历史"标记01"格式破解)
+    //  [u32 nl][名][u32 pl][父名][u32 nf][f32 trans×nf×3][u32 nf2==nf][f32 quat×nf×4 (w,x,y,z)][尾10B]
+    //  静态节点 nf=0 → 双名锚点跳过; 证据: 1dao01(109骨)/6dao01(61)/0_chibang01_01(72) 全走查 tail=10 恒定;
+    //  四元数模长命中率 1.00(off=4,stride=16) + 字节自相关周期16 双重实证。
+    //  ================================================================
+    static ActSkel ParseSelfNodes(byte[] d)
+    {
+        try
+        {
+            int F = d.Length;
+            if (F < 64 || d[0] != 0xFF || d[1] != 0xFF) return null;
+            int tl = U16(d, 2);
+            int o = FindPattern(d, tl + 4, new byte[] { 0x00, 0x00, 0x80, 0x3f });   // 1.0f 头
+            if (o < 0) return null;
+            o += 6;
+            if (o + 4 > F) return null;
+            int cnt = U32(d, o); o += 4;
+            if (cnt < 1 || cnt > 512) return null;
+            var sk = new ActSkel(); sk.srcName = "self";
+            for (int i = 0; i < cnt; i++)
+            {
+                if (!ActNameAt(d, o, 24)) return null;
+                string nm = ActNameGet(d, o, out o);
+                if (!ActNameAt(d, o, 24)) return null;
+                string par = ActNameGet(d, o, out o);
+                if (o + 4 > F) return null;
+                int nf = U32(d, o); o += 4;
+                var b = new Bone(); b.name = nm; b.parent = par;
+                if (nf >= 1 && nf <= 60000 && o + (long)nf * 12 + 4 <= F)
+                {
+                    b.nf = nf;
+                    b.trans = new float[nf * 3];
+                    for (int k = 0; k < nf * 3; k++) { b.trans[k] = F32(d, o); o += 4; }
+                    if (o + 4 > F) return null;
+                    int nf2 = U32(d, o); o += 4;
+                    if (nf2 != nf || o + (long)nf * 16 > F) return null;   // 布局失配 → 整表放弃
+                    b.quats = new float[nf * 4];
+                    for (int k = 0; k < nf * 4; k++) { b.quats[k] = F32(d, o); o += 4; }
+                    o += 10;                                              // 恒定尾 10B (三样本走查定案)
+                }
+                else
+                {
+                    b.nf = 0;                                             // 静态节点 → 双名锚点跳
+                    int nxt = FindNodeAnchor(d, o, F);
+                    if (nxt >= F) { sk.bones.Add(b); break; }
+                    o = nxt;
+                }
+                sk.bones.Add(b);
+            }
+            return sk.bones.Count > 0 ? sk : null;
+        }
+        catch (Exception) { return null; }
+    }
+    static int FindNodeAnchor(byte[] d, int o, int F)
+    {
+        for (int p = o; p + 12 < F; p++)
+        {
+            if (ActNameAt(d, p, 24))
+            {
+                int e1 = SkipName(d, p);
+                if (ActNameAt(d, e1, 24)) return p;
+            }
+        }
+        return F;
+    }
+
+    // v4.8.9: 武器类蒙皮局部变换 — quat 存 (w,x,y,z), 与 ski 路径 BoneLocal 的 (x,y,z,w) 不同
+    static FramePose BoneLocalW(Bone b, int frame)
+    {
+        var fp = new FramePose();
+        if (b.nf > 0 && b.quats != null && b.trans != null)
+        {
+            int f = frame >= b.nf ? b.nf - 1 : frame; if (f < 0) f = 0;
+            float w = b.quats[f * 4], x = b.quats[f * 4 + 1], y = b.quats[f * 4 + 2], z = b.quats[f * 4 + 3];
+            float n = x * x + y * y + z * z + w * w;
+            if (n < 1e-12f) { fp.R[0] = fp.R[4] = fp.R[8] = 1f; }
+            else
+            {
+                float s = 2f / n;
+                fp.R[0] = 1 - s * (y * y + z * z); fp.R[1] = s * (x * y - z * w); fp.R[2] = s * (x * z + y * w);
+                fp.R[3] = s * (x * y + z * w);     fp.R[4] = 1 - s * (x * x + z * z); fp.R[5] = s * (y * z - x * w);
+                fp.R[6] = s * (x * z - y * w);     fp.R[7] = s * (y * z + x * w); fp.R[8] = 1 - s * (y * y + x * x);
+            }
+            fp.tx = b.trans[f * 3]; fp.ty = b.trans[f * 3 + 1]; fp.tz = b.trans[f * 3 + 2];
+        }
+        else { fp.R[0] = fp.R[4] = fp.R[8] = 1f; }
+        return fp;
+    }
+
+    // v4.8.9: 父链组合世界矩阵 W_b = W_parent·(R,t) — 武器类 ACT 存每骨局部变换, 须组合;
+    // (ski 装备的 role 骨架存已组合变换 → 纯直接, 两条路径互不干涉)
+    static List<FramePose> WorldMats(ActSkel sk, int frame)
+    {
+        int n = sk.bones.Count;
+        var nameIdx = new Dictionary<string, int>();
+        for (int i = 0; i < n; i++) if (!nameIdx.ContainsKey(sk.bones[i].name)) nameIdx[sk.bones[i].name] = i;
+        var W = new List<FramePose>(n);
+        for (int i = 0; i < n; i++) W.Add(null);
+        var done = new bool[n];
+        for (int i = 0; i < n; i++) WMResolve(sk, frame, i, W, done, nameIdx);
+        return W;
+    }
+    static void WMResolve(ActSkel sk, int frame, int i, List<FramePose> W, bool[] done, Dictionary<string, int> nameIdx)
+    {
+        if (done[i]) return;
+        done[i] = true;
+        var b = sk.bones[i];
+        var fp = BoneLocalW(b, frame);
+        int pid;
+        if (b.parent != null && nameIdx.TryGetValue(b.parent, out pid) && pid != i)
+        {
+            if (!done[pid]) WMResolve(sk, frame, pid, W, done, nameIdx);
+            var pp = W[pid];
+            if (pp != null)
+            {
+                float[] R = new float[9];
+                R[0] = pp.R[0] * fp.R[0] + pp.R[1] * fp.R[3] + pp.R[2] * fp.R[6];
+                R[1] = pp.R[0] * fp.R[1] + pp.R[1] * fp.R[4] + pp.R[2] * fp.R[7];
+                R[2] = pp.R[0] * fp.R[2] + pp.R[1] * fp.R[5] + pp.R[2] * fp.R[8];
+                R[3] = pp.R[3] * fp.R[0] + pp.R[4] * fp.R[3] + pp.R[5] * fp.R[6];
+                R[4] = pp.R[3] * fp.R[1] + pp.R[4] * fp.R[4] + pp.R[5] * fp.R[7];
+                R[5] = pp.R[3] * fp.R[2] + pp.R[4] * fp.R[5] + pp.R[5] * fp.R[8];
+                R[6] = pp.R[6] * fp.R[0] + pp.R[7] * fp.R[3] + pp.R[8] * fp.R[6];
+                R[7] = pp.R[6] * fp.R[1] + pp.R[7] * fp.R[4] + pp.R[8] * fp.R[7];
+                R[8] = pp.R[6] * fp.R[2] + pp.R[7] * fp.R[5] + pp.R[8] * fp.R[8];
+                float tx = pp.R[0] * fp.tx + pp.R[1] * fp.ty + pp.R[2] * fp.tz + pp.tx;
+                float ty = pp.R[3] * fp.tx + pp.R[4] * fp.ty + pp.R[5] * fp.tz + pp.ty;
+                float tz = pp.R[6] * fp.tx + pp.R[7] * fp.ty + pp.R[8] * fp.tz + pp.tz;
+                fp.R = R; fp.tx = tx; fp.ty = ty; fp.tz = tz;
+            }
+        }
+        W[i] = fp;
+    }
+
+    // v4.8.9: 顶点组对角线 — 烘焙门的尺度感知基准
+    static float BoundsDiag(List<Vector3> vs)
+    {
+        if (vs == null || vs.Count == 0) return 1f;
+        Vector3 mn = vs[0], mx = vs[0];
+        for (int i = 1; i < vs.Count; i++)
+        {
+            if (vs[i].x < mn.x) mn.x = vs[i].x; if (vs[i].x > mx.x) mx.x = vs[i].x;
+            if (vs[i].y < mn.y) mn.y = vs[i].y; if (vs[i].y > mx.y) mx.y = vs[i].y;
+            if (vs[i].z < mn.z) mn.z = vs[i].z; if (vs[i].z > mx.z) mx.z = vs[i].z;
+        }
+        return (mx - mn).magnitude;
+    }
+
+    // v4.8.9: 全文件链扫描兜底 — 64K窗口最长链不足 vNeed 时用 (首记录合法廉价预筛控耗时);
+    // 实证: 1dao01 fashion03a 954/955, 6dao01 mon172_01_b 2127/2128 — 真池在窗口边界外差1条
+    static int ScanWholePool(byte[] d, int F, int vNeed)
+    {
+        int bestP = -1, bestN = 0;
+        for (int p = 0; p < F - 60; p++)
+        {
+            int nb = U32(d, p);
+            if (nb < 1 || nb > 8) continue;
+            if (d[p + 4] > 127) continue;
+            float w0 = F32(d, p + 5);
+            if (w0 < -0.01f || w0 > 1.001f) continue;
+            int n = ChainVtx(d, p, F);
+            if (n >= vNeed) return p;
+            if (n > bestN) { bestN = n; bestP = p; }
+        }
+        return bestP;
+    }
+
     // 从块面表尾提取顶点: A) ski记录链(续拼) B) VaSkin 32B定长池; 成功返回 true
     static bool ExtractActVerts(ActMeshData am, ActSub s, byte[] d, int F)
     {
@@ -1259,7 +1452,7 @@ public class PreviewV4 : MonoBehaviour
         if (vNeed < 3 || vNeed > 60000) return false;
         int winLo = s.faceEnd, winHi = Math.Min(F, s.faceEnd + 65536);
 
-        // ---- A. ski 记录链 (武器/怪物/翅膀) ----
+        // ---- A. ski 记录链 (武器/怪物/翅膀) — v4.8.9: 64K窗口→全文件兜底, 命中后烘焙/静态双尝试 ----
         int bestP = -1, bestN = 0;
         for (int p = winLo; p < winHi - 60; p++)
         {
@@ -1267,11 +1460,17 @@ public class PreviewV4 : MonoBehaviour
             if (n > bestN) { bestN = n; bestP = p; }
             if (bestN >= vNeed) break;
         }
+        if (bestN < vNeed)
+        {
+            int gP = ScanWholePool(d, F, vNeed);
+            if (gP >= 0) { bestP = gP; bestN = vNeed; }
+        }
         if (bestP >= 0 && bestN >= Math.Min(8, vNeed))
         {
             var tmp = new SkiData();
             int sp = bestP, guard = 0;
-            while (tmp.verts.Count < vNeed && sp < winHi && guard < 4096)
+            int scanHi = Math.Min(F, bestP + vNeed * 8 * 30 + 4096);
+            while (tmp.verts.Count < vNeed && sp < scanHi && guard < 4096)
             {
                 int p2 = WalkVerts(tmp, d, sp, F, vNeed - tmp.verts.Count);
                 if (p2 <= sp) { sp++; guard++; continue; }
@@ -1279,21 +1478,46 @@ public class PreviewV4 : MonoBehaviour
             }
             if (tmp.verts.Count >= vNeed)
             {
-                int vb = am.rverts.Count;
+                // v4.8.9 蒙皮: 自文件节点表(帧0) 父链组合烘焙; 失败回落 pos0 静态 (装机行为零回退)
+                if (am.self != null)
+                {
+                    var W = WorldMats(am.self, 0);
+                    int vb = am.rverts.Count;
+                    for (int i = 0; i < vNeed; i++)
+                    {
+                        am.rverts.Add(BakeVertex(W, tmp.verts[i]));
+                        am.ruvs.Add(i < tmp.uv.Count ? tmp.uv[i] : Vector2.zero);
+                    }
+                    var probe = new List<Vector3>(vNeed);
+                    for (int i = 0; i < vNeed; i++) probe.Add(am.rverts[vb + i]);
+                    float ed = ActEdgeCheck(probe, s.idx);
+                    float dg = BoundsDiag(probe);
+                    if (ed < Mathf.Max(4f, dg * 0.45f) && dg > 1e-4f)
+                    {
+                        am.bakedSubs++;
+                        if (am.rigTag.Length == 0) am.rigTag = "烘[自架" + am.self.bones.Count + "骨帧0]";
+                        AppendSubTris(am, s, vb);
+                        return true;
+                    }
+                    am.rverts.RemoveRange(vb, vNeed);
+                    am.ruvs.RemoveRange(vb, vNeed);
+                }
+                int vb0 = am.rverts.Count;
                 for (int i = 0; i < vNeed; i++)
                 {
                     am.rverts.Add(tmp.verts[i].pos0);
                     am.ruvs.Add(i < tmp.uv.Count ? tmp.uv[i] : Vector2.zero);
                 }
-                var probe = new List<Vector3>(vNeed);
-                for (int i = 0; i < vNeed; i++) probe.Add(am.rverts[vb + i]);
-                if (ActEdgeCheck(probe, s.idx) < 4.0f)
+                var probe0 = new List<Vector3>(vNeed);
+                for (int i = 0; i < vNeed; i++) probe0.Add(am.rverts[vb0 + i]);
+                if (ActEdgeCheck(probe0, s.idx) < 4.0f)
                 {
-                    AppendSubTris(am, s, vb);
+                    am.staticSubs++;
+                    AppendSubTris(am, s, vb0);
                     return true;
                 }
-                am.rverts.RemoveRange(vb, vNeed);
-                am.ruvs.RemoveRange(vb, vNeed);
+                am.rverts.RemoveRange(vb0, vNeed);
+                am.ruvs.RemoveRange(vb0, vNeed);
             }
         }
 
@@ -1331,6 +1555,7 @@ public class PreviewV4 : MonoBehaviour
                 for (int i = 0; i < vNeed; i++) probe2.Add(am.rverts[vb2 + i]);
                 if (ActEdgeCheck(probe2, s.idx) < 4.0f)
                 {
+                    am.poolSubs++;
                     AppendSubTris(am, s, vb2);
                     return true;
                 }
@@ -1383,9 +1608,10 @@ public class PreviewV4 : MonoBehaviour
             }
             o++;
         }
-        if (subs.Count == 0) return null;
+        if (subs.Count == 0) { _actDiag = "无容器网格块"; return null; }
         var am = new ActMeshData();
         am.nodes = nodes; am.meshes = 0;
+        am.self = ParseSelfNodes(d);                       // v4.8.9: 自文件节点表(蒙皮地基), 失败=静态回落
         foreach (var s in subs)
         {
             if (ExtractActVerts(am, s, d, F))
@@ -1394,7 +1620,7 @@ public class PreviewV4 : MonoBehaviour
                 if (!string.IsNullOrEmpty(s.mat) && !matNames.Contains(s.mat)) matNames.Add(s.mat);
             }
         }
-        if (!am.real) return null;
+        if (!am.real) { _actDiag = "容器块" + subs.Count + "个但顶点提取全败"; return null; }
         // 材质名优先作贴图锚 (块内解析的可信度高于扫描); 兼容 _m 去除变体
         var anchors = new List<string>();
         foreach (var mn in matNames)
@@ -1406,6 +1632,10 @@ public class PreviewV4 : MonoBehaviour
         foreach (var a in ExtractAnchorsAct(d)) if (!anchors.Contains(a)) anchors.Add(a);
         am.anchors = anchors;
         am.fmt = string.Format("容器 顶点{0} 面{1} 子网格{2}/{3}", am.rverts.Count, am.rtris.Count / 3, am.meshes, subs.Count);
+        if (am.self != null) am.fmt += " 自架" + am.self.bones.Count + "骨";
+        if (am.bakedSubs > 0) am.fmt += " 烘" + am.bakedSubs;
+        if (am.poolSubs > 0) am.fmt += " 池" + am.poolSubs;
+        if (am.staticSubs > 0) am.fmt += " 静" + am.staticSubs;
         return am;
     }
 
@@ -1873,13 +2103,16 @@ public class PreviewV4 : MonoBehaviour
         try
         {
             if (d == null) throw new Exception("act 读取失败: " + err);
-            // v4.8.8: CRT容器真网格优先, 旧点云扫描兜底
+            // v4.8.8: CRT容器真网格优先, 旧点云扫描兜底; v4.8.9: 回落原因诊断
+            _actDiag = "";
             ActMeshData am = null;
             try { am = ParseActContainer(d); } catch (Exception) { am = null; }
             bool real = am != null && am.real;
-            if (!real && am == null)
+            if (!real)
             {
+                string why = _actDiag;
                 try { am = ParseActMesh(d); } catch (Exception) { am = null; }
+                if (am != null && !string.IsNullOrEmpty(why)) am.fmt = "v4.8.7 ACT点云[容器败:" + why + "]";
             }
             if (am == null) throw new Exception("act 解析失败(容器/点云均未命中)");
 
@@ -1925,7 +2158,11 @@ public class PreviewV4 : MonoBehaviour
                 mat.color = new Color(0.72f, 0.72f, 0.76f);
                 mr.sharedMaterial = mat;
 
-                line3 = "[v4.8.8] " + am.fmt + " 转" + ModelRot.x.ToString("F0") + " | 贴图=...";
+                line3 = "[v4.8.9] " + am.fmt + " 转" + ModelRot.x.ToString("F0") + " | 贴图=...";
+                string lw2 = name.ToLower();
+                if (lw2.StartsWith("iw") && (lw2.Contains("dao") || lw2.Contains("gong") || lw2.Contains("jian") ||
+                    lw2.Contains("qiang") || lw2.Contains("fu") || lw2.Contains("bang")))
+                    line3 += " [武器(坐骑挂载)]";
                 if (hostPv != null)
                     hostPv.StartCoroutine(LoadTexCoAct(name, am.anchors, mat));
                 return;
@@ -1958,13 +2195,18 @@ public class PreviewV4 : MonoBehaviour
             mat2.color = new Color(0.62f, 0.70f, 0.82f);
             mr2.sharedMaterial = mat2;
 
-            line3 = "[v4.8.8] " + am.fmt + " ext=" + extRaw.ToString("F0") + "→" + ext2.ToString("F1") + " 转" + ModelRot.x.ToString("F0") + " | 贴图=...";
+            line3 = "[v4.8.9] " + am.fmt + " 转" + ModelRot.x.ToString("F0") + " | 贴图=...";
+            // v4.8.9: 怪物/坐骑包里的武器模型标注 (用户实测线索: iw0401dao_04/iwgong01 类)
+            string lw = name.ToLower();
+            if (lw.StartsWith("iw") && (lw.Contains("dao") || lw.Contains("gong") || lw.Contains("jian") ||
+                lw.Contains("qiang") || lw.Contains("fu") || lw.Contains("bang") || lw.Contains("qiang")))
+                line3 += " [武器(坐骑挂载)]";
             if (hostPv != null)
                 hostPv.StartCoroutine(LoadTexCoAct(name, am.anchors, mat2));
         }
         catch (Exception e)
         {
-            line3 = "[v4.8.8] " + name + " 解析失败: " + e.Message + " (◀▶手动翻页)";
+            line3 = "[v4.8.9] " + name + " 解析失败: " + e.Message + " (◀▶手动翻页)";
             if (curModel != null) { UnityEngine.Object.Destroy(curModel); curModel = null; }
         }
     }
@@ -2009,6 +2251,9 @@ public class PreviewV4 : MonoBehaviour
         if (string.IsNullOrEmpty(c)) return null;
         if (TexExists(c + ".dds")) return c + ".dds";
         if (TexExists(c + ".png")) return c + ".png";
+        // v4.8.9: 池未命中 → 全盘索引兜底 (武器/怪物引用他包贴图的实测缺口)
+        if (TexIndexLookup(c + ".dds") != null) return c + ".dds";
+        if (TexIndexLookup(c + ".png") != null) return c + ".png";
         return null;
     }
     static string StripDigitsTail(string s)
@@ -2168,6 +2413,16 @@ public class PreviewV4 : MonoBehaviour
         {
             try { raw = ReadTexFile(p); } catch (Exception) { raw = null; }
         }
+        // v4.8.9: 跨包反查 — 常规目录未命中 → TexIndex 全盘文件名→路径索引
+        string idxPath = null;
+        if (raw == null && !string.IsNullOrEmpty(p))
+        {
+            idxPath = TexIndexLookup(p);
+            if (idxPath != null)
+            {
+                try { raw = File.ReadAllBytes(idxPath); } catch (Exception) { raw = null; idxPath = null; }
+            }
+        }
         Texture2D t = null;
         if (raw != null)
         {
@@ -2178,9 +2433,76 @@ public class PreviewV4 : MonoBehaviour
         {
             texCache[p] = t;
             if (mat != null) { mat.mainTexture = t; mat.color = Color.white; }
-            line3 += " ✓" + p;
+            line3 += " ✓" + p + (idxPath != null ? "(跨包)" : "");
         }
-        else line3 += " ✗解码失败:" + p + (DdsV4.LastErr != null ? "[" + DdsV4.LastErr + "]" : "");
+        else if (raw == null)
+            line3 += " ✗未找到:" + p + TexIdxNote();                    // v4.8.9: 文件不存在(此前误报"解码失败")
+        else
+            line3 += " ✗解码失败:" + p + (DdsV4.LastErr != null ? "[" + DdsV4.LastErr + "]" : "[过短" + raw.Length + "B]");
+    }
+
+    // ============ v4.8.9: TexIndex — pak 根目录全盘文件名→路径索引 (懒建一次) ============
+    static Dictionary<string, string> _texIdx;
+    static int _texIdxN = -1;                                          // -1=未建
+    static string _texIdxRoots = "";
+    static void EnsureTexIndex()
+    {
+        if (_texIdxN >= 0) return;
+        _texIdx = new Dictionary<string, string>();
+        _texIdxN = 0;
+        try
+        {
+            var roots = new List<string>();
+            string pd = Application.persistentDataPath;
+            string[] cands = {
+                localTexDir, localActorDir,
+                "/storage/emulated/0/Game/游戏端/pak_out",
+                "/storage/emulated/0/Game/pak_out",
+                "/storage/emulated/0/Game/游戏端/pak_out2",
+                pd + "/pak_out",
+            };
+            foreach (var c in cands)
+            {
+                if (string.IsNullOrEmpty(c) || !Directory.Exists(c)) continue;
+                string r = c;                                          // 目录在 pak_out/creature/xxx → 根取 pak_out
+                string p1 = Path.GetDirectoryName(c.TrimEnd('/'));
+                if (p1 != null && Path.GetFileName(p1) == "creature") r = p1;
+                if (!roots.Contains(r)) roots.Add(r);
+            }
+            foreach (var r in roots)
+            {
+                try { ScanTexDir(r, r, 0); _texIdxRoots += (_texIdxRoots.Length > 0 ? "," : "") + Path.GetFileName(r); }
+                catch (Exception) { }
+            }
+        }
+        catch (Exception) { }
+    }
+    static void ScanTexDir(string root, string dir, int depth)
+    {
+        if (_texIdxN > 60000 || depth > 4) return;                     // 上限: 6万文件/4层深
+        try
+        {
+            foreach (var f in Directory.GetFiles(dir))
+            {
+                string ln = Path.GetFileName(f).ToLower();
+                if (!ln.EndsWith(".dds") && !ln.EndsWith(".png")) continue;
+                if (!_texIdx.ContainsKey(ln)) { _texIdx[ln] = f; _texIdxN++; }
+            }
+            foreach (var sub in Directory.GetDirectories(dir)) ScanTexDir(root, sub, depth + 1);
+        }
+        catch (Exception) { }
+    }
+    static string TexIndexLookup(string name)
+    {
+        try { EnsureTexIndex(); } catch (Exception) { return null; }
+        if (_texIdx == null || _texIdxN == 0) return null;
+        string v;
+        return _texIdx.TryGetValue(name.ToLower(), out v) ? v : null;
+    }
+    static string TexIdxNote()
+    {
+        try { EnsureTexIndex(); } catch (Exception) { }
+        return "(全盘索引" + _texIdxN + "文件" + (_texIdxRoots.Length > 0 ? "[" + _texIdxRoots + "]" : "") + ")";
     }
 
     // ================================================================
@@ -2284,7 +2606,8 @@ public static class DdsV4
 
     static Texture2D Inner(byte[] raw, string name)
     {
-        if (raw == null || raw.Length < 64) return null;
+        if (raw == null) { LastErr = "无数据"; return null; }
+        if (raw.Length < 64) { LastErr = "过短" + raw.Length + "B"; return null; }   // v4.8.9: 抽包占位文件定性
         int magic = raw[0] | (raw[1] << 8) | (raw[2] << 16) | (raw[3] << 24);
         int dataOff, width, height, fourcc; uint pfFlags;
         if (magic == 0x20534444 && raw.Length >= 128)
